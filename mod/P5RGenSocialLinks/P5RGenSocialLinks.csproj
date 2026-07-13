@@ -1,0 +1,19 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>P5RGenSocialLinks</AssemblyName>
+    <RootNamespace>P5RGenSocialLinks</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Reloaded.Hooks" Version="4.4.0" />
+    <PackageReference Include="Reloaded.Hooks.Definitions" Version="4.4.0" />
+    <PackageReference Include="Reloaded.Memory" Version="9.4.2" />
+    <PackageReference Include="Reloaded.Mod.Interfaces" Version="1.18.0" />
+  </ItemGroup>
+
+</Project>
