@@ -183,3 +183,79 @@ The C# mod patches the game's dialogue buffer with this string and lets the engi
 | 8 | Prompt Builder | Per-character system prompts (Ann, Ryuji, Makoto…) |
 | 9 | Bridge | C# calls Python server; inject returned text |
 | 10| Polish | Error handling, fallback to scripted lines |
+
+---
+
+## Chapter 2: ASLR, Module Base Addresses, and Pointer Chains
+
+### Why Static Addresses Are Useless
+
+When Windows loads `p5r.exe`, the OS kernel picks a **random base address** for the executable in virtual memory — this is ASLR (Address Space Layout Randomization). It's a security feature: malware can't rely on knowing where functions live. The consequence for us: every single game launch, P5R loads at a different virtual address.
+
+```
+Session 1: p5r.exe loads at 0x7FF8_1200_0000
+Session 2: p5r.exe loads at 0x7FF9_AC30_0000
+Session 3: p5r.exe loads at 0x7FFA_0010_0000
+```
+
+**What stays constant**: the *distance* between any two things inside the exe. The compiler laid out the binary — the offset from the start of the module to any global variable or function is baked into the `.exe` file and never changes (for a given game version).
+
+So instead of hardcoding an absolute address, we always work with:
+```
+absolute_address = module_base + constant_offset
+```
+
+Reloaded-II gives us `module_base` via `IModLoader.GetModAssembly()` → `Process.GetCurrentProcess().MainModule.BaseAddress`.
+
+---
+
+### The Pointer Chain (Multi-Level Indirection)
+
+P5R is a C++ game. C++ objects live on the **heap** — dynamically allocated memory. A global variable doesn't *contain* the Social Link session struct; it contains a *pointer to* it. Sometimes the global holds a pointer to a struct that holds another pointer to another struct, and so on. This is called a **pointer chain**.
+
+Visualized:
+```
+MODULE BASE
+    │
+    + 0x01E8_0000 ──► [Global Ptr]  (holds address X)
+                              │
+                              X + 0x18 ──► [Mid-level object]  (holds address Y)
+                                                    │
+                                                    Y + 0x08 ──► SocialLinkSession* ← this is what we want
+```
+
+Each `──►` is a **dereference**: read 8 bytes at that address to get the next address. In C#:
+```csharp
+unsafe IntPtr ResolveChain(IntPtr moduleBase)
+{
+    IntPtr p = moduleBase + 0x01E8_0000;  // step 1: static offset
+    p = *(IntPtr*)p;                       // step 2: dereference → follow pointer
+    p = *(IntPtr*)(p + 0x18);             // step 3: offset + dereference
+    p = *(IntPtr*)(p + 0x08);             // step 4: final dereference → SocialLinkSession*
+    return p;
+}
+```
+
+This is exactly what Cheat Engine calls a "pointer scan." When you right-click a value in Cheat Engine and click "Find what accesses this address," it can trace back through the chain to find the static root.
+
+---
+
+### How We Find the Real Offsets: Cheat Engine Workflow
+
+1. **Attach Cheat Engine to p5r.exe** while a Social Link conversation is active.
+2. **Search for the Confidant ID value** (e.g., scan for `int` value `1` when talking to Ryuji).
+3. **Narrow it down**: exit the conversation, scan for "changed value." Re-enter, scan for original. Repeat until 1–3 addresses remain.
+4. **Right-click → "Find what writes to this address"** — this shows which game function modifies `ConfidantId`, giving you the struct context.
+5. **Pointer scan** the final address → Cheat Engine traces back to a module-relative root pointer chain.
+6. **Verify in Ghidra**: import the binary, look up the address, confirm the struct layout.
+
+> Note: The offsets in `GameMemory.cs` are currently placeholders. They MUST be verified live against `p5r.exe` using this workflow before any real memory reads will work.
+
+---
+
+### Why Reloaded.Memory Over Raw Pointers
+
+Raw `*(IntPtr*)p` will hard-crash the process (Access Violation / null deref) if any step in the chain returns a null pointer. `Reloaded.Memory` provides:
+- **`Memory.Read<T>(nuint address, out T value)`** — returns `bool` success instead of crashing.
+- **`MemoryBufferHelper`** — allocates executable memory regions for our trampoline hooks.
+- **`SigScanner`** — finds functions by their **byte signature** rather than raw offset, which survives minor game patches (the function body changes less often than its absolute position).
