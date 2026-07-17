@@ -259,3 +259,73 @@ Raw `*(IntPtr*)p` will hard-crash the process (Access Violation / null deref) if
 - **`Memory.Read<T>(nuint address, out T value)`** — returns `bool` success instead of crashing.
 - **`MemoryBufferHelper`** — allocates executable memory regions for our trampoline hooks.
 - **`SigScanner`** — finds functions by their **byte signature** rather than raw offset, which survives minor game patches (the function body changes less often than its absolute position).
+
+---
+
+## Chapter 3: The Reloaded-II Mod Lifecycle & Polling
+
+### The IMod Interface
+
+Reloaded-II defines a contract every mod must implement:
+
+```
+IMod
+ ├── Start(IModLoaderV1 loader)   ← called once when mod is injected
+ ├── Suspend()                    ← called when user disables mod at runtime
+ ├── Resume()                     ← called when user re-enables mod
+ ├── Unload()                     ← called when mod is fully removed
+ ├── CanSuspend() → bool          ← tell Reloaded if you support suspend/resume
+ └── CanUnload()  → bool          ← tell Reloaded if you support hot-unload
+```
+
+`Start()` is your constructor. Everything — hook setup, reader initialization, background threads — launches from here. The `IModLoaderV1` parameter is your gateway to:
+- The game's `Process` object (for module base address)
+- The `IReloadedHooks` service (for function detours)
+- The logger (writes to Reloaded-II's console)
+
+### Getting the Module Base Address
+
+```csharp
+void Start(IModLoaderV1 loader)
+{
+    // Reloaded gives us the current process; MainModule is the .exe itself
+    nuint moduleBase = (nuint)Process.GetCurrentProcess()
+                                     .MainModule!
+                                     .BaseAddress;
+    // Now moduleBase + any constant offset = a stable address regardless of ASLR
+}
+```
+
+`MainModule.BaseAddress` is where Windows loaded `p5r.exe` this session. This value changes every launch (ASLR) but is always correct at runtime.
+
+### Polling vs. Hooking: Two Ways to Watch Game State
+
+**Polling** (what we implement now): a background thread wakes up every N milliseconds and calls `TryReadSnapshot()`. Simple, but wastes CPU when nothing is happening.
+
+**Hooking** (Micro-step 4): detour the exact function that *sets* `ConfidantId` when a conversation begins. Zero wasted cycles — we're called only when the game itself triggers the event.
+
+We start with polling because it lets us verify our memory reads without needing to identify the exact game function yet. Once reads are confirmed correct, we swap to a hook.
+
+### System.Threading.PeriodicTimer (C# 6+)
+
+Instead of `Thread.Sleep()` in a loop (wastes a thread), we use `PeriodicTimer`:
+
+```csharp
+// Fires every 250ms on the thread pool; no dedicated thread held between ticks.
+_timer = new PeriodicTimer(TimeSpan.FromMilliseconds(250));
+_pollTask = Task.Run(async () =>
+{
+    while (await _timer.WaitForNextTickAsync(_cts.Token))
+    {
+        var snap = _reader.TryReadSnapshot();
+        if (snap is not null)
+            OnConversationActive(snap);
+    }
+});
+```
+
+`CancellationTokenSource` (`_cts`) lets us cleanly stop the loop in `Unload()` without leaving orphan threads in the game process.
+
+### Why Clean Unload Matters
+
+Our mod runs *inside* P5R's process. If we leave a thread running after `Unload()`, it keeps reading memory addresses that may get freed as the game progresses. That's a use-after-free — eventual crash. Always cancel and await your background tasks in `Unload()`.
