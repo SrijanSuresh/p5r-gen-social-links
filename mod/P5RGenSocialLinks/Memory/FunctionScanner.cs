@@ -14,21 +14,21 @@ internal sealed class FunctionScanner : IDisposable
     private readonly Scanner _scanner;
     private readonly nuint   _moduleBase;
 
-    internal unsafe FunctionScanner()
+    internal FunctionScanner()
     {
-        ProcessModule module = Process.GetCurrentProcess().MainModule!;
+        Process process = Process.GetCurrentProcess();
+        ProcessModule module = process.MainModule!;
         _moduleBase = (nuint)module.BaseAddress;
-        // Pin the module memory region for scanning
-        _scanner = new Scanner((byte*)_moduleBase, module.ModuleMemorySize);
+        _scanner = new Scanner(process, module);
     }
 
     /// <summary>
     /// Scans for <paramref name="pattern"/> and returns its absolute address.
-    /// Throws <see cref="InvalidOperationException"/> if not found.
+    /// Throws <see cref="InvalidOperationException"/> when the pattern is not found.
     /// </summary>
     internal nuint FindOrThrow(string pattern)
     {
-        PatternScanResult result = _scanner.CompiledFindPattern(pattern);
+        PatternScanResult result = _scanner.FindPattern(pattern);
         if (!result.Found)
             throw new InvalidOperationException(
                 $"SigScan failed for pattern [{pattern}]. " +
