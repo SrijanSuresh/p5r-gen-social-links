@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
+using Reloaded.Hooks;
 using Reloaded.Hooks.Definitions;
 using Reloaded.Hooks.Definitions.X64;
 using Reloaded.Mod.Interfaces.Internal;
@@ -12,20 +13,18 @@ namespace P5RGenSocialLinks;
 
 public class Mod : IModV1
 {
-    private ILoggerV2?     _logger;
-    private LLMClient?     _llmClient;
+    private ILoggerV2?        _logger;
+    private LLMClient?        _llmClient;
     private SocialLinkReader? _reader;
 
-    // Polling (temporary — replaced by hook in Phase 2)
-    private PeriodicTimer?           _timer;
-    private Task?                    _pollTask;
-    private CancellationTokenSource  _cts = new();
+    // Polling (fallback while hook is placeholder)
+    private PeriodicTimer?          _timer;
+    private Task?                   _pollTask;
+    private CancellationTokenSource _cts = new();
 
-    // Hook (wired in Micro-step 4 once we have the function address)
+    // Conversation-init detour
     private IHook<ConversationInitDelegate>? _conversationHook;
 
-    // Matches: void __fastcall SocialLink_BeginConversation(SocialLinkSession* session)
-    // Placeholder — signature must be verified against the actual p5r.exe binary.
     [Function(CallingConventions.Microsoft)]
     public delegate void ConversationInitDelegate(nuint sessionPtr);
 
@@ -39,11 +38,50 @@ public class Mod : IModV1
 
         _reader = new SocialLinkReader(moduleBase);
 
+        TryActivateHook();
         StartPollLoop();
-        _logger.WriteLine("[P5RGenSocialLinks] Started (polling mode).");
+
+        _logger.WriteLine("[P5RGenSocialLinks] Started.");
     }
 
-    // ── Poll loop (runs until hook is active) ──────────────────────────────
+    private void TryActivateHook()
+    {
+        try
+        {
+            using var scanner = new FunctionScanner();
+            nuint funcAddr = scanner.FindOrThrow(Signatures.BeginConversation);
+            _logger!.WriteLine($"[P5RGenSocialLinks] Hook target: 0x{funcAddr:X}");
+
+            var hooks = ReloadedHooks.Instance;
+            _conversationHook = hooks
+                .CreateHook<ConversationInitDelegate>(OnConversationInit, (long)funcAddr)
+                .Activate();
+
+            _logger.WriteLine("[P5RGenSocialLinks] Conversation hook active.");
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger!.WriteLine($"[P5RGenSocialLinks] Hook skipped (sig not found): {ex.Message}");
+            _logger.WriteLine("[P5RGenSocialLinks] Falling back to poll loop.");
+        }
+    }
+
+    private void OnConversationInit(nuint sessionPtr)
+    {
+        // Run original first so session fields are initialised before we read them
+        _conversationHook!.OriginalFunction(sessionPtr);
+
+        SocialLinkSnapshot? snap = _reader!.TryReadSnapshot();
+        if (snap is null)
+            return;
+
+        _logger?.WriteLine(
+            $"[P5RGenSocialLinks] Hook: Confidant={snap.ConfidantId} Rank={snap.RankLevel}");
+
+        // TODO Micro-step 5: dispatch async LLM request and inject result
+    }
+
+    // ── Poll loop (fallback) ───────────────────────────────────────────────
 
     private void StartPollLoop()
     {
@@ -56,24 +94,12 @@ public class Mod : IModV1
     {
         while (await _timer!.WaitForNextTickAsync(ct))
         {
+            if (_conversationHook is not null) break;  // hook is live, stop polling
             SocialLinkSnapshot? snap = _reader!.TryReadSnapshot();
-            if (snap is null)
-                continue;
-
-            _logger!.WriteLine(
-                $"[P5RGenSocialLinks] Confidant={snap.ConfidantId} Rank={snap.RankLevel} Line={snap.DialogueIndex}");
-
-            // TODO Micro-step 4: call LLM and inject dialogue
+            if (snap is not null)
+                _logger!.WriteLine(
+                    $"[P5RGenSocialLinks] Poll: Confidant={snap.ConfidantId}");
         }
-    }
-
-    // ── Hook handler (Micro-step 4 wires this up) ─────────────────────────
-
-    private void OnConversationInit(nuint sessionPtr)
-    {
-        _logger?.WriteLine($"[P5RGenSocialLinks] Hook fired: sessionPtr=0x{sessionPtr:X}");
-        // TODO: read session from sessionPtr, call LLM, inject dialogue
-        _conversationHook?.OriginalFunction(sessionPtr);
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────
@@ -81,12 +107,13 @@ public class Mod : IModV1
     public void Suspend()
     {
         _cts.Cancel();
-        _pollTask?.Wait(TimeSpan.FromSeconds(2));
+        _conversationHook?.Disable();
         _logger?.WriteLine("[P5RGenSocialLinks] Suspended.");
     }
 
     public void Resume()
     {
+        _conversationHook?.Enable();
         StartPollLoop();
         _logger?.WriteLine("[P5RGenSocialLinks] Resumed.");
     }
