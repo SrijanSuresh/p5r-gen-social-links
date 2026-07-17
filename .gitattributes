@@ -1,0 +1,6 @@
+# Enforce LF line endings in the repo for all text files
+* text=auto eol=lf
+
+# Windows-specific C# and solution files may keep CRLF
+*.csproj text eol=crlf
+*.sln    text eol=crlf
