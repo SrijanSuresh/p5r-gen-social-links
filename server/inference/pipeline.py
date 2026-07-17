@@ -1,4 +1,4 @@
-"""Inference pipeline: tokenize → generate → decode → trim."""
+"""Inference pipeline: tokenize â†’ generate â†’ decode â†’ trim."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 from .config import ModelConfig
 from social_link.prompt_builder import build_prompt
+from inference.postprocess import clean_response
 
 if TYPE_CHECKING:
     import torch
@@ -21,7 +22,7 @@ class InferencePipeline:
         self._cfg       = cfg
 
     def generate(self, confidant_id: int, rank: int, context: str) -> str:
-        import torch  # noqa: PLC0415 — lazy import; torch only needed at inference time
+        import torch  # noqa: PLC0415 â€” lazy import; torch only needed at inference time
 
         system_prompt, user_prompt = build_prompt(confidant_id, rank, context)
 
@@ -45,4 +46,4 @@ class InferencePipeline:
         new_ids  = output_ids[0, inputs["input_ids"].shape[1]:]
         raw_text = self._tokenizer.decode(new_ids, skip_special_tokens=True).strip()
 
-        return raw_text[: self._cfg.max_response_chars]
+        return clean_response(raw_text, self._cfg.max_response_chars)
