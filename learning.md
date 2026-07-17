@@ -329,3 +329,94 @@ _pollTask = Task.Run(async () =>
 ### Why Clean Unload Matters
 
 Our mod runs *inside* P5R's process. If we leave a thread running after `Unload()`, it keeps reading memory addresses that may get freed as the game progresses. That's a use-after-free — eventual crash. Always cancel and await your background tasks in `Unload()`.
+
+---
+
+## Chapter 4: Function Hooking with Reloaded.Hooks
+
+### The Problem with Polling
+
+Our 250ms poll loop works but wastes CPU: it calls `TryReadSnapshot()` 4× per second even when the player is in a dungeon, menu, or cutscene with no Social Link active. Over a 40-hour playthrough, that's ~576,000 pointless reads. The solution is to **eliminate polling entirely** and instead run our code *only* when P5R itself decides a conversation starts.
+
+### What is a Function Hook (Detour)?
+
+A **detour** (also called a hook) is a technique where you overwrite the first ~14 bytes of a target function with a `JMP` instruction pointing to your code:
+
+```
+Before hook:
+p5r.exe + 0xABC123:  push rbp          ; original function start
+                      mov rbp, rsp
+                      ...
+
+After hook:
+p5r.exe + 0xABC123:  jmp 0x7FF9_0001_0000  ; → our trampoline stub
+                      nop nop nop           ; (original bytes saved by Reloaded.Hooks)
+```
+
+Reloaded.Hooks:
+1. **Saves** the overwritten bytes into a "trampoline" — a small stub that executes the original bytes then jumps back into the original function *after* the patch.
+2. **Writes** the `JMP` to our code at the function's entry point.
+3. **Gives us a delegate** (`IHook<TDelegate>`) that we can call to invoke the original function, optionally skipping or modifying its arguments/return value.
+
+### Hook Types: Pre-hook vs. Mid-function
+
+- **Pre-hook** (what we use): runs before the original function. We read or modify state, then optionally call the original.
+- **Post-hook**: some frameworks let you also intercept the return. With Reloaded.Hooks we achieve this by calling the original ourselves and inspecting its return value.
+
+### Defining the Hook Signature
+
+The hook delegate must exactly match the C++ calling convention and signature of the target function. P5R is an x64 Windows binary, which uses the **Microsoft x64 calling convention**:
+- First 4 integer args → `rcx`, `rdx`, `r8`, `r9`
+- Remaining args → stack
+- Return value → `rax`
+
+For a hypothetical conversation-init function:
+```csharp
+// Matches void __fastcall SocialLink_BeginConversation(SocialLinkSession* session)
+[Function(CallingConventions.Microsoft)]
+delegate void BeginConversationDelegate(nuint sessionPtr);
+```
+
+### Finding the Target Function
+
+To hook the right function, we need its address. Two methods:
+
+**Method 1 — Static offset** (fragile across patches):
+```csharp
+nuint funcAddr = moduleBase + 0x00_ABC1_23;
+```
+
+**Method 2 — Byte signature scan** (robust):
+```csharp
+// Signature: first N bytes of the function that are unlikely to change
+// ?? = wildcard byte
+string sig = "48 89 5C 24 ?? 48 89 6C 24 ?? 48 89 74 24 ?? 57 41 56 41 57";
+var scanner = new Scanner((byte*)moduleBase, moduleSize);
+var match = scanner.CompiledFindPattern(sig);
+nuint funcAddr = moduleBase + (nuint)match.Offset;
+```
+
+A byte signature targets the *body* of the function (specific instruction sequences) which changes far less often than a function's absolute position in memory when the binary is rebuilt.
+
+### How Reloaded.Hooks Wires It Up
+
+```csharp
+// 1. Get the hooks service from the mod loader
+var hooks = _modLoader.GetController<IReloadedHooks>()!.GetWrapper();
+
+// 2. Create the hook (Reloaded.Hooks writes the JMP, saves the trampoline)
+_conversationHook = hooks.CreateHook<BeginConversationDelegate>(
+    OnBeginConversation, (long)funcAddr).Activate();
+
+// 3. Our handler — called instead of the original function
+private void OnBeginConversation(nuint sessionPtr)
+{
+    // Read state from sessionPtr directly (it's the session being initialized)
+    // ... fire LLM request ...
+
+    // Always call the original so P5R continues normally
+    _conversationHook.OriginalFunction(sessionPtr);
+}
+```
+
+The original function still runs — we just get to execute code *before* (or after) it every time the game triggers a conversation.
