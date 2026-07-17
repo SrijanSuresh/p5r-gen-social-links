@@ -420,3 +420,172 @@ private void OnBeginConversation(nuint sessionPtr)
 ```
 
 The original function still runs — we just get to execute code *before* (or after) it every time the game triggers a conversation.
+
+
+---
+
+## Chapter 5: 4-Bit Quantization — The Mathematics
+
+### Why Not Just Use float16?
+
+A float16 weight occupies 16 bits. With 7 billion parameters (Llama-7B):
+  7,000,000,000 × 2 bytes = **14 GB** — too large for an RTX 3060 (12 GB) or 4070 (12 GB).
+
+With 4-bit quantization:
+  7,000,000,000 × 0.5 bytes = **3.5 GB** — fits with room for activations and KV cache.
+
+### GPTQ: Post-Training Quantization
+
+GPTQ (Frantar et al., 2022) quantizes a trained model without retraining. For each weight matrix W:
+
+1. Run calibration data (a few hundred text samples) through the model.
+2. For each row of W, solve the optimization:
+   ```
+   minimize ‖W·X - Q·S·X‖²   subject to Q ∈ {0..15}ⁿ
+   ```
+   where X is the layer''s input activations on the calibration data.
+3. Q is a matrix of 4-bit unsigned integers (values 0–15).
+4. S is a float16 scale factor (one per group of K consecutive weights).
+5. Z is a zero-point (shifts Q so the quantized range is symmetric).
+
+The dequantization formula at inference time:
+```
+W_float ≈ (Q - Z) × S
+```
+
+### Groups: Why Not One Scale Per Layer?
+
+A single scale per layer means every weight must fit in the range
+`[scale × 0, scale × 15]`. Low-magnitude weights get crushed to 0;
+high-magnitude weights clip. **Group quantization** assigns one scale
+per G consecutive weights (G = 32, 64, or 128). Smaller G = more
+scales stored = better quality, but more memory for scales.
+
+### What Changes at Inference Time
+
+At runtime, for each matmul:
+1. Load packed int4 weights (2 per byte) from VRAM → GPU registers.
+2. Unpack to int8 via bit masking.
+3. Subtract zero-point and multiply by scale → float16.
+4. Perform standard float16 multiply-accumulate with the activation.
+
+Steps 1–3 are what our Triton kernel implements.
+---
+
+## Chapter 6: Triton Block Pointers and the dequant_matmul Kernel
+
+### What is a Triton "Program"?
+
+When you launch `dequant_matmul_kernel[grid](...)`, Triton spawns
+`grid[0] × grid[1]` parallel programs on the GPU''s Streaming Multiprocessors.
+Each program handles one tile of the output matrix, completely independently.
+This is called **data parallelism at the tile level**.
+
+`tl.program_id(0)` returns which row-tile this program owns.
+`tl.program_id(1)` returns which col-tile this program owns.
+
+### Block Pointer Arithmetic (the hardest part)
+
+For a 2D matrix A with shape [M, K] stored row-major:
+```
+element A[row, col] lives at address:  A_ptr + row * K + col
+```
+
+For a **tile** of shape [BLOCK_M, BLOCK_K] starting at (pid_m * BLOCK_M, k_start):
+```
+row_offs = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)   # shape [BLOCK_M]
+k_offs   = k_start          + tl.arange(0, BLOCK_K)   # shape [BLOCK_K]
+
+# Broadcasting creates a [BLOCK_M, BLOCK_K] address matrix:
+ptrs = A_ptr + row_offs[:, None] * K + k_offs[None, :]
+```
+
+`[:, None]` promotes the row vector to shape [BLOCK_M, 1].
+`[None, :]` promotes the col vector to shape [1, BLOCK_K].
+NumPy-style broadcasting produces a [BLOCK_M, BLOCK_K] matrix of addresses.
+
+### The Boundary Mask
+
+The matrix edge tiles (last row-tile or col-tile) often go out of bounds.
+Loading from an invalid GPU address causes undefined behavior (silent wrong data
+or a kernel crash). We guard every load:
+
+```python
+mask = (row_offs[:, None] < M) & (k_offs[None, :] < K)
+tile  = tl.load(ptrs, mask=mask, other=0.0)
+```
+
+`other=0.0` fills out-of-bounds lanes with zero, which contributes nothing to
+the dot product — mathematically correct, not just safe.
+
+### tl.dot vs. element-wise multiply
+
+`tl.dot(A, B)` is Triton''s tensor-core-accelerated matmul. It emits an mma
+(matrix multiply-accumulate) instruction that runs on the GPU''s Tensor Cores
+(WMMA / MMA units), achieving 8–16× throughput vs. a naive loop. This is the
+core reason writing a custom kernel beats a for-loop dequant on the CPU.
+
+### BLOCK_M / BLOCK_N / BLOCK_K Tuning
+
+These three constants control how much work each program does:
+- Too small → too many programs → overhead from launch/sync dominates.
+- Too large → registers spill to local memory (slow) or the tile doesn''t fit.
+- `triton.autotune` tries all combinations and picks the fastest for your GPU.
+  We use fixed values (16, 64, 32) as a starting point; autotune will be
+  wired in Micro-step 7.
+---
+
+## Chapter 6: Triton Block Pointers and the dequant_matmul Kernel
+
+### What is a Triton "Program"?
+
+When you launch `dequant_matmul_kernel[grid](...)`, Triton spawns
+`grid[0] × grid[1]` parallel programs on the GPU's Streaming Multiprocessors.
+Each program handles one tile of the output matrix, completely independently.
+
+`tl.program_id(0)` returns which row-tile this program owns.
+`tl.program_id(1)` returns which col-tile this program owns.
+
+### Block Pointer Arithmetic
+
+For a 2D matrix A with shape [M, K] stored row-major:
+```
+A[row, col] lives at:  A_ptr + row * K + col
+```
+
+For a tile [BLOCK_M, BLOCK_K] starting at (pid_m * BLOCK_M, k_start):
+```python
+row_offs = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)   # [BLOCK_M]
+k_offs   = k_start          + tl.arange(0, BLOCK_K)   # [BLOCK_K]
+# Broadcasting → [BLOCK_M, BLOCK_K] address matrix
+ptrs = A_ptr + row_offs[:, None] * K + k_offs[None, :]
+```
+
+`[:, None]` promotes to shape [BLOCK_M, 1]; `[None, :]` to [1, BLOCK_K].
+Broadcasting produces the full [BLOCK_M, BLOCK_K] address block.
+
+### The Boundary Mask
+
+The matrix edge tiles go out of bounds. Loading from an invalid GPU address
+causes silent wrong data or a kernel crash. We guard every load:
+
+```python
+mask = (row_offs[:, None] < M) & (k_offs[None, :] < K)
+tile  = tl.load(ptrs, mask=mask, other=0.0)
+```
+
+`other=0.0` fills out-of-bounds lanes with zero — mathematically correct
+(contributes nothing to the dot product), not just safe.
+
+### tl.dot vs. element-wise multiply
+
+`tl.dot(A, B)` emits a Tensor Core mma (matrix-multiply-accumulate) instruction,
+achieving 8–16× throughput over a naive multiply-accumulate loop. This is the
+core reason the custom kernel outperforms a CPU dequant loop.
+
+### BLOCK_M / BLOCK_N / BLOCK_K Tuning
+
+- Too small → too many programs → launch overhead dominates.
+- Too large → register spill to local memory (slow).
+- `triton.autotune` searches all combinations; we use (16, 64, 32) as a
+  starting point and wire autotune in Micro-step 7.

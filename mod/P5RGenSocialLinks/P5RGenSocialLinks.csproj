@@ -5,6 +5,8 @@
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- This mod targets Windows-only P5R; suppress cross-platform scanner warning -->
+    <NoWarn>CA1416</NoWarn>
     <AssemblyName>P5RGenSocialLinks</AssemblyName>
     <RootNamespace>P5RGenSocialLinks</RootNamespace>
   </PropertyGroup>
@@ -13,6 +15,7 @@
     <PackageReference Include="Reloaded.Hooks" Version="4.3.3" />
     <PackageReference Include="Reloaded.Hooks.Definitions" Version="1.15.0" />
     <PackageReference Include="Reloaded.Memory" Version="9.4.3" />
+    <PackageReference Include="Reloaded.Memory.SigScan" Version="3.1.9" />
     <PackageReference Include="Reloaded.Mod.Interfaces" Version="2.5.0" />
   </ItemGroup>
 
