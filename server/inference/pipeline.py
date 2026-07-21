@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-import torch
-from transformers import AutoTokenizer  # type: ignore[import-untyped]
+from typing import TYPE_CHECKING
 
 from .config import ModelConfig
-from ..social_link.prompt_builder import build_prompt
+from social_link.prompt_builder import build_prompt
+
+if TYPE_CHECKING:
+    import torch
+    from transformers import AutoTokenizer  # type: ignore[import-untyped]
 
 
 class InferencePipeline:
@@ -18,9 +21,10 @@ class InferencePipeline:
         self._cfg       = cfg
 
     def generate(self, confidant_id: int, rank: int, context: str) -> str:
+        import torch  # noqa: PLC0415 — lazy import; torch only needed at inference time
+
         system_prompt, user_prompt = build_prompt(confidant_id, rank, context)
 
-        # Llama-2-chat format: <s>[INST] <<SYS>>\n{system}\n<</SYS>>\n\n{user} [/INST]
         full_prompt = (
             f"<s>[INST] <<SYS>>\n{system_prompt}\n<</SYS>>\n\n{user_prompt} [/INST]"
         )
