@@ -1,7 +1,8 @@
-﻿using System;
+using System;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace P5RGenSocialLinks.Server;
@@ -29,13 +30,13 @@ internal sealed class LLMClient : IDisposable
         _http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
     }
 
-    internal async Task<string> GenerateAsync(GenerateRequest request)
+    internal async Task<string> GenerateAsync(GenerateRequest request, CancellationToken ct = default)
     {
         string json = JsonSerializer.Serialize(request);
         using var content = new StringContent(json, Encoding.UTF8, "application/json");
-        using var response = await _http.PostAsync($"{BaseUrl}/generate", content);
+        using var response = await _http.PostAsync($"{BaseUrl}/generate", content, ct);
         response.EnsureSuccessStatusCode();
-        string body = await response.Content.ReadAsStringAsync();
+        string body = await response.Content.ReadAsStringAsync(ct);
         var result = JsonSerializer.Deserialize<GenerateResponse>(body);
         return result?.Text ?? string.Empty;
     }
