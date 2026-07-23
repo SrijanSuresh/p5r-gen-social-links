@@ -533,3 +533,59 @@ These three constants control how much work each program does:
 - `triton.autotune` tries all combinations and picks the fastest for your GPU.
   We use fixed values (16, 64, 32) as a starting point; autotune will be
   wired in Micro-step 7.
+---
+
+## Chapter 6: Triton Block Pointers and the dequant_matmul Kernel
+
+### What is a Triton "Program"?
+
+When you launch `dequant_matmul_kernel[grid](...)`, Triton spawns
+`grid[0] × grid[1]` parallel programs on the GPU's Streaming Multiprocessors.
+Each program handles one tile of the output matrix, completely independently.
+
+`tl.program_id(0)` returns which row-tile this program owns.
+`tl.program_id(1)` returns which col-tile this program owns.
+
+### Block Pointer Arithmetic
+
+For a 2D matrix A with shape [M, K] stored row-major:
+```
+A[row, col] lives at:  A_ptr + row * K + col
+```
+
+For a tile [BLOCK_M, BLOCK_K] starting at (pid_m * BLOCK_M, k_start):
+```python
+row_offs = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)   # [BLOCK_M]
+k_offs   = k_start          + tl.arange(0, BLOCK_K)   # [BLOCK_K]
+# Broadcasting → [BLOCK_M, BLOCK_K] address matrix
+ptrs = A_ptr + row_offs[:, None] * K + k_offs[None, :]
+```
+
+`[:, None]` promotes to shape [BLOCK_M, 1]; `[None, :]` to [1, BLOCK_K].
+Broadcasting produces the full [BLOCK_M, BLOCK_K] address block.
+
+### The Boundary Mask
+
+The matrix edge tiles go out of bounds. Loading from an invalid GPU address
+causes silent wrong data or a kernel crash. We guard every load:
+
+```python
+mask = (row_offs[:, None] < M) & (k_offs[None, :] < K)
+tile  = tl.load(ptrs, mask=mask, other=0.0)
+```
+
+`other=0.0` fills out-of-bounds lanes with zero — mathematically correct
+(contributes nothing to the dot product), not just safe.
+
+### tl.dot vs. element-wise multiply
+
+`tl.dot(A, B)` emits a Tensor Core mma (matrix-multiply-accumulate) instruction,
+achieving 8–16× throughput over a naive multiply-accumulate loop. This is the
+core reason the custom kernel outperforms a CPU dequant loop.
+
+### BLOCK_M / BLOCK_N / BLOCK_K Tuning
+
+- Too small → too many programs → launch overhead dominates.
+- Too large → register spill to local memory (slow).
+- `triton.autotune` searches all combinations; we use (16, 64, 32) as a
+  starting point and wire autotune in Micro-step 7.
