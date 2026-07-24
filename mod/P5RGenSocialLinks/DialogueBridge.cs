@@ -55,12 +55,16 @@ internal sealed class DialogueBridge
                 if (!string.IsNullOrWhiteSpace(text))
                 {
                     unsafe { DialogueWriter.Write(snap.SessionBase + (nuint)P5ROffsets.DIALOGUE_BUFFER, text); }
-                    _log.WriteLine($"[P5RGenSocialLinks] Injected: \"{text[..Math.Min(text.Length, 60)]}…\"");
+                    _log.WriteLine($"[P5RGenSocialLinks] Injected: \"{text[..Math.Min(text.Length, 60)]}â€¦\"");
                 }
+            }
+            catch (InferenceInFlightException)
+            {
+                // Server busy — scripted dialogue stays; no log spam.
             }
             catch (OperationCanceledException)
             {
-                _log.WriteLine("[P5RGenSocialLinks] LLM timeout — keeping scripted dialogue.");
+                _log.WriteLine("[P5RGenSocialLinks] LLM timeout â€” keeping scripted dialogue.");
             }
             catch (Exception ex) when (ex is not OutOfMemoryException)
             {
