@@ -82,16 +82,35 @@ public class Mod : IModV1
         _conversationHook!.OriginalFunction(sessionPtr);
 
         _logger?.WriteLine($"[P5RGenSocialLinks] sessionPtr=0x{sessionPtr:X}");
-        _logger?.WriteLine($"[P5RGenSocialLinks] HexDump:{SocialLinkReader.HexDump(sessionPtr)}");
 
-        SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(sessionPtr);
-        if (snap is null)
+        if (sessionPtr == 0)
+        {
+            _logger?.WriteLine("[P5RGenSocialLinks] sessionPtr is null — skipping.");
             return;
+        }
 
-        _logger?.WriteLine(
-            $"[P5RGenSocialLinks] Hook: Confidant={snap.ConfidantId} Rank={snap.RankLevel}");
+        try
+        {
+            // LEA RBX,[RCX+0x62B8] in the prologue tells us the SL session struct
+            // begins 0x62B8 bytes into the manager object that RCX (sessionPtr) points to.
+            const nuint SESSION_OFFSET = 0x62B8;
+            nuint slSession = sessionPtr + SESSION_OFFSET;
+            _logger?.WriteLine($"[P5RGenSocialLinks] slSession=0x{slSession:X}");
+            _logger?.WriteLine($"[P5RGenSocialLinks] HexDump@slSession:{SocialLinkReader.HexDump(slSession)}");
 
-        _bridge!.DispatchAsync(snap, ContextBuilder.ReadAndBuild(snap));
+            SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(slSession);
+            if (snap is null)
+                return;
+
+            _logger?.WriteLine(
+                $"[P5RGenSocialLinks] Hook: Confidant={snap.ConfidantId} Rank={snap.RankLevel}");
+
+            _bridge!.DispatchAsync(snap, ContextBuilder.ReadAndBuild(snap));
+        }
+        catch (Exception ex)
+        {
+            _logger?.WriteLine($"[P5RGenSocialLinks] OnConversationInit error: {ex.Message}");
+        }
     }
 
     // ── Poll loop (fallback) ───────────────────────────────────────────────

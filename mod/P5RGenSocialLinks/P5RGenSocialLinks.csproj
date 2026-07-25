@@ -7,9 +7,17 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <!-- This mod targets Windows-only P5R; suppress cross-platform scanner warning -->
     <NoWarn>CA1416</NoWarn>
+    <!-- Bundle all NuGet deps alongside the DLL so Reloaded-II can find them -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <AssemblyName>P5RGenSocialLinks</AssemblyName>
     <RootNamespace>P5RGenSocialLinks</RootNamespace>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="ModConfig.json">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Reloaded.Hooks" Version="4.3.3" />

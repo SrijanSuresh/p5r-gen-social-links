@@ -1,0 +1,21 @@
+{
+  "ModId": "p5r.gen.social.links",
+  "ModName": "P5R Generative Social Links",
+  "ModAuthor": "SrijanSuresh",
+  "ModVersion": "1.0.0",
+  "ModDescription": "Injects a local LLM into Persona 5 Royal Social Link conversations via memory hooking.",
+  "ModDll": "P5RGenSocialLinks.dll",
+  "ModIcon": "",
+  "ModR2RManagedDll32": "",
+  "ModR2RManagedDll64": "",
+  "ModNativeDll32": "",
+  "ModNativeDll64": "",
+  "Tags": [],
+  "IsLibrary": false,
+  "IsUniversalMod": false,
+  "ModDependencies": [],
+  "OptionalDependencies": [],
+  "SupportedAppId": [
+    "p5r.exe"
+  ]
+}
