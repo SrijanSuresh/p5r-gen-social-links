@@ -1146,6 +1146,91 @@ C# mod
    struct. Finding it requires hooking the text-render function or a separate CE scan
    of live text addresses during active dialogue display.
 
-2. **Real model**: Replace `MOCK_LLM=1` with `TheBloke/Llama-2-7B-Chat-GPTQ` running
-   via auto-gptq on CUDA. Requires ~4 GB VRAM and the full `requirements.txt` install
-   (including `torch==2.4.1+cu121` for Windows with CUDA).
+2. **Real model**: Switched from auto-gptq to llama-cpp-python — see Chapter 13.
+
+---
+
+## Chapter 13 — llama-cpp-python vs auto-gptq: Backend Choice and GGUF Format
+
+### Why We're Switching from auto-gptq to llama-cpp-python
+
+`auto-gptq` was the original plan because it supports our custom Triton dequant kernel.
+But three Windows-specific problems made it the wrong choice for dev:
+
+| Problem | auto-gptq | llama-cpp-python |
+|---|---|---|
+| Triton backend | Linux-only — had to disable | Not needed — uses llama.cpp's own CUDA kernels |
+| Windows CUDA wheels | Fragile — often breaks on new CUDA/PyTorch versions | Pre-built wheels for every CUDA version |
+| Model format | GPTQ (multi-file: safetensors + config) | GGUF (single binary file, self-describing) |
+| Dependencies | torch + triton + transformers + accelerate | Just llama-cpp-python |
+
+For production Linux deployment the Triton kernel is still valuable. For the Windows
+gaming loop (P5R running alongside the server), llama-cpp-python is the right tool.
+
+### What GGUF Is
+
+GGUF (Generic GPU Unified Format) is the model file format used by llama.cpp.
+A single `.gguf` file contains:
+- Model weights (quantized)
+- Tokenizer vocabulary and merge rules
+- Architecture hyperparameters (n_layers, n_heads, etc.)
+- Quantization metadata (scale factors, zero points)
+
+This self-description means you can load any GGUF model with one call:
+```python
+from llama_cpp import Llama
+model = Llama(model_path="models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+              n_gpu_layers=-1,   # offload all layers to GPU
+              n_ctx=2048)        # context window
+```
+
+No tokenizer download, no config.json, no `trust_remote_code`.
+
+### Q4_K_M: The Quantization Name Decoded
+
+`Q4_K_M` means:
+- `Q4` — 4-bit integers for weights (same bit-width as GPTQ)
+- `K`  — k-quants: groups of weights share a scale factor, reducing error vs flat Q4
+- `M`  — "medium" variant: attention layers use Q5 (one step higher), FFN uses Q4
+
+On an RTX 4060 8GB:
+- Model VRAM: ~4.9 GB
+- P5R VRAM: ~1.5 GB
+- OS + driver overhead: ~0.5 GB
+- Total: ~7 GB → 1 GB headroom ✓
+
+Generation speed for a 1-3 sentence response (~50 tokens): **~1.5–2 seconds**.
+Well inside our 8-second `DialogueBridge` timeout.
+
+### llama-cpp-python's Chat Completion API
+
+Instead of manually constructing `<s>[INST]` prompt strings (the Llama-2 format),
+llama-cpp-python exposes an OpenAI-compatible chat API:
+
+```python
+response = model.create_chat_completion(
+    messages=[
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": user_prompt},
+    ],
+    max_tokens=80,
+    temperature=0.8,
+    top_p=0.9,
+    repeat_penalty=1.1,
+)
+text = response["choices"][0]["message"]["content"].strip()
+```
+
+The library handles tokenization and special token injection for each supported
+model family (Llama-3 uses `<|begin_of_text|>`, Mistral uses `[INST]`, etc.)
+automatically from the GGUF metadata.
+
+### n_gpu_layers=-1: Full GPU Offload
+
+`n_gpu_layers=-1` tells llama.cpp to offload **all** transformer layers to VRAM.
+With all layers on the GPU, token generation is pure CUDA matmul — no PCIe transfers
+during the generation loop, giving maximum throughput.
+
+If VRAM fills up (both P5R and the LLM running simultaneously), set
+`n_gpu_layers=28` to offload 28 of 32 layers, keeping the last 4 on CPU. This
+reduces peak VRAM by ~0.6 GB with a small speed cost (~+200ms per response).

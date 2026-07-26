@@ -33,11 +33,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("MOCK_LLM=1 — skipping model load, returning canned responses.")
         _pipeline = _MOCK
     else:
-        log.info("Loading model %s …", _cfg.model_id)
+        log.info("Loading model from %s …", _cfg.model_path)
         try:
             from inference.model_loader import load_model
-            model, tokenizer = load_model(_cfg)
-            _pipeline = InferencePipeline(model, tokenizer, _cfg)
+            model     = load_model(_cfg)
+            _pipeline = InferencePipeline(model, _cfg)
             log.info("Model ready.")
         except Exception as exc:  # noqa: BLE001
             log.warning("Model load failed (%s). /generate will return 503.", exc)
