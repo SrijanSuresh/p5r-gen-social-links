@@ -1234,3 +1234,124 @@ during the generation loop, giving maximum throughput.
 If VRAM fills up (both P5R and the LLM running simultaneously), set
 `n_gpu_layers=28` to offload 28 of 32 layers, keeping the last 4 on CPU. This
 reduces peak VRAM by ~0.6 GB with a small speed cost (~+200ms per response).
+
+---
+
+## Chapter 14 — Phase 2: Per-Line NPC Generation Architecture
+
+### The Problem: One LLM Call Per Hang-Out Is Not Enough
+
+Phase 1 gave us one LLM response per session (triggered when the session pointer
+changes). A real P5R gym hang-out has ~15-30 dialogue lines and 3-4 player choices.
+Phase 2 makes the LLM respond to **each NPC speech bubble** independently.
+
+### Two Strategies for Per-Line Triggering
+
+**Strategy A — Hook-driven**: Intercept the function the game engine calls to
+display each new NPC speech bubble. That function is called exactly once per line
+render, giving us a natural "new line" signal with no polling.
+
+**Strategy B — Struct-diff polling**: Find a field inside the session struct that
+increments (or changes) every time the dialogue advances. Poll it at 100ms; when
+the value changes, dispatch a new LLM call.
+
+We are investigating both simultaneously. The CMM_EXEC_EVENT hook (already wired)
+is a candidate for Strategy A. For Strategy B, we need to scan more of the struct.
+
+### Why CMM_EXEC_EVENT Might Not Be Per-Line
+
+CMM_EXEC_EVENT (`CmmExecEvent` in Ghidra) fires when the Crimson Mask Manager
+executes a social-link **event** — but an "event" in P5R is the entire hang-out
+session, not a single dialogue line. That's why:
+
+- We hooked it → it fires once at session start (or not at all for some session types)
+- It never fires again until the next session
+
+The per-dialogue-line hook we actually want is deeper in the VMD (Virtual Machine
+Dialogue) stack — the function that writes each text string into the dialogue box
+render buffer. Finding that function requires Ghidra analysis of the call chain from
+CmmExecEvent down to the string-copy site.
+
+### The struct-diff approach: Passive Discovery
+
+While we work on Ghidra analysis, we can instrument the poll loop to **diff the
+entire first 64 bytes** of the session struct on every tick. Any byte that changes
+between ticks is a candidate for a per-line counter.
+
+```csharp
+// Capture baseline snapshot at session start
+byte[] _baseline = new byte[64];
+Buffer.MemoryCopy((void*)session, Unsafe.AsPointer(ref _baseline[0]), 64, 64);
+
+// Each tick: compare, log changed offsets
+for (int i = 0; i < 64; i++)
+{
+    if (current[i] != _baseline[i])
+        _logger.WriteLine($"  +0x{i:X2}: {_baseline[i]:X2} → {current[i]:X2}");
+}
+_baseline = current;
+```
+
+This passive scan requires zero Ghidra work — we let the game tell us which offsets
+are "live" during dialogue advancement.
+
+### Rate-Limiting LLM Dispatch Per Line
+
+If we find a per-line trigger, we can't just call `DispatchAsync` on every line:
+- Fast dialogue tap (player spamming confirm) could queue 10 calls
+- InferenceQueue already drops concurrent calls (429), so only the first survives
+- But the user sees long delays as each queued call completes in sequence
+
+The correct design is **leading-edge throttle with dead-time**:
+
+```
+line 1 fires at t=0    → dispatch (starts LLM, ~2s)
+line 2 fires at t=0.3  → skip (still within dead-time)
+line 3 fires at t=0.6  → skip
+...
+line 8 fires at t=3.1  → dispatch (dead-time expired, new LLM call)
+```
+
+Implementation: store `_lastDispatch = DateTimeOffset.UtcNow` on each dispatch.
+New dispatch only if `(UtcNow - _lastDispatch) > MinDispatchInterval` (default 3s).
+
+### Hook Diagnostic Checklist
+
+Before building more Phase 2 infrastructure, we must know why CmmExecEvent hook
+shows no log output. Possible causes:
+
+1. `IReloadedHooks` is null — shared lib not installed → hook creation skipped entirely
+2. Signature scan fails → `InvalidOperationException` → falls back to poll loop
+3. Hook IS active but the function is never called during gym hang-outs
+4. Hook fires but throws before reaching the log line
+
+To distinguish these: add explicit startup status logging that prints the hook
+state after `TryActivateHook()`, and add a hit counter inside `OnCmmExecEvent`
+that logs on first fire.
+
+### Architecture After Phase 2
+
+```
+                     P5R GAME ENGINE
+                           │
+          ┌────────────────┴────────────────┐
+          │ CmmExecEvent (session start)    │
+          │ TextDisplay hook (per line) ←── │ ← Phase 2 target
+          └────────────────┬────────────────┘
+                           │
+              ┌────────────▼───────────────┐
+              │    Mod.cs dispatcher       │
+              │  leading-edge throttle     │
+              │  3s dead-time per session  │
+              └────────────┬───────────────┘
+                           │
+              ┌────────────▼───────────────┐
+              │  DialogueBridge            │
+              │  POST /generate            │
+              └────────────┬───────────────┘
+                           │
+              ┌────────────▼───────────────┐
+              │  Llama-3.1-8B (GGUF)       │
+              │  ~2s per response          │
+              └────────────────────────────┘
+```
