@@ -18,7 +18,9 @@ internal sealed class DialogueBridge
 
     // Hard timeout: if the LLM takes longer than this, we fall back to the
     // scripted dialogue that is already in the buffer.
-    private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(8);
+    // 30s: first inference after model load triggers CUDA JIT warmup (~15s).
+    // Steady-state responses arrive in ~2s; the timeout only matters on cold start.
+    private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(30);
 
     internal interface ILogger
     {
