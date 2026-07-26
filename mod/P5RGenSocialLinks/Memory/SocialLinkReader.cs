@@ -20,7 +20,7 @@ internal sealed class SocialLinkReader
     /// </summary>
     internal static unsafe SocialLinkSnapshot? TryReadFromPtr(nuint sessionPtr)
     {
-        if (sessionPtr == 0) return null;
+        if (!MemoryGuard.IsReadable(sessionPtr, 0x10)) return null;
 
         int confidantId   = *(int*)(sessionPtr + (nuint)P5ROffsets.CONFIDANT_ID);
         int rankLevel     = *(int*)(sessionPtr + (nuint)P5ROffsets.RANK_LEVEL);
@@ -35,6 +35,9 @@ internal sealed class SocialLinkReader
     /// </summary>
     internal static unsafe string HexDump(nuint ptr, int bytes = 128)
     {
+        if (!MemoryGuard.IsReadable(ptr, bytes))
+            return $" [unreadable @ 0x{ptr:X}]";
+
         var sb = new System.Text.StringBuilder();
         byte* p = (byte*)ptr;
         for (int i = 0; i < bytes; i++)
