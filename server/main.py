@@ -67,6 +67,17 @@ async def health() -> dict[str, str]:
     return {"status": status}
 
 
+@app.get("/stats")
+async def stats() -> dict[str, object]:
+    return {
+        "total_requests":    _queue.total_requests,
+        "total_drops":       _queue.total_drops,
+        "total_completions": _queue.total_completions,
+        "avg_latency_ms":    _queue.avg_latency_ms,
+        "model_loaded":      _pipeline is not None and _pipeline is not _MOCK,
+    }
+
+
 @app.post("/generate", response_model=GenerateResponse)
 async def generate(req: GenerateRequest) -> GenerateResponse:
     if _pipeline is None:
