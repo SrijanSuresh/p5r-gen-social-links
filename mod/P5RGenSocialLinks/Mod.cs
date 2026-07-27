@@ -126,7 +126,9 @@ public class Mod : IModV1
         return result;
     }
 
-    // ── Poll loop (fallback) ───────────────────────────────────────────────
+    // ── Poll loop (fallback + struct discovery) ───────────────────────────
+
+    private readonly StructDiffScanner _diffScanner = new();
 
     private void StartPollLoop()
     {
@@ -141,16 +143,34 @@ public class Mod : IModV1
 
         while (await _timer!.WaitForNextTickAsync(ct))
         {
-            if (!_reader!.TryResolve(out nuint session)) { lastSession = 0; continue; }
-            if (session == lastSession) continue;
-            lastSession = session;
+            if (!_reader!.TryResolve(out nuint session))
+            {
+                if (lastSession != 0) _diffScanner.Reset();
+                lastSession = 0;
+                continue;
+            }
 
-            SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
-            if (snap is null) continue;
+            if (session != lastSession)
+            {
+                lastSession = session;
+                _diffScanner.Reset();
 
-            _logger!.WriteLine(
-                $"[P5RGenSocialLinks] Hang-out: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber} (0x{session:X})");
-            _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap));
+                SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
+                if (snap is null) continue;
+
+                _logger!.WriteLine(
+                    $"[P5RGenSocialLinks] Hang-out: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber} (0x{session:X})");
+
+                if (!_hookActive)
+                    _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap));
+
+                continue;
+            }
+
+            // Same session — diff the struct to find per-line changing fields.
+            string? diff = _diffScanner.Diff(session);
+            if (diff is not null)
+                _logger!.WriteLine($"[P5RGenSocialLinks] {diff}");
         }
     }
 
