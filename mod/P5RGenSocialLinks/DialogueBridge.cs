@@ -22,6 +22,13 @@ internal sealed class DialogueBridge
     // Steady-state responses arrive in ~2s; the timeout only matters on cold start.
     private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(30);
 
+    // Leading-edge throttle: minimum gap between two consecutive LLM dispatches.
+    // Prevents GPU thrashing when a per-line trigger fires on rapid dialogue tap.
+    // 3s > steady-state LLM latency (~2s), so we never stack calls.
+    private static readonly TimeSpan MinDispatchInterval = TimeSpan.FromSeconds(3);
+
+    private DateTimeOffset _lastDispatch = DateTimeOffset.MinValue;
+
     internal interface ILogger
     {
         void WriteLine(string message);
@@ -34,11 +41,19 @@ internal sealed class DialogueBridge
     }
 
     /// <summary>
-    /// Fires-and-forgets an LLM request. On success, overwrites the game buffer.
+    /// Fires-and-forgets an LLM request with leading-edge throttling.
+    /// Returns false immediately if called within MinDispatchInterval of the last dispatch.
+    /// On success, logs the generated response (write-back pending offset discovery).
     /// On timeout or error, the original scripted dialogue remains untouched.
     /// </summary>
-    internal void DispatchAsync(SocialLinkSnapshot snap, string contextText)
+    internal bool DispatchAsync(SocialLinkSnapshot snap, string contextText)
     {
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        if (now - _lastDispatch < MinDispatchInterval)
+            return false;
+
+        _lastDispatch = now;
+
         _ = Task.Run(async () =>
         {
             using var cts = new CancellationTokenSource(Timeout);
@@ -74,5 +89,7 @@ internal sealed class DialogueBridge
                 _log.WriteLine($"[P5RGenSocialLinks] LLM error: {ex.Message}");
             }
         });
+
+        return true;
     }
 }

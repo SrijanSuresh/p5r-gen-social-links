@@ -116,7 +116,9 @@ public class Mod : IModV1
 
             _logger?.WriteLine(
                 $"[P5RGenSocialLinks] CmmExec #{fireCount}: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber}");
-            _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap));
+            bool dispatched = _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap));
+            if (!dispatched)
+                _logger?.WriteLine($"[P5RGenSocialLinks] CmmExec #{fireCount}: throttled (< 3s since last dispatch).");
         }
         catch (Exception ex)
         {
