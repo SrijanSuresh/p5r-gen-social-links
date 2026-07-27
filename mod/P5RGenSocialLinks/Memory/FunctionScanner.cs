@@ -37,5 +37,15 @@ internal sealed class FunctionScanner : IDisposable
         return _moduleBase + (nuint)result.Offset;
     }
 
+    /// <summary>
+    /// Returns the offset of the first occurrence of <paramref name="pattern"/>,
+    /// or null if not found. Used for discovery logging without hooking.
+    /// </summary>
+    internal nuint? TryFindFirst(string pattern)
+    {
+        PatternScanResult result = _scanner.FindPattern(pattern);
+        return result.Found ? _moduleBase + (nuint)result.Offset : null;
+    }
+
     public void Dispose() => _scanner.Dispose();
 }

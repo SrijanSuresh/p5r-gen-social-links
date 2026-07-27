@@ -59,20 +59,25 @@ public class Mod : IModV1
         try
         {
             using var scanner = new FunctionScanner();
-            nuint funcAddr = scanner.FindOrThrow(Signatures.BeginConversation);
-            _logger!.WriteLine($"[P5RGenSocialLinks] Hook target: 0x{funcAddr:X}");
 
-            var hooks = ReloadedHooks.Instance;
-            _conversationHook = hooks
-                .CreateHook<ConversationInitDelegate>(OnConversationInit, (long)funcAddr)
-                .Activate();
-
-            _logger.WriteLine("[P5RGenSocialLinks] Conversation hook active.");
+            // Discovery pass: log the first hit of the broad LEA pattern so we
+            // can inspect it in CE's disassembler and build a precise signature.
+            nuint? candidate = scanner.TryFindFirst(Signatures.BeginConversation);
+            if (candidate is nuint addr)
+            {
+                _logger!.WriteLine(
+                    $"[P5RGenSocialLinks] LEA 0x62B8 candidate: 0x{addr:X} " +
+                    $"(offset from base: 0x{addr - (nuint)System.Diagnostics.Process.GetCurrentProcess().MainModule!.BaseAddress:X})");
+                _logger.WriteLine("[P5RGenSocialLinks] Open CE disassembler at that address to find function start.");
+            }
+            else
+            {
+                _logger!.WriteLine("[P5RGenSocialLinks] Pattern 48 8D ?? B8 62 00 00 not found — 0x62B8 offset may differ in this build.");
+            }
         }
-        catch (InvalidOperationException ex)
+        catch (Exception ex)
         {
-            _logger!.WriteLine($"[P5RGenSocialLinks] Hook skipped (sig not found): {ex.Message}");
-            _logger.WriteLine("[P5RGenSocialLinks] Falling back to poll loop.");
+            _logger!.WriteLine($"[P5RGenSocialLinks] Scanner error: {ex.Message}");
         }
     }
 
