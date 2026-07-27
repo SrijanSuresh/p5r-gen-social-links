@@ -35,6 +35,7 @@ public class Mod : IModV1
     // The native function reads from globals (no meaningful parameters).
     private IHook<CmmExecEventDelegate>? _conversationHook;
     private IReloadedHooks?              _hooks;
+    private int                          _cmmExecFireCount;
 
     [Function(CallingConventions.Microsoft)]
     public delegate nint CmmExecEventDelegate();
@@ -56,32 +57,40 @@ public class Mod : IModV1
         TryActivateHook();
         StartPollLoop();
 
-        _logger.WriteLine("[P5RGenSocialLinks] Started.");
+        _logger.WriteLine($"[P5RGenSocialLinks] Started — hook:{(_hookActive ? "ON" : "OFF")} poll:ON");
     }
+
+    // Tracks whether the hook wired successfully — logged on Start() completion.
+    private bool _hookActive;
 
     private void TryActivateHook()
     {
+        _logger!.WriteLine("[P5RGenSocialLinks] TryActivateHook: begin.");
+        _logger!.WriteLine($"[P5RGenSocialLinks] IReloadedHooks available: {_hooks is not null}");
+
         try
         {
             using var scanner = new FunctionScanner();
             nuint funcAddr = scanner.FindOrThrow(Signatures.CmmExecEvent);
-            _logger!.WriteLine($"[P5RGenSocialLinks] CmmExecEvent hook target: 0x{funcAddr:X}");
+            _logger!.WriteLine($"[P5RGenSocialLinks] CmmExecEvent sig scan OK: 0x{funcAddr:X}");
 
             if (_hooks is null)
             {
-                _logger!.WriteLine("[P5RGenSocialLinks] IReloadedHooks not available — is reloaded.sharedlib.hooks installed?");
+                _logger!.WriteLine("[P5RGenSocialLinks] Hook skipped — IReloadedHooks null (install reloaded.sharedlib.hooks).");
                 return;
             }
+
             _conversationHook = _hooks
                 .CreateHook<CmmExecEventDelegate>(OnCmmExecEvent, (long)funcAddr)
                 .Activate();
 
-            _logger.WriteLine("[P5RGenSocialLinks] CmmExecEvent hook active.");
+            _hookActive = true;
+            _logger.WriteLine("[P5RGenSocialLinks] CmmExecEvent hook ACTIVE.");
         }
         catch (InvalidOperationException ex)
         {
-            _logger!.WriteLine($"[P5RGenSocialLinks] Hook skipped: {ex.Message}");
-            _logger.WriteLine("[P5RGenSocialLinks] Falling back to poll loop.");
+            _logger!.WriteLine($"[P5RGenSocialLinks] Sig scan FAILED: {ex.Message}");
+            _logger.WriteLine("[P5RGenSocialLinks] Falling back to poll loop only.");
         }
     }
 
@@ -90,21 +99,23 @@ public class Mod : IModV1
         // Run original first — it populates the session sub-object we are about to read.
         nint result = _conversationHook!.OriginalFunction();
 
+        int fireCount = System.Threading.Interlocked.Increment(ref _cmmExecFireCount);
+
         try
         {
             if (!_reader!.TryResolve(out nuint session))
             {
-                _logger?.WriteLine("[P5RGenSocialLinks] CmmExecEvent: session chain unresolved.");
+                _logger?.WriteLine($"[P5RGenSocialLinks] CmmExecEvent #{fireCount}: session chain unresolved.");
                 return result;
             }
 
-            _logger?.WriteLine($"[P5RGenSocialLinks] CmmExecEvent session=0x{session:X}");
+            _logger?.WriteLine($"[P5RGenSocialLinks] CmmExecEvent #{fireCount} session=0x{session:X}");
 
             SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
             if (snap is null) return result;
 
             _logger?.WriteLine(
-                $"[P5RGenSocialLinks] CmmExec: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber}");
+                $"[P5RGenSocialLinks] CmmExec #{fireCount}: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber}");
             _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap));
         }
         catch (Exception ex)
