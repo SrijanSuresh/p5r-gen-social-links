@@ -23,6 +23,27 @@ internal static class P5ROffsets
     //   +00B: 04           → byte  = 4  (rank before this session; Ryuji went 4→5) CONFIRMED
     //   +00C: 33 00        → int16 = 51 (unknown — scene/event number)
     //   +010: ptr (unknown)
+    // ── Dialogue line counter (discovered via Cheat Engine, 2026-08-09) ──────────
+    // CE "increased by 1" scan during Ryuji Scene 51 + "Find out what writes"
+    // revealed: mov [rcx+18],eax at 0x7FFA995C2928 writes to 0x006FFC28.
+    // Increments once per player dialogue-advance button press.
+    // Writes stop when CMM session ends — confirmed Social Link specific.
+    //
+    // WARNING: 0x006FFC28 is likely a heap or DLL-data address, NOT module-relative.
+    // Verify it is stable across game restarts before relying on it directly.
+    // Long-term: trace from 0x006FFC10 (counter struct base) via Ghidra to find
+    // the module-relative static pointer that reaches it.
+    internal const nuint CMM_LINE_COUNTER_ADDR         = 0x006FFC28;  // absolute — verify static
+    internal const nuint CMM_LINE_COUNTER_STRUCT_BASE  = 0x006FFC10;  // rcx at write time
+    internal const int   CMM_LINE_COUNTER_STRUCT_OFFSET = 0x18;       // [rcx+0x18] = counter byte
+
+    // ── Script text pool (discovered via CE string scan, 2026-08-09) ─────────
+    // All dialogue for a scene is pre-loaded contiguously at hang-out start.
+    // Found at ~0x41DE9104BA (heap, changes per session).
+    // Pointer chain from session struct to pool: NOT YET FOUND — needs Ghidra.
+    // Write-back strategy: overwrite pool entries at hang-out start, before player reaches them.
+    internal const nuint SCRIPT_TEXT_POOL_ADDR_UNKNOWN = 0x0;  // placeholder — needs pointer chain
+
     internal const int CONFIDANT_ID    = 0x00;  // int32
     // +0x04 is always 0 in every observed session — not a dialogue-line counter.
     // May track scene phase or be a reserved field. Renamed to avoid confusion.

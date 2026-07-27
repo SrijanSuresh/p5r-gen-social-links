@@ -1935,3 +1935,75 @@ confirmed LLM response from the previous session was:
 
 In character, rank-appropriate, correct length — the real inference works.
 
+---
+
+## Chapter 23 — Cheat Engine Recon: Script Pool, Line Counter, and the Pre-Load Problem
+
+### What We Found
+
+A live CE session against P5R during Ryuji's Scene 51 (gym hang-out) revealed:
+
+**1. The 16-bit game timer at +0x20/+0x21**
+The StructDiff output showed `+0x20` changing every 500ms poll tick by ~60 units,
+with `+0x21` catching the carry overflow. Together they form a continuously running
+16-bit little-endian clock — NOT a dialogue-line counter. The CMM session struct's
+first 64 bytes contain timing state, not line progression.
+
+**2. The dialogue line counter at 0x006FFC28**
+CE's "increased by 1" scan + "Find out what writes to this address" revealed:
+- Address `0x006FFC28` holds a byte that increments once per dialogue advance
+- The write instruction: `mov [rcx+18], eax` at `0x7FFA995C2928` (a system/middleware DLL)
+- This means the counter sits at offset `+0x18` inside a struct based at `0x006FFC10`
+- Writes stop when the CMM session ends — confirming it's Social Link specific
+
+**3. The pre-loaded script text pool**
+A CE string scan for on-screen dialogue found the text at `~0x41DE9104BA` — about
+1.6MB past the session struct. Crucially, scrolling around that address revealed
+multiple dialogue lines stored **contiguously**. The text doesn't change in-place
+when you advance a line; instead, the game moves a read-pointer forward through the pool.
+
+### The Pre-Load Problem
+
+This is the central challenge for write-back. In Unreal or Unity games, a "current
+dialogue" string variable gets overwritten on each line. In P5R's BF script system:
+
+```
+[Script Text Pool — loaded at hang-out start]
+  offset 0x000: "Yo, you ready? We're not leavin'...\0"
+  offset 0x030: "Man, I've been thinking about...\0"
+  offset 0x060: "Hey, you think we can actually...\0"
+  ...
+```
+
+A read-pointer (somewhere near `0x006FFC10`) advances through this pool. The game
+never "writes" a new string — it just reads further ahead.
+
+**Consequence for write-back**: we cannot replace text in real-time as each line
+appears. We must overwrite entries in the pool *before* the player reaches them —
+at hang-out start. This means:
+1. Detect hang-out (we already do this)
+2. Immediately generate 2-3 LLM lines for the opening exchange
+3. Find the text pool address and overwrite specific offsets
+4. Player sees our text when they advance
+
+### Why the Pool Address Isn't Fixed
+
+`0x41DE9104BA` is a heap allocation — it changes every game restart. To find it
+reliably we need a pointer chain from a stable root (a static global or the session
+struct). That pointer chain requires Ghidra: we trace from `0x006FFC10` (the counter
+struct) back through whatever holds a reference to it, until we hit a module-relative
+static offset we can hardcode.
+
+### Session Timing Constraint
+
+The CMM session struct deallocates *before* the hang-out scene fully ends — confirmed
+when the mod logged `Hang-out ended` while gym dialogue was still playing on screen.
+This means our write-back window is the **opening phase** of each hang-out, not the
+closing transition. All LLM writes must complete before the first rank-up animation.
+
+### What This Unlocks Right Now
+
+Even without the text pool pointer, we gained a per-line trigger: when `0x006FFC28`
+increments, a new dialogue line just appeared. Wiring this into the poll loop replaces
+our once-per-session dispatch with a true per-line dispatch — closer to the full vision.
+
