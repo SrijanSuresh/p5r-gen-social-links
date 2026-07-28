@@ -30,13 +30,24 @@ public class Mod : IModV1
     private Task?                   _pollTask;
     private CancellationTokenSource _cts = new();
 
-    // CmmExecEvent fires once per dialogue line — this is the primary per-line LLM trigger.
+    // CmmExecEvent fires once at hang-out init (not per-line, kept for session context).
     private IHook<CmmExecEventDelegate>? _conversationHook;
     private IReloadedHooks?              _hooks;
     private int                          _cmmExecFireCount;
 
     [Function(CallingConventions.Microsoft)]
     public delegate nint CmmExecEventDelegate();
+
+    // Per-line hook: intercepts the game's memcpy (p5r.exe+0x5A8590) to capture
+    // dialogue text as it is copied into the display buffer.
+    [Function(CallingConventions.Microsoft)]
+    private delegate void MemcpyGameDelegate(nuint dst, nuint src, nuint count);
+
+    private IHook<MemcpyGameDelegate>? _memcpyHook;
+    private volatile bool              _inActiveSession;
+
+    // Dialogue heap sits above 256 GB; CLR/runtime copies are all below 4 GB.
+    private static readonly nuint HeapLow = unchecked((nuint)0x4000000000UL);
 
     private GenConfig _cfg = new();
 
@@ -63,12 +74,51 @@ public class Mod : IModV1
         loader.GetController<IReloadedHooks>()?.TryGetTarget(out _hooks);
 
         TryActivateHook();
+        SetupMemcpyHook();
         StartPollLoop();
 
         _logger.WriteLine($"[P5RGenSocialLinks] Started — hook:{(_hookActive ? "ON" : "OFF")} poll:ON");
     }
 
     private bool _hookActive;
+
+    private void SetupMemcpyHook()
+    {
+        if (_hooks is null)
+        {
+            _logger!.WriteLine("[P5RGenSocialLinks] Memcpy hook skipped — IReloadedHooks null.");
+            return;
+        }
+        nuint moduleBase = (nuint)Process.GetCurrentProcess().MainModule!.BaseAddress;
+        nuint addr = moduleBase + 0x5A8590;
+        _memcpyHook = _hooks.CreateHook<MemcpyGameDelegate>(OnGameMemcpy, (long)addr).Activate();
+        _logger!.WriteLine($"[P5RGenSocialLinks] Memcpy hook ACTIVE at 0x{addr:X}");
+    }
+
+    private unsafe void OnGameMemcpy(nuint dst, nuint src, nuint count)
+    {
+        _memcpyHook!.OriginalFunction(dst, src, count);
+
+        // Fast-path guards — reject the overwhelming majority of non-dialogue copies.
+        if (src < HeapLow || count < 10 || count > 600) return;
+        if (!_inActiveSession) return;
+
+        int n = (int)count;
+        byte* p = (byte*)dst;
+
+        // Require at least 5 printable ASCII bytes in the first 64 to avoid binary data.
+        int printable = 0;
+        int check = Math.Min(n, 64);
+        for (int i = 0; i < check && p[i] != 0; i++)
+            if (p[i] >= 0x20 && p[i] <= 0x7E) printable++;
+        if (printable < 5) return;
+
+        var sb = new System.Text.StringBuilder(n);
+        for (int i = 0; i < n && p[i] != 0; i++)
+            sb.Append(p[i] >= 0x20 && p[i] <= 0x7E ? (char)p[i] : '·');
+
+        _modLog!.Info($"[MemcpyHook] ({n}B src=0x{src:X}): \"{sb}\"");
+    }
 
     private void TryActivateHook()
     {
@@ -170,6 +220,7 @@ public class Mod : IModV1
                     _diffScanner.Reset();
                     _bridge!.ResetSession();
                     _poolFindRetries = 0;
+                    _inActiveSession = false;
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
                 }
                 lastSession = 0;
@@ -181,6 +232,7 @@ public class Mod : IModV1
                 lastSession = session;
                 _diffScanner.Reset();
                 _poolFindRetries = 0;
+                _inActiveSession = true;
 
                 SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
                 if (snap is null) continue;
@@ -244,6 +296,8 @@ public class Mod : IModV1
     {
         _cts.Cancel();
         _conversationHook?.Disable();
+        _memcpyHook?.Disable();
+        _inActiveSession = false;
         _diffScanner.Reset();
         _logger?.WriteLine("[P5RGenSocialLinks] Suspended.");
     }
@@ -251,6 +305,7 @@ public class Mod : IModV1
     public void Resume()
     {
         _conversationHook?.Enable();
+        _memcpyHook?.Enable();
         StartPollLoop();
         _logger?.WriteLine("[P5RGenSocialLinks] Resumed.");
     }
@@ -262,6 +317,8 @@ public class Mod : IModV1
         _timer?.Dispose();
         _llmClient?.Dispose();
         _conversationHook?.Disable();
+        _memcpyHook?.Disable();
+        _inActiveSession = false;
         _diffScanner.Reset();
         _logger?.WriteLine("[P5RGenSocialLinks] Unloaded.");
     }

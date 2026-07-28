@@ -2754,4 +2754,93 @@ New strategy:
 - Existing 3-second throttle prevents duplicate calls
 - No pool finder, no CmmExecEvent, no per-session scanning
 
+---
+
+## Chapter 35 — Why the CE Call Stack Showed .NET Frames, and How Source-Address Filtering Solves It
+
+### What the CE breakpoint actually showed
+
+Setting a software breakpoint at `p5r.exe+5A857E` (the `REP MOVSB` inside `FUN_1405a8570`)
+caused CE to break immediately with these call stack entries:
+
+```
+P5R.exe+4FFF1C   System.Net.Net...
+P5R.exe+4EC675   Reloaded.Mod...
+P5R.exe+4EC221   0AD44BD0,Syste...
+```
+
+And the source register was `RSI = 0x0AD453E8` — a 32-bit address well below 4 GB.
+
+This is **not** the game's dialogue copy. Reloaded-II hosts the .NET CLR inside the
+P5R process. The CLR runtime performs its own internal memory operations — GC compaction,
+string interning, JIT code emission — and many of those paths call into the same native
+memcpy that P5R uses. A static breakpoint at that function fires for all of them
+indiscriminately.
+
+**Key insight:** The dialogue text addresses we confirmed with CE were all in the range
+`0x41XXXXXXXX` — above `0x4000000000` (256 GB). The CLR and runtime copies are in the
+low 4 GB range (`0x0XXXXXXXX`). A single 64-bit comparison separates them with zero
+false positives.
+
+### Hooking `FUN_1405a8590` directly (the memcpy dispatcher)
+
+`FUN_1405a8590` at `p5r.exe+0x5A8590` is the game's `memcpy` dispatcher. Its Microsoft
+x64 calling convention maps perfectly:
+
+```
+RCX = dst   (destination buffer)
+RDX = src   (source — the dialogue text buffer)
+R8  = count (byte count, typically 512 for dialogue)
+```
+
+Reloaded-II's `CreateHook<T>` with `[Function(CallingConventions.Microsoft)]` wraps
+this function cleanly: we call `OriginalFunction(dst, src, count)` first (so the copy
+always completes), then inspect the destination for dialogue content.
+
+### The three-tier filter
+
+The hook must be extremely fast because memcpy is called constantly. Three cheap guards
+eliminate almost all non-dialogue calls before any string inspection:
+
+```
+1. src <  0x4000000000  →  return  (CLR/runtime low-heap copy, skip)
+2. count < 10 || count > 600  →  return  (too small or too large for dialogue)
+3. !_inActiveSession  →  return  (no social link in progress)
+```
+
+Only if all three pass does the hook scan the destination buffer for printable text
+(≥5 printable bytes in the first 64 bytes). That check costs ~64 iterations at most,
+and only during confirmed dialogue scenes.
+
+### `_inActiveSession` — cached boolean avoids session-chain lookup in hot path
+
+`TryResolve()` walks a pointer chain on every call. That is fine in the 500 ms poll
+loop but would be expensive called from inside the game's memcpy thousands of times
+per second. Instead, the poll loop sets a `volatile bool _inActiveSession` whenever it
+detects or loses a session. The hook reads this single boolean — one cache-coherent
+load — with no lock.
+
+### Why we read from `dst` (destination), not `src` (source)
+
+The `OriginalFunction` call copies `count` bytes from `src` to `dst`. After that
+call returns, `dst` has the same content as `src` — but accessing `dst` is safer:
+
+- `src` is the BF interpreter's internal buffer. Writing to it could corrupt the
+  interpreter's own state if it re-reads from that address later.
+- `dst` is the display buffer. Writing to it is exactly what LLM write-back needs
+  to do — overwrite the destination so the renderer sees our text.
+
+For Phase 1 (observation), we only log from `dst`. For Phase 2 (write-back), we
+will `Marshal.Copy` the LLM byte array into `dst` in-place, immediately after the
+native copy completes and before the renderer reads from it.
+
+### Next step: confirm captures match dialogue, then add write-back
+
+After building and deploying, run a hang-out and check the log for:
+```
+[MemcpyHook] (512B src=0x41DBE3B059): "It·s a gym over in Shibuya····"
+```
+Once we confirm dialogue text appears there (and not noise), we pipe `dst` through
+`_bridge.DispatchAsync()` and write the LLM response back to `dst`.
+
 This is simpler than everything we built. One mid-function hook, one buffer overwrite.
