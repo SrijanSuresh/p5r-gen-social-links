@@ -12,9 +12,9 @@ internal sealed class PointerChainResolver
 {
     private readonly nuint _moduleBase;
 
-    // Pointer chain: [moduleBase + SL_STATIC_PTR] -> +0x18 -> +0x08 -> SocialLinkSession*
-    // These offsets are PLACEHOLDERS — verify with Cheat Engine + Ghidra against your build.
-    private static readonly int[] Chain = { 0x18, 0x08 };
+    // Chain: [moduleBase + SL_STATIC_PTR] -> +0x48 -> CmmSession*
+    // Derived from CMM_EXEC_EVENT: MOV RAX,[CMM_global]; MOV RCX,[RAX+0x48]
+    private static readonly int[] Chain = { P5ROffsets.CMM_SESSION_OFFSET };
 
     internal PointerChainResolver(nuint moduleBase)
     {

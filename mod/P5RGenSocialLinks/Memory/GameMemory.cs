@@ -1,19 +1,25 @@
 ﻿namespace P5RGenSocialLinks.Memory;
 
-// Offsets discovered via Cheat Engine / ghidra analysis of P5R PC binary.
+// Offsets discovered via Ghidra analysis of CMM_EXEC_EVENT native function.
 // All values are relative to the module base address of p5r.exe.
-// These are placeholder offsets — they MUST be verified against the actual binary.
 internal static class P5ROffsets
 {
-    // Pointer chain to the active Social Link session object:
-    // [[[BaseModule + SL_STATIC_PTR] + 0x18] + 0x08] = SocialLinkSession*
-    internal const int SL_STATIC_PTR   = 0x01_E8_00_00;
+    // Static pointer to the CommunityManager object.
+    // Found via Ghidra: CMM_EXEC_EVENT at 0x140E0D0B0 opens with
+    //   MOV RAX, [DAT_142a63ef0]  →  offset 0x2A63EF0 from image base.
+    internal const int SL_STATIC_PTR = 0x02_A6_3E_F0;
 
-    // Offsets within SocialLinkSession struct
-    internal const int CONFIDANT_ID    = 0x00;  // int32 — which arcana/character
-    internal const int RANK_LEVEL      = 0x04;  // int32 — current rank 1-10
-    internal const int DIALOGUE_INDEX  = 0x08;  // int32 — script line index
-    internal const int DIALOGUE_BUFFER = 0x10;  // wchar_t* — pointer to UTF-16 text buffer
+    // Chain offset: [CMM + 0x48] = active community event/session sub-object.
+    // Discovered from:  MOV RCX, [RAX + 0x48]  in CMM_EXEC_EVENT.
+    internal const int CMM_SESSION_OFFSET = 0x48;
+
+    // Field offsets within the session sub-object — byte at +0xA observed in
+    // CMM_EXEC_EVENT: MOVZX EAX, byte ptr [RCX + 0xA].
+    // Remaining offsets (rank, dialogue) are candidates pending hex-dump confirmation.
+    internal const int CONFIDANT_ID    = 0x0A;  // byte — cmmId 1-21 (arcana index)
+    internal const int RANK_LEVEL      = 0x0B;  // byte candidate — needs verification
+    internal const int DIALOGUE_INDEX  = 0x0C;  // byte candidate — needs verification
+    internal const int DIALOGUE_BUFFER = 0x10;  // ptr candidate — needs verification
 }
 
 // Memory layout of the Social Link session struct (mirrors C++ object in P5R)

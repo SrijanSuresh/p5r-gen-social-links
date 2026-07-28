@@ -31,11 +31,12 @@ public class Mod : IModV1
     private Task?                   _pollTask;
     private CancellationTokenSource _cts = new();
 
-    // Conversation-init detour
-    private IHook<ConversationInitDelegate>? _conversationHook;
+    // CMM_EXEC_EVENT detour — fires when a Social Link community event executes.
+    // The native function reads from globals (no meaningful parameters).
+    private IHook<CmmExecEventDelegate>? _conversationHook;
 
     [Function(CallingConventions.Microsoft)]
-    public delegate void ConversationInitDelegate(nuint sessionPtr);
+    public delegate nint CmmExecEventDelegate();
 
     public void Start(IModLoaderV1 loader)
     {
@@ -59,63 +60,52 @@ public class Mod : IModV1
         try
         {
             using var scanner = new FunctionScanner();
+            nuint funcAddr = scanner.FindOrThrow(Signatures.CmmExecEvent);
+            _logger!.WriteLine($"[P5RGenSocialLinks] CmmExecEvent hook target: 0x{funcAddr:X}");
 
-            // Discovery pass: log the first hit of the broad LEA pattern so we
-            // can inspect it in CE's disassembler and build a precise signature.
-            nuint? candidate = scanner.TryFindFirst(Signatures.BeginConversation);
-            if (candidate is nuint addr)
-            {
-                _logger!.WriteLine(
-                    $"[P5RGenSocialLinks] LEA 0x62B8 candidate: 0x{addr:X} " +
-                    $"(offset from base: 0x{addr - (nuint)System.Diagnostics.Process.GetCurrentProcess().MainModule!.BaseAddress:X})");
-                _logger.WriteLine("[P5RGenSocialLinks] Open CE disassembler at that address to find function start.");
-            }
-            else
-            {
-                _logger!.WriteLine("[P5RGenSocialLinks] Pattern 48 8D ?? B8 62 00 00 not found — 0x62B8 offset may differ in this build.");
-            }
+            var hooks = ReloadedHooks.Instance;
+            _conversationHook = hooks
+                .CreateHook<CmmExecEventDelegate>(OnCmmExecEvent, (long)funcAddr)
+                .Activate();
+
+            _logger.WriteLine("[P5RGenSocialLinks] CmmExecEvent hook active.");
         }
-        catch (Exception ex)
+        catch (InvalidOperationException ex)
         {
-            _logger!.WriteLine($"[P5RGenSocialLinks] Scanner error: {ex.Message}");
+            _logger!.WriteLine($"[P5RGenSocialLinks] Hook skipped: {ex.Message}");
+            _logger.WriteLine("[P5RGenSocialLinks] Falling back to poll loop.");
         }
     }
 
-    private void OnConversationInit(nuint sessionPtr)
+    private nint OnCmmExecEvent()
     {
-        // Run original first so session fields are initialised before we read them
-        _conversationHook!.OriginalFunction(sessionPtr);
-
-        _logger?.WriteLine($"[P5RGenSocialLinks] sessionPtr=0x{sessionPtr:X}");
-
-        if (sessionPtr == 0)
-        {
-            _logger?.WriteLine("[P5RGenSocialLinks] sessionPtr is null — skipping.");
-            return;
-        }
+        // Run original first — it populates the session sub-object we are about to read.
+        nint result = _conversationHook!.OriginalFunction();
 
         try
         {
-            // LEA RBX,[RCX+0x62B8] in the prologue tells us the SL session struct
-            // begins 0x62B8 bytes into the manager object that RCX (sessionPtr) points to.
-            const nuint SESSION_OFFSET = 0x62B8;
-            nuint slSession = sessionPtr + SESSION_OFFSET;
-            _logger?.WriteLine($"[P5RGenSocialLinks] slSession=0x{slSession:X}");
-            _logger?.WriteLine($"[P5RGenSocialLinks] HexDump@slSession:{SocialLinkReader.HexDump(slSession)}");
+            if (!_reader!.TryResolve(out nuint session))
+            {
+                _logger?.WriteLine("[P5RGenSocialLinks] CmmExecEvent: session chain unresolved.");
+                return result;
+            }
 
-            SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(slSession);
-            if (snap is null)
-                return;
+            _logger?.WriteLine($"[P5RGenSocialLinks] CmmExecEvent session=0x{session:X}");
+            _logger?.WriteLine($"[P5RGenSocialLinks] HexDump:{SocialLinkReader.HexDump(session)}");
+
+            SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
+            if (snap is null) return result;
 
             _logger?.WriteLine(
-                $"[P5RGenSocialLinks] Hook: Confidant={snap.ConfidantId} Rank={snap.RankLevel}");
-
+                $"[P5RGenSocialLinks] Confidant={snap.ConfidantId} Rank={snap.RankLevel}");
             _bridge!.DispatchAsync(snap, ContextBuilder.ReadAndBuild(snap));
         }
         catch (Exception ex)
         {
-            _logger?.WriteLine($"[P5RGenSocialLinks] OnConversationInit error: {ex.Message}");
+            _logger?.WriteLine($"[P5RGenSocialLinks] OnCmmExecEvent error: {ex.Message}");
         }
+
+        return result;
     }
 
     // ── Poll loop (fallback) ───────────────────────────────────────────────

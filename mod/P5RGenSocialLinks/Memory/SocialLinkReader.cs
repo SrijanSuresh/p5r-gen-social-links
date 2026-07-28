@@ -13,6 +13,8 @@ internal sealed class SocialLinkReader
         _resolver = new PointerChainResolver(moduleBase);
     }
 
+    internal bool TryResolve(out nuint session) => _resolver.TryResolve(out session);
+
     /// <summary>
     /// Reads a snapshot directly from a pointer received via the hook argument.
     /// Bypasses the pointer chain entirely — use this inside OnConversationInit
