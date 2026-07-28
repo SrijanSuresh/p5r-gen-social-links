@@ -13,7 +13,7 @@
   "Tags": [],
   "IsLibrary": false,
   "IsUniversalMod": false,
-  "ModDependencies": [],
+  "ModDependencies": ["reloaded.sharedlib.hooks"],
   "OptionalDependencies": [],
   "SupportedAppId": [
     "p5r.exe"

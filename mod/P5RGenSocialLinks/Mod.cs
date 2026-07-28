@@ -2,9 +2,9 @@ using System;
 using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
-using Reloaded.Hooks;
 using Reloaded.Hooks.Definitions;
 using Reloaded.Hooks.Definitions.X64;
+using Reloaded.Mod.Interfaces;
 using Reloaded.Mod.Interfaces.Internal;
 using P5RGenSocialLinks.Memory;
 using P5RGenSocialLinks.Server;
@@ -34,6 +34,7 @@ public class Mod : IModV1
     // CMM_EXEC_EVENT detour — fires when a Social Link community event executes.
     // The native function reads from globals (no meaningful parameters).
     private IHook<CmmExecEventDelegate>? _conversationHook;
+    private IReloadedHooks?              _hooks;
 
     [Function(CallingConventions.Microsoft)]
     public delegate nint CmmExecEventDelegate();
@@ -49,6 +50,9 @@ public class Mod : IModV1
         _reader = new SocialLinkReader(moduleBase);
         _bridge = new DialogueBridge(_llmClient!, new LoggerAdapter(_logger!));
 
+        // Hooks implementation provided by reloaded.sharedlib.hooks at runtime.
+        loader.GetController<IReloadedHooks>()?.TryGetTarget(out _hooks);
+
         TryActivateHook();
         StartPollLoop();
 
@@ -63,8 +67,12 @@ public class Mod : IModV1
             nuint funcAddr = scanner.FindOrThrow(Signatures.CmmExecEvent);
             _logger!.WriteLine($"[P5RGenSocialLinks] CmmExecEvent hook target: 0x{funcAddr:X}");
 
-            var hooks = ReloadedHooks.Instance;
-            _conversationHook = hooks
+            if (_hooks is null)
+            {
+                _logger!.WriteLine("[P5RGenSocialLinks] IReloadedHooks not available — is reloaded.sharedlib.hooks installed?");
+                return;
+            }
+            _conversationHook = _hooks
                 .CreateHook<CmmExecEventDelegate>(OnCmmExecEvent, (long)funcAddr)
                 .Activate();
 

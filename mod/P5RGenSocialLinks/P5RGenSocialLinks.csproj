@@ -20,7 +20,8 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Reloaded.Hooks" Version="4.3.3" />
+    <!-- Reloaded.Hooks removed: bundling it causes Reloaded.Memory version conflicts.
+         The hooks implementation is provided by reloaded.sharedlib.hooks at runtime. -->
     <PackageReference Include="Reloaded.Hooks.Definitions" Version="1.15.0" />
     <PackageReference Include="Reloaded.Memory" Version="9.4.3" />
     <PackageReference Include="Reloaded.Memory.SigScan" Version="3.1.9" />
