@@ -45,3 +45,39 @@ async def test_generate_with_mocked_pipeline() -> None:
     assert r.status_code == 200
     assert len(r.json()["text"]) > 0
     srv._pipeline = None
+
+
+@pytest.mark.asyncio
+async def test_stats_endpoint_returns_expected_keys() -> None:
+    import main as srv
+    transport = ASGITransport(app=srv.app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        r = await client.get("/stats")
+    assert r.status_code == 200
+    body = r.json()
+    assert "total_requests" in body
+    assert "total_drops" in body
+    assert "total_completions" in body
+    assert "avg_latency_ms" in body
+    assert "model_loaded" in body
+    assert isinstance(body["total_requests"], int)
+
+
+@pytest.mark.asyncio
+async def test_stats_completions_increment_after_generate() -> None:
+    import main as srv
+    from inference.queue import InferenceQueue
+    srv._queue = InferenceQueue()  # fresh queue for isolation
+    mock = MagicMock()
+    mock.generate.return_value = "Yo, let's go!"
+    srv._pipeline = mock
+    transport = ASGITransport(app=srv.app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post("/generate", json={
+            "confidant_id": 8, "rank": 4,
+            "context": "gym scene", "character_name": "Ryuji Sakamoto",
+        })
+        r = await client.get("/stats")
+    assert r.json()["total_completions"] == 1
+    assert r.json()["total_requests"] == 1
+    srv._pipeline = None
