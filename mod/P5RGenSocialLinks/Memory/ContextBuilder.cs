@@ -10,6 +10,10 @@ namespace P5RGenSocialLinks.Memory;
 /// </summary>
 internal static class ContextBuilder
 {
-    internal static string Build(SocialLinkSnapshot snap) =>
-        $"[Scene {snap.SceneNumber}] Social Link hang-out — Confidant #{snap.ConfidantId}, rank {snap.RankLevel}";
+    internal static string Build(SocialLinkSnapshot snap)
+    {
+        string name = ConfidantNames.Resolve(snap.ConfidantId);
+        return $"[Scene {snap.SceneNumber}] Hang-out with {name} (rank {snap.RankLevel}/10). " +
+               $"This is a Social Link conversation where {name} is spending time with the protagonist.";
+    }
 }
