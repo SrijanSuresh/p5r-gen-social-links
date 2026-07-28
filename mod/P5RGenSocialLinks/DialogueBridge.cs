@@ -64,7 +64,7 @@ internal sealed class DialogueBridge
                     ConfidantId   = snap.ConfidantId,
                     Rank          = snap.RankLevel,
                     Context       = contextText,
-                    CharacterName = $"Confidant #{snap.ConfidantId}",
+                    CharacterName = ConfidantNames.Resolve(snap.ConfidantId),
                 };
 
                 string text = await _llm.GenerateAsync(request, cts.Token);
