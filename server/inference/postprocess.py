@@ -8,17 +8,38 @@ import re
 _OOC_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\(OOC:.*?\)", re.IGNORECASE),
     re.compile(r"\[Note:.*?\]", re.IGNORECASE),
-    re.compile(r"As an AI.*?[\.\!]", re.IGNORECASE),
-    re.compile(r"I am an AI.*?[\.\!]", re.IGNORECASE),
+    re.compile(r"As an AI.*?[\.\!\?]", re.IGNORECASE),
+    re.compile(r"I am an AI.*?[\.\!\?]", re.IGNORECASE),
+    re.compile(r"I'm an AI.*?[\.\!\?]", re.IGNORECASE),
 ]
+
+# "Name: " or "Name Surname: " prefix the model sometimes adds despite the rule
+_NAME_PREFIX = re.compile(r"^[A-Z][a-zA-Z]+(?: [A-Z][a-zA-Z]+)?:\s*")
+
+
+def _truncate_at_sentence(text: str, max_chars: int) -> str:
+    """Truncate at the last sentence boundary before max_chars."""
+    if len(text) <= max_chars:
+        return text
+    chunk = text[:max_chars]
+    # Walk backwards to find the last sentence-ending punctuation
+    for i in range(len(chunk) - 1, -1, -1):
+        if chunk[i] in ".!?":
+            return chunk[: i + 1]
+    # No sentence boundary found — fall back to word boundary
+    last_space = chunk.rfind(" ")
+    return chunk[:last_space] if last_space > 0 else chunk
 
 
 def clean_response(raw: str, max_chars: int = 200) -> str:
     """
-    Strip out-of-character commentary and truncate to buffer limit.
-    Returns the cleaned string, or empty string if nothing remains.
+    Strip out-of-character commentary, remove name-prefix, and truncate at a
+    sentence boundary. Returns the cleaned string, or empty string if nothing remains.
     """
     text = raw.strip()
+
+    # Remove "CharacterName: " prefix if model ignored the rule
+    text = _NAME_PREFIX.sub("", text, count=1)
 
     for pattern in _OOC_PATTERNS:
         text = pattern.sub("", text)
@@ -26,4 +47,4 @@ def clean_response(raw: str, max_chars: int = 200) -> str:
     # Collapse multiple spaces left by removals
     text = re.sub(r"  +", " ", text).strip()
 
-    return text[:max_chars]
+    return _truncate_at_sentence(text, max_chars)
