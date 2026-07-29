@@ -1237,6 +1237,90 @@ reduces peak VRAM by ~0.6 GB with a small speed cost (~+200ms per response).
 
 ---
 
+## Chapter 15 — Context Engineering: Making the LLM Sound Like P5R
+
+### Why Prompt Design Matters More Than Model Size
+
+Llama-3.1-8B is a mid-size model. By default it generates plausible English, but
+not specifically Ryuji Sakamoto slang. The gap between "competent English" and
+"convincingly in-character P5R dialogue" is almost entirely closed through
+**prompt engineering** — structuring what the model knows before it generates.
+
+### The Three-Layer Prompt Structure
+
+```
+┌──────────────────────────────────┐
+│ SYSTEM PROMPT                    │
+│  Who the character IS            │ ← identity, arcana, personality
+│  What the relationship IS        │ ← rank-tier emotional guidance
+│  Hard rules (no meta-commentary) │ ← guardrails
+├──────────────────────────────────┤
+│ USER PROMPT                      │
+│  [Scene context: ...]            │ ← where in the story we are
+│  CharacterName:                  │ ← leading-edge: model completes the line
+└──────────────────────────────────┘
+```
+
+The system prompt is static per hang-out (same character, same rank). The user
+prompt is the only dynamic part — it includes the scene metadata string built
+by `ContextBuilder` in the C# mod.
+
+### Rank Tiers: Emotional Distance as a Design Parameter
+
+P5R Social Links are a 10-rank progression from strangers to deep bonds. The LLM
+has no concept of in-game rank unless we tell it explicitly. The `_tier_note()`
+function maps rank to emotional vocabulary:
+
+| Rank | Tier note |
+|------|-----------|
+| 1-2  | "just met, polite but reserved" |
+| 3-5  | "warming up, casual, shared history implied" |
+| 6-8  | "close friends, comfortable banter" |
+| 9-10 | "deepest bond, trust and vulnerability" |
+
+A rank-4 Ryuji should be friendly but not yet at "best friend" intimacy. A
+rank-9 Ryuji should speak more openly about personal struggles. The tier note
+shifts the model's word-choice, not just tone.
+
+### Post-processing: Why the Model Ignores Its Own Rules
+
+Even with a rule "do not start your response with the character's name", Llama
+sometimes generates:
+```
+Ryuji Sakamoto: Yo, let's hit the gym!
+```
+
+This is because the system prompt is just context — the model assigns it
+probability weight, not absolute constraint. Our post-processor strips the
+name-prefix pattern (`_NAME_PREFIX` regex) as a hard guarantee.
+
+Similarly, sentence-boundary truncation (`_truncate_at_sentence`) ensures a
+clean cut at `max_chars`. Without it:
+```
+"Dude, what's up? I was thinkin' we could grab some ramen before we head back to"
+```
+The sentence is incomplete because the character buffer cuts at 80 chars. With
+sentence-boundary truncation, the model's natural sentence ending at "." is used.
+
+### What Context Does NOT Yet Include (Phase 2 Target)
+
+The current context string is only:
+```
+"[Scene 51] Hang-out with Ryuji Sakamoto (rank 4/10). This is a Social Link
+ conversation where Ryuji Sakamoto is spending time with the protagonist."
+```
+
+It says nothing about:
+- What the previous dialogue line was
+- What topic Ryuji is discussing
+- Whether the player made a choice just before this line
+
+Phase 2 improves this by either:
+a) Including the struct-diff field that changes per line as a "line number"
+b) Injecting recent event history from a rolling buffer in the C# mod
+
+---
+
 ## Chapter 14 — Phase 2: Per-Line NPC Generation Architecture
 
 ### The Problem: One LLM Call Per Hang-Out Is Not Enough
