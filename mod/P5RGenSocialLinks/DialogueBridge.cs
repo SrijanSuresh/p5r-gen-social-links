@@ -35,6 +35,9 @@ internal sealed class DialogueBridge
         _minInterval = TimeSpan.FromSeconds(cfg?.ThrottleSeconds ?? 3.0);
     }
 
+    /// <summary>Current text pool base; 0 means write-back is disabled for this session.</summary>
+    internal nuint PoolBase => _poolBase;
+
     /// <summary>
     /// Stores the text pool base address found at hang-out start.
     /// The bridge will write LLM responses into pool slot (lineIndex + 1).

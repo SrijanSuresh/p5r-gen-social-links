@@ -203,6 +203,14 @@ public class Mod : IModV1
                 SocialLinkSnapshot? lineSnap = SocialLinkReader.TryReadFromPtr(session);
                 if (lineSnap is not null)
                 {
+                    // Retry pool scan on the first line advance if it missed at session start.
+                    // BF engine loads text lazily; pool is guaranteed in memory once a line renders.
+                    if (_bridge!.PoolBase == 0)
+                    {
+                        nuint retryPool = DialogueTextPoolFinder.Find(session, msg => _modLog!.Info(msg));
+                        _bridge!.SetPoolBase(retryPool);
+                    }
+
                     _modLog!.Info($"[P5RGenSocialLinks] Line advanced (counter={lineIndex}) — dispatching LLM.");
                     _bridge!.DispatchAsync(lineSnap, ContextBuilder.Build(lineSnap), lineIndex);
                 }
