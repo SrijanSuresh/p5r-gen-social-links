@@ -30,11 +30,12 @@ internal sealed class InferenceInFlightException : Exception
 internal sealed class LLMClient : IDisposable
 {
     private readonly HttpClient _http;
-    private const string BaseUrl = "http://localhost:8765";
+    private readonly string     _baseUrl;
 
-    internal LLMClient()
+    internal LLMClient(string baseUrl = "http://127.0.0.1:8765")
     {
-        _http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+        _baseUrl = baseUrl.TrimEnd('/');
+        _http    = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
     }
 
     // Pydantic expects snake_case JSON keys (confidant_id, character_name, etc.)
@@ -48,7 +49,7 @@ internal sealed class LLMClient : IDisposable
     {
         string json = JsonSerializer.Serialize(request, _jsonOpts);
         using var content  = new StringContent(json, Encoding.UTF8, "application/json");
-        using var response = await _http.PostAsync($"{BaseUrl}/generate", content, ct);
+        using var response = await _http.PostAsync($"{_baseUrl}/generate", content, ct);
 
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
             throw new InferenceInFlightException();

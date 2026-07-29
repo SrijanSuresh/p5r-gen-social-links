@@ -40,16 +40,25 @@ public class Mod : IModV1
     [Function(CallingConventions.Microsoft)]
     public delegate nint CmmExecEventDelegate();
 
+    private GenConfig _cfg = new();
+
     public void Start(IModLoaderV1 loader)
     {
         _logger    = (ILoggerV2)loader.GetLogger();
-        _llmClient = new LLMClient();
+
+        // Load user-editable runtime config from GenDialogue.json next to the DLL.
+        string modDir = System.IO.Path.GetDirectoryName(
+            System.Reflection.Assembly.GetExecutingAssembly().Location) ?? ".";
+        _cfg = GenConfig.Load(modDir);
+        _logger.WriteLine($"[P5RGenSocialLinks] Config: throttle={_cfg.ThrottleSeconds}s timeout={_cfg.TimeoutSeconds}s url={_cfg.ServerUrl}");
+
+        _llmClient = new LLMClient(_cfg.ServerUrl);
 
         nuint moduleBase = (nuint)Process.GetCurrentProcess().MainModule!.BaseAddress;
         _logger.WriteLine($"[P5RGenSocialLinks] Base: 0x{moduleBase:X}");
 
         _reader = new SocialLinkReader(moduleBase);
-        _bridge = new DialogueBridge(_llmClient!, new LoggerAdapter(_logger!));
+        _bridge = new DialogueBridge(_llmClient!, new LoggerAdapter(_logger!), _cfg);
 
         // Hooks implementation provided by reloaded.sharedlib.hooks at runtime.
         loader.GetController<IReloadedHooks>()?.TryGetTarget(out _hooks);
@@ -135,7 +144,7 @@ public class Mod : IModV1
     private void StartPollLoop()
     {
         _cts      = new CancellationTokenSource();
-        _timer    = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
+        _timer    = new PeriodicTimer(TimeSpan.FromMilliseconds(_cfg.PollIntervalMs));
         _pollTask = Task.Run(() => PollLoopAsync(_cts.Token));
     }
 
@@ -170,9 +179,12 @@ public class Mod : IModV1
             }
 
             // Same session — diff the struct to find per-line changing fields.
-            string? diff = _diffScanner.Diff(session);
-            if (diff is not null)
-                _logger!.WriteLine($"[P5RGenSocialLinks] {diff}");
+            if (_cfg.StructDiffEnabled)
+            {
+                string? diff = _diffScanner.Diff(session);
+                if (diff is not null)
+                    _logger!.WriteLine($"[P5RGenSocialLinks] {diff}");
+            }
         }
     }
 

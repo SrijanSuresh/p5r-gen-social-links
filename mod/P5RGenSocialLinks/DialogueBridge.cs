@@ -15,17 +15,8 @@ internal sealed class DialogueBridge
 {
     private readonly LLMClient _llm;
     private readonly ILogger   _log;
-
-    // Hard timeout: if the LLM takes longer than this, we fall back to the
-    // scripted dialogue that is already in the buffer.
-    // 30s: first inference after model load triggers CUDA JIT warmup (~15s).
-    // Steady-state responses arrive in ~2s; the timeout only matters on cold start.
-    private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(30);
-
-    // Leading-edge throttle: minimum gap between two consecutive LLM dispatches.
-    // Prevents GPU thrashing when a per-line trigger fires on rapid dialogue tap.
-    // 3s > steady-state LLM latency (~2s), so we never stack calls.
-    private static readonly TimeSpan MinDispatchInterval = TimeSpan.FromSeconds(3);
+    private readonly TimeSpan  _timeout;
+    private readonly TimeSpan  _minInterval;
 
     private DateTimeOffset _lastDispatch = DateTimeOffset.MinValue;
 
@@ -34,10 +25,12 @@ internal sealed class DialogueBridge
         void WriteLine(string message);
     }
 
-    internal DialogueBridge(LLMClient llm, ILogger log)
+    internal DialogueBridge(LLMClient llm, ILogger log, GenConfig? cfg = null)
     {
-        _llm = llm;
-        _log = log;
+        _llm         = llm;
+        _log         = log;
+        _timeout     = TimeSpan.FromSeconds(cfg?.TimeoutSeconds  ?? 30.0);
+        _minInterval = TimeSpan.FromSeconds(cfg?.ThrottleSeconds ?? 3.0);
     }
 
     /// <summary>
@@ -49,14 +42,14 @@ internal sealed class DialogueBridge
     internal bool DispatchAsync(SocialLinkSnapshot snap, string contextText)
     {
         DateTimeOffset now = DateTimeOffset.UtcNow;
-        if (now - _lastDispatch < MinDispatchInterval)
+        if (now - _lastDispatch < _minInterval)
             return false;
 
         _lastDispatch = now;
 
         _ = Task.Run(async () =>
         {
-            using var cts = new CancellationTokenSource(Timeout);
+            using var cts = new CancellationTokenSource(_timeout);
             try
             {
                 var request = new GenerateRequest
