@@ -121,19 +121,20 @@ public class Mod : IModV1
     private void StartPollLoop()
     {
         _cts      = new CancellationTokenSource();
-        _timer    = new PeriodicTimer(TimeSpan.FromMilliseconds(250));
+        _timer    = new PeriodicTimer(TimeSpan.FromSeconds(1));
         _pollTask = Task.Run(() => PollLoopAsync(_cts.Token));
     }
 
     private async Task PollLoopAsync(CancellationToken ct)
     {
+        nuint lastSession = 0;
         while (await _timer!.WaitForNextTickAsync(ct))
         {
-            if (_conversationHook is not null) break;  // hook is live, stop polling
-            SocialLinkSnapshot? snap = _reader!.TryReadSnapshot();
-            if (snap is not null)
-                _logger!.WriteLine(
-                    $"[P5RGenSocialLinks] Poll: Confidant={snap.ConfidantId}");
+            if (!_reader!.TryResolve(out nuint session)) { lastSession = 0; continue; }
+            if (session == lastSession) continue;  // only log on change
+            lastSession = session;
+            _logger!.WriteLine($"[P5RGenSocialLinks] Poll: session=0x{session:X}");
+            _logger!.WriteLine($"[P5RGenSocialLinks] Poll HexDump:{SocialLinkReader.HexDump(session)}");
         }
     }
 
