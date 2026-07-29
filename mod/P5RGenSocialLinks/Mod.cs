@@ -99,21 +99,31 @@ public class Mod : IModV1
     {
         _memcpyHook!.OriginalFunction(dst, src, count);
 
-        // Fast-path guards — reject the overwhelming majority of non-dialogue copies.
+        // Tier 1: cheap numeric gates.
         if (src < HeapLow || count < 10 || count > 600) return;
         if (!_inActiveSession) return;
 
         int n = (int)count;
         byte* p = (byte*)dst;
 
-        // Require at least 5 printable ASCII bytes in the first 64 to avoid binary data.
-        int printable = 0;
+        // Tier 2: reject 4-byte repeating patterns (float/vertex/matrix buffers).
+        // Real dialogue text never repeats the same 4 bytes more than once in a row.
+        if (n >= 16 && p[4] == p[0] && p[5] == p[1] && p[6] == p[2] && p[7] == p[3]
+                    && p[8] == p[0] && p[9] == p[1] && p[10] == p[2] && p[11] == p[3])
+            return;
+
+        // Tier 3: dialogue text has spaces (0x20); binary buffers almost never do.
+        int spaces = 0, printable = 0;
         int check = Math.Min(n, 64);
         for (int i = 0; i < check && p[i] != 0; i++)
-            if (p[i] >= 0x20 && p[i] <= 0x7E) printable++;
-        if (printable < 5) return;
+        {
+            byte b = p[i];
+            if (b == 0x20) spaces++;
+            if (b >= 0x20 && b <= 0x7E) printable++;
+        }
+        if (spaces < 1 || printable < 5) return;
 
-        var sb = new System.Text.StringBuilder(n);
+        var sb = new System.Text.StringBuilder(Math.Min(n, 256));
         for (int i = 0; i < n && p[i] != 0; i++)
             sb.Append(p[i] >= 0x20 && p[i] <= 0x7E ? (char)p[i] : '·');
 
