@@ -26,9 +26,16 @@ internal static class MemoryGuard
         public uint  Type;
     }
 
-    private const uint MEM_COMMIT   = 0x1000;
-    private const uint PAGE_NOACCESS = 0x01;
-    private const uint PAGE_GUARD   = 0x100;
+    private const uint MEM_COMMIT              = 0x1000;
+    private const uint PAGE_NOACCESS           = 0x01;
+    private const uint PAGE_READWRITE          = 0x04;
+    private const uint PAGE_WRITECOPY          = 0x08;
+    private const uint PAGE_EXECUTE_READWRITE  = 0x40;
+    private const uint PAGE_EXECUTE_WRITECOPY  = 0x80;
+    private const uint PAGE_GUARD              = 0x100;
+
+    private static readonly uint WritableMask =
+        PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
 
     /// <summary>
     /// Returns true only if [addr, addr+size) is fully within a committed,
@@ -42,7 +49,22 @@ internal static class MemoryGuard
         if (mbi.State != MEM_COMMIT) return false;
         if ((mbi.Protect & PAGE_NOACCESS) != 0) return false;
         if ((mbi.Protect & PAGE_GUARD) != 0) return false;
-        // Ensure the entire [addr, addr+size) range fits inside this region
+        return (addr - mbi.BaseAddress) + (nuint)size <= mbi.RegionSize;
+    }
+
+    /// <summary>
+    /// Returns true only if [addr, addr+size) is fully within a committed,
+    /// writable page — safe to write without an AV.
+    /// </summary>
+    internal static bool IsWritable(nuint addr, int size)
+    {
+        if (addr == 0) return false;
+        nint queryResult = VirtualQuery(addr, out var mbi, (nuint)Marshal.SizeOf<MEMORY_BASIC_INFORMATION>());
+        if (queryResult == 0) return false;
+        if (mbi.State != MEM_COMMIT) return false;
+        if ((mbi.Protect & PAGE_NOACCESS) != 0) return false;
+        if ((mbi.Protect & PAGE_GUARD) != 0) return false;
+        if ((mbi.Protect & WritableMask) == 0) return false;
         return (addr - mbi.BaseAddress) + (nuint)size <= mbi.RegionSize;
     }
 }

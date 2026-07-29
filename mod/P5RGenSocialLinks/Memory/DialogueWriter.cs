@@ -4,31 +4,74 @@ using System.Text;
 namespace P5RGenSocialLinks.Memory;
 
 /// <summary>
-/// Writes LLM-generated text back into the game''s dialogue buffer.
-/// P5R stores dialogue as null-terminated UTF-16LE strings in a heap buffer
-/// pointed to by SocialLinkSession.DialogueBuffer.
+/// Writes LLM-generated text into a specific slot of P5R's pre-loaded script text pool.
+///
+/// The pool is a contiguous sequence of null-terminated UTF-8 strings:
+///   [str0]\0[str1]\0[str2]\0...
+///
+/// Write strategy: navigate to the target line by counting null terminators, read the
+/// original string's length, then overwrite with LLM text truncated to that length.
+/// Truncation is mandatory — writing more bytes than the original string would corrupt
+/// the next string in the pool.
 /// </summary>
 internal static class DialogueWriter
 {
-    // Maximum characters we will write — stays within P5R''s expected buffer bounds.
-    // Actual buffer size must be confirmed via Ghidra; 256 wchars is a safe conservative limit.
-    private const int MaxChars = 256;
+    // How far into the pool to search for a line offset (safety cap).
+    private const int MaxPoolScan = 32768;
 
     /// <summary>
-    /// Overwrites the dialogue buffer at <paramref name="bufferPtr"/> with
-    /// <paramref name="text"/>, truncating to <see cref="MaxChars"/> if needed.
+    /// Overwrites line <paramref name="lineIndex"/> (0-based) in the text pool at
+    /// <paramref name="poolBase"/> with <paramref name="text"/>.
+    /// Returns false if the line could not be located or the page is not writable.
     /// </summary>
-    internal static unsafe void Write(nuint bufferPtr, string text)
+    internal static unsafe bool WriteAtLineIndex(nuint poolBase, int lineIndex, string text)
     {
-        if (bufferPtr == 0)
-            throw new ArgumentException("Null dialogue buffer pointer.");
+        if (poolBase == 0 || lineIndex < 0 || string.IsNullOrEmpty(text)) return false;
 
-        ReadOnlySpan<char> chars = text.AsSpan(0, Math.Min(text.Length, MaxChars - 1));
-        char* dest = (char*)bufferPtr;
+        // Walk past 'lineIndex' null terminators to reach the target slot.
+        int offset = FindLineOffset((byte*)poolBase, lineIndex);
+        if (offset < 0) return false;
 
-        for (int i = 0; i < chars.Length; i++)
-            dest[i] = chars[i];
+        // Measure the original string at this slot — we must not exceed its length.
+        int origLen = MeasureString((byte*)poolBase + offset, MaxPoolScan - offset);
+        if (origLen <= 0) return false;
 
-        dest[chars.Length] = '\0';  // null-terminate
+        nuint writeAddr = poolBase + (nuint)offset;
+        if (!MemoryGuard.IsWritable(writeAddr, origLen + 1)) return false;
+
+        // Encode as UTF-8 (ASCII-range for English P5R PC) and truncate to fit.
+        byte[] encoded = Encoding.UTF8.GetBytes(text);
+        int writeLen   = Math.Min(encoded.Length, origLen);
+
+        byte* dest = (byte*)writeAddr;
+        fixed (byte* src = encoded)
+            Buffer.MemoryCopy(src, dest, origLen, writeLen);
+
+        dest[writeLen] = 0; // null-terminate
+
+        return true;
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────
+
+    private static unsafe int FindLineOffset(byte* pool, int lineIndex)
+    {
+        int linesSkipped = 0;
+        for (int i = 0; i < MaxPoolScan; i++)
+        {
+            if (pool[i] != 0) continue;
+
+            // Found a null terminator — the next string starts at i+1.
+            linesSkipped++;
+            if (linesSkipped == lineIndex) return i + 1;
+        }
+        return -1; // lineIndex beyond pool scan range
+    }
+
+    private static unsafe int MeasureString(byte* p, int maxLen)
+    {
+        for (int i = 0; i < maxLen; i++)
+            if (p[i] == 0) return i;
+        return -1; // no null terminator found within maxLen
     }
 }

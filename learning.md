@@ -2133,3 +2133,136 @@ it keeps `learning.md` motivated by giving it an audience.
 
 This is the standard pattern for research-oriented projects: the README is the contract,
 the journal is the reasoning.
+
+---
+
+## Ch26 — In-Process Heap Scanning and Dialogue Write-Back Architecture
+
+### Why We Don't Need Cheat Engine
+
+CE is a GUI front-end over the same Win32 API calls any process can make. Its "find
+what writes" is a VEH (vectored exception handler) memory-access watchpoint; its
+string scan is a walk over `VirtualQuery`-enumerated committed pages. Since our C#
+mod runs *inside* P5R's process (injected by Reloaded-II), we have identical access
+to that address space with no extra privileges required.
+
+The C# equivalents:
+- CE "scan all memory for string" → `VirtualQuery` loop + `memcmp` / string heuristic
+- CE "find what accesses address" → hardware breakpoint via `SetThreadContext` (not needed here)
+- CE "pointer scan" → walk a region for 8-byte values in the heap VA range
+
+### VirtualQuery and the Virtual Address Space Layout
+
+`VirtualQuery(address)` returns a `MEMORY_BASIC_INFORMATION` block describing the
+*region* containing `address` — its base, size, state, and protection flags.
+
+The three state values we care about:
+
+| State      | Meaning                              |
+|------------|--------------------------------------|
+| MEM_COMMIT | Pages are backed by RAM or page file |
+| MEM_RESERVE| Reserved, not accessible             |
+| MEM_FREE   | Not reserved — safe to skip          |
+
+Heap allocations are always `MEM_COMMIT` + `MEM_PRIVATE` (not mapped from a file).
+Code sections are `MEM_COMMIT` + `MEM_IMAGE`. This lets us filter heap regions from
+everything else.
+
+To walk the entire address space:
+```csharp
+nuint addr = 0;
+while (VirtualQuery(addr, out MBI mbi, ...) != 0)
+{
+    if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && readable)
+        Probe(mbi.BaseAddress, mbi.RegionSize);
+    addr = mbi.BaseAddress + mbi.RegionSize; // advance to next region
+}
+```
+
+### The Counter Struct Pivot
+
+Brute-force scanning the entire heap is slow and noisy. We have a better anchor:
+`0x006FFC10` — the base of the counter struct whose `+0x18` field is the line counter
+at `0x006FFC28`.
+
+The CE write instruction was `mov [rcx+18],eax`, so `rcx` held a pointer to the
+counter struct. That struct almost certainly also holds a pointer *to the text pool* —
+it's the object responsible for tracking position within the pool.
+
+Strategy: read 256 bytes from `0x006FFC10` and treat every aligned 8-byte word as a
+candidate pointer. Filter to the heap VA range (roughly `0x1_0000_0000` to
+`0x7FF_FFFF_0000` on Windows x64). For each candidate, probe the pointed-to address
+for the text pool pattern. This is typically 1–4 probes rather than hundreds.
+
+### Text Pool Heuristic
+
+A BF script text pool has a distinctive fingerprint:
+- Multiple consecutive null-terminated strings (5+ in a row)
+- Each string is printable ASCII, 10–300 chars long (dialogue, not binary data)
+- No binary junk between strings — just `\0` separators
+
+Distinguishing it from other string pools (debug log buffers, localization tables,
+path strings) relies on quantity: a dialogue scene has 20–50 lines, so a genuine pool
+has more consecutive valid strings than any incidental string region.
+
+### Write-Back Timing
+
+P5R pre-loads the entire scene's text into the pool at hang-out start. The pool
+persists until the session ends. Our write window is:
+
+```
+[Session struct appears] ←── our window ──→ [Player advances line 0]
+         ↑                                              ↑
+    CMM hook fires,                          Too late for line 0
+    pool scan runs,                          (already rendered)
+    LLM request fires
+```
+
+LLM response comes back in <2s. If the player takes >2s to press confirm on the
+first line (they always do — cutscene animations, reading time), we win the race.
+
+For subsequent lines: `LineCounterMonitor` fires when line N advances. We dispatch
+LLM immediately, response arrives in <2s, we write to line N+1. The player has to
+read line N+1 and press confirm, which is always more than 2s.
+
+The key insight: **write ahead, not to the current line**. By the time the LLM
+responds, line N is already displayed. We write to N+1 (the line the player hasn't
+seen yet).
+
+### Write Truncation
+
+Strings in the text pool are packed contiguously:
+```
+[str0]\0[str1]\0[str2]\0...
+```
+
+If we write more bytes than `strlen(strN)`, we corrupt `str(N+1)`. The rule: always
+`min(llm_text_length, original_string_length)`. Read the original length first by
+scanning for the next `\0` from the target offset, then truncate the LLM text to
+`original_length - 1` (leaving one byte for the null terminator).
+
+### Encoding
+
+P5R PC (English, Steam) stores dialogue as **UTF-8** (effectively ASCII for English
+text — all chars are < 0x80). The existing `DialogueWriter` stub assumed UTF-16LE
+(wide chars), which is wrong for this pool. The fix is straightforward:
+
+```csharp
+byte[] encoded = Encoding.UTF8.GetBytes(text);
+// Write bytes, not chars
+```
+
+For future Japanese locale support: Shift-JIS encoding, not UTF-16. But for now
+`UTF8.GetBytes` on pure English text gives identical output to ASCII.
+
+### The IsWritable Guard
+
+Write-back needs a writable page. `MemoryGuard.IsReadable` only checks readable
+protection flags. We need `IsWritable`, which additionally requires:
+- `PAGE_READWRITE` (0x04) — normal heap pages
+- `PAGE_EXECUTE_READWRITE` (0x40) — JIT-compiled or self-modifying code (rare here)
+- `PAGE_WRITECOPY` (0x08) — copy-on-write mapped sections
+
+Heap memory is always `PAGE_READWRITE`, so in practice this is just checking that
+flag. But we guard it properly to avoid an access violation if the protection ever
+changes (e.g., after a `VirtualProtect` call by the game's anti-tamper layer).

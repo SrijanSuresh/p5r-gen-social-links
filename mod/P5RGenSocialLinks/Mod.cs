@@ -186,8 +186,12 @@ public class Mod : IModV1
                 _modLog!.Info(
                     $"[P5RGenSocialLinks] Hang-out: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber} (0x{session:X})");
 
+                // Locate the text pool once per session; bridge uses it for write-back.
+                nuint poolBase = DialogueTextPoolFinder.Find(session, msg => _modLog!.Info(msg));
+                _bridge!.SetPoolBase(poolBase);
+
                 if (!_hookActive)
-                    _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap));
+                    _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap), lineIndex: 0);
 
                 continue;
             }
@@ -195,11 +199,12 @@ public class Mod : IModV1
             // Per-line trigger: fire LLM when dialogue line counter advances.
             if (_lineMonitor.HasAdvanced())
             {
+                int lineIndex = (int)_lineMonitor.CurrentValue();
                 SocialLinkSnapshot? lineSnap = SocialLinkReader.TryReadFromPtr(session);
                 if (lineSnap is not null)
                 {
-                    _modLog!.Info($"[P5RGenSocialLinks] Line advanced (counter={_lineMonitor.CurrentValue()}) — dispatching LLM.");
-                    _bridge!.DispatchAsync(lineSnap, ContextBuilder.Build(lineSnap));
+                    _modLog!.Info($"[P5RGenSocialLinks] Line advanced (counter={lineIndex}) — dispatching LLM.");
+                    _bridge!.DispatchAsync(lineSnap, ContextBuilder.Build(lineSnap), lineIndex);
                 }
             }
 
