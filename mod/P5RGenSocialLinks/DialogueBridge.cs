@@ -13,10 +13,11 @@ namespace P5RGenSocialLinks;
 /// </summary>
 internal sealed class DialogueBridge
 {
-    private readonly LLMClient _llm;
-    private readonly ILogger   _log;
-    private readonly TimeSpan  _timeout;
-    private readonly TimeSpan  _minInterval;
+    private readonly LLMClient     _llm;
+    private readonly ILogger       _log;
+    private readonly TimeSpan      _timeout;
+    private readonly TimeSpan      _minInterval;
+    private readonly SessionHistory _history = new();
 
     private DateTimeOffset _lastDispatch = DateTimeOffset.MinValue;
 
@@ -47,6 +48,12 @@ internal sealed class DialogueBridge
 
         _lastDispatch = now;
 
+        // Include prior LLM lines this session as context for continuity.
+        string priorCtx = _history.BuildPriorContext(snap.SessionBase);
+        string fullCtx  = string.IsNullOrEmpty(priorCtx)
+            ? contextText
+            : $"{contextText} {priorCtx}";
+
         _ = Task.Run(async () =>
         {
             using var cts = new CancellationTokenSource(_timeout);
@@ -56,7 +63,7 @@ internal sealed class DialogueBridge
                 {
                     ConfidantId   = snap.ConfidantId,
                     Rank          = snap.RankLevel,
-                    Context       = contextText,
+                    Context       = fullCtx,
                     CharacterName = ConfidantNames.Resolve(snap.ConfidantId),
                 };
 
@@ -64,9 +71,10 @@ internal sealed class DialogueBridge
 
                 if (!string.IsNullOrWhiteSpace(text))
                 {
+                    _history.RecordResponse(snap.SessionBase, text);
                     // TODO: dialogue write-back requires locating the text buffer offset.
                     // For now, log the generated response so we can verify E2E flow.
-                    _log.WriteLine($"[P5RGenSocialLinks] LLM: \"{text[..Math.Min(text.Length, 80)]}\"");
+                    _log.WriteLine($"[P5RGenSocialLinks] LLM: \"{text[..Math.Min(text.Length, 120)]}\"");
                 }
             }
             catch (InferenceInFlightException)
@@ -75,7 +83,7 @@ internal sealed class DialogueBridge
             }
             catch (OperationCanceledException)
             {
-                _log.WriteLine("[P5RGenSocialLinks] LLM timeout â€” keeping scripted dialogue.");
+                _log.WriteLine("[P5RGenSocialLinks] LLM timeout — keeping scripted dialogue.");
             }
             catch (Exception ex) when (ex is not OutOfMemoryException)
             {
