@@ -50,6 +50,23 @@ internal sealed class LineCounterMonitor
     /// <summary>Current raw counter value — useful for logging.</summary>
     internal unsafe byte CurrentValue() => ReadCounter();
 
+    /// <summary>
+    /// Logs the readability and raw value of the counter address.
+    /// Call once at session start to confirm the address is live before relying on HasAdvanced().
+    /// </summary>
+    internal static unsafe void Diagnose(Action<string> log)
+    {
+        nuint addr = P5ROffsets.CMM_LINE_COUNTER_ADDR;
+        bool readable = MemoryGuard.IsReadable(addr, sizeof(byte));
+        if (!readable)
+        {
+            log($"[LineCounter] 0x{addr:X} NOT READABLE — address may have changed this session.");
+            return;
+        }
+        byte val = *(byte*)addr;
+        log($"[LineCounter] 0x{addr:X} readable, value={val} — polling active.");
+    }
+
     private static unsafe byte ReadCounter()
     {
         nuint addr = P5ROffsets.CMM_LINE_COUNTER_ADDR;

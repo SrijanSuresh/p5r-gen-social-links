@@ -179,6 +179,7 @@ public class Mod : IModV1
                 lastSession = session;
                 _diffScanner.Reset();
                 _lineMonitor.Activate();
+                LineCounterMonitor.Diagnose(msg => _modLog!.Info(msg));
 
                 SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
                 if (snap is null) continue;
