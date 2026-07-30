@@ -64,6 +64,31 @@ async def test_stats_endpoint_returns_expected_keys() -> None:
 
 
 @pytest.mark.asyncio
+async def test_model_info_no_model() -> None:
+    import main as srv
+    srv._pipeline = None
+    transport = ASGITransport(app=srv.app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        r = await client.get("/model-info")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["mode"] == "not_loaded"
+    assert "model_path" in body
+    assert "temperature" in body
+
+
+@pytest.mark.asyncio
+async def test_model_info_mock_mode() -> None:
+    import main as srv
+    srv._pipeline = srv._MOCK
+    transport = ASGITransport(app=srv.app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        r = await client.get("/model-info")
+    assert r.json()["mode"] == "mock"
+    srv._pipeline = None
+
+
+@pytest.mark.asyncio
 async def test_stats_completions_increment_after_generate() -> None:
     import main as srv
     from inference.queue import InferenceQueue

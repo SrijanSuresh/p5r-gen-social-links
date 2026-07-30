@@ -78,6 +78,21 @@ async def stats() -> dict[str, object]:
     }
 
 
+@app.get("/model-info")
+async def model_info() -> dict[str, object]:
+    is_mock  = _pipeline is _MOCK
+    is_real  = _pipeline is not None and not is_mock
+    info: dict[str, object] = {
+        "mode":         "mock" if is_mock else ("real" if is_real else "not_loaded"),
+        "model_path":   _cfg.model_path,
+        "n_gpu_layers": _cfg.n_gpu_layers,
+        "n_ctx":        _cfg.n_ctx,
+        "max_tokens":   _cfg.max_tokens,
+        "temperature":  _cfg.temperature,
+    }
+    return info
+
+
 @app.post("/generate", response_model=GenerateResponse)
 async def generate(req: GenerateRequest) -> GenerateResponse:
     if _pipeline is None:
