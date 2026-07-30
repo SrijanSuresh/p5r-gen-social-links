@@ -54,6 +54,9 @@ public class Mod : IModV1
 
         _llmClient = new LLMClient(_cfg.ServerUrl);
 
+        // Async health check — fires after a 2s delay to let the model finish loading.
+        ServerHealthChecker.CheckAsync(_cfg.ServerUrl, msg => _logger.WriteLine(msg));
+
         nuint moduleBase = (nuint)Process.GetCurrentProcess().MainModule!.BaseAddress;
         _logger.WriteLine($"[P5RGenSocialLinks] Base: 0x{moduleBase:X}");
 
