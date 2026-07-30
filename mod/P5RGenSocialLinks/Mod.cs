@@ -38,13 +38,20 @@ public class Mod : IModV1
     [Function(CallingConventions.Microsoft)]
     public delegate nint CmmExecEventDelegate();
 
-    // Per-line hook: intercepts the game's memcpy (p5r.exe+0x5A8590) to capture
-    // dialogue text as it is copied into the display buffer.
-    [Function(CallingConventions.Microsoft)]
-    private delegate void MemcpyGameDelegate(nuint dst, nuint src, nuint count);
+    // Per-line hook: intercepts FUN_1405a8570 (the REP MOVSB inner copy function).
+    // The dialogue system calls this DIRECTLY via function pointer (0x158131be0),
+    // bypassing the outer dispatcher FUN_1405a8590 that uses standard registers.
+    // Custom convention: RCX=dst, R10=src (non-standard!), R8=count.
+    [Function(
+        new FunctionAttribute.Register[] {
+            FunctionAttribute.Register.rcx,
+            FunctionAttribute.Register.r10,
+            FunctionAttribute.Register.r8 },
+        FunctionAttribute.Register.rax, false)]
+    private delegate void MemcpyInnerDelegate(nuint dst, nuint src, nuint count);
 
-    private IHook<MemcpyGameDelegate>? _memcpyHook;
-    private volatile bool              _inActiveSession;
+    private IHook<MemcpyInnerDelegate>? _memcpyHook;
+    private volatile bool               _inActiveSession;
 
     // Dialogue heap sits above 256 GB; CLR/runtime copies are all below 4 GB.
     private static readonly nuint HeapLow = unchecked((nuint)0x4000000000UL);
@@ -86,18 +93,21 @@ public class Mod : IModV1
     {
         if (_hooks is null)
         {
-            _logger!.WriteLine("[P5RGenSocialLinks] Memcpy hook skipped — IReloadedHooks null.");
+            _logger!.WriteLine("[P5RGenSocialLinks] Memcpy inner hook skipped — IReloadedHooks null.");
             return;
         }
         nuint moduleBase = (nuint)Process.GetCurrentProcess().MainModule!.BaseAddress;
-        nuint addr = moduleBase + 0x5A8590;
-        _memcpyHook = _hooks.CreateHook<MemcpyGameDelegate>(OnGameMemcpy, (long)addr).Activate();
-        _logger!.WriteLine($"[P5RGenSocialLinks] Memcpy hook ACTIVE at 0x{addr:X}");
+        // Hook the REP MOVSB inner function directly (not the outer dispatcher).
+        // The dialogue system reaches FUN_1405a8570 via a function pointer, bypassing
+        // FUN_1405a8590, so hooking the inner function catches all paths.
+        nuint addr = moduleBase + 0x5A8570;
+        _memcpyHook = _hooks.CreateHook<MemcpyInnerDelegate>(OnGameMemcpy, (long)addr).Activate();
+        _logger!.WriteLine($"[P5RGenSocialLinks] Memcpy inner hook ACTIVE at 0x{addr:X}");
     }
 
     private unsafe void OnGameMemcpy(nuint dst, nuint src, nuint count)
     {
-        _memcpyHook!.OriginalFunction(dst, src, count);
+        _memcpyHook!.OriginalFunction(dst, src, count); // R10←src restored by trampoline
 
         // Tier 1: cheap numeric gates.
         if (src < HeapLow || count < 10 || count > 600) return;
