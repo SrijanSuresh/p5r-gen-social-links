@@ -13,12 +13,16 @@ internal static class P5ROffsets
     // Discovered from:  MOV RCX, [RAX + 0x48]  in CMM_EXEC_EVENT.
     internal const int CMM_SESSION_OFFSET = 0x48;
 
-    // Field offsets within the session sub-object — byte at +0xA observed in
-    // CMM_EXEC_EVENT: MOVZX EAX, byte ptr [RCX + 0xA].
-    // Remaining offsets (rank, dialogue) are candidates pending hex-dump confirmation.
-    internal const int CONFIDANT_ID    = 0x0A;  // byte — cmmId 1-21 (arcana index)
-    internal const int RANK_LEVEL      = 0x0B;  // byte candidate — needs verification
-    internal const int DIALOGUE_INDEX  = 0x0C;  // byte candidate — needs verification
+    // Field offsets confirmed via hex dump (session=0x41D7156660, Ryuji conversation):
+    //   +000: 08 00 00 00  → int32 = 8 (Ryuji cmmId) ✓
+    //   +004: 00 00 00 00  → int32 = 0 (rank level — 0 in field, non-zero in hang-out)
+    //   +00A: 02           → byte event-type (what CMM_EXEC_EVENT reads; NOT confidant id)
+    //   +00C: 33 00        → int16 candidate (dialogue index?)
+    //   +010: ptr 0x70B8C058 (unknown pointer)
+    // RANK_LEVEL and DIALOGUE_INDEX still need hang-out session to confirm values.
+    internal const int CONFIDANT_ID    = 0x00;  // int32 — cmmId confirmed by hex dump
+    internal const int RANK_LEVEL      = 0x04;  // int32 candidate — 0 in field dialogue
+    internal const int DIALOGUE_INDEX  = 0x0C;  // int16 candidate — needs verification
     internal const int DIALOGUE_BUFFER = 0x10;  // ptr candidate — needs verification
 }
 
