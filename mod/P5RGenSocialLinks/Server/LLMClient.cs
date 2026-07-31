@@ -44,20 +44,35 @@ internal sealed class LLMClient : IDisposable
         PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
     };
 
+    // Number of times to retry on 503 (model still loading) before giving up.
+    // 503 on first game boot: model load takes ~20s; 3 retries × 8s = 24s max wait.
+    private const int MaxRetries503 = 3;
+    private static readonly TimeSpan Retry503Delay = TimeSpan.FromSeconds(8);
+
     /// <returns>Generated text, or throws <see cref="InferenceInFlightException"/> on 429.</returns>
     internal async Task<string> GenerateAsync(GenerateRequest request, CancellationToken ct = default)
     {
         string json = JsonSerializer.Serialize(request, _jsonOpts);
-        using var content  = new StringContent(json, Encoding.UTF8, "application/json");
-        using var response = await _http.PostAsync($"{_baseUrl}/generate", content, ct);
 
-        if (response.StatusCode == HttpStatusCode.TooManyRequests)
-            throw new InferenceInFlightException();
+        for (int attempt = 0; ; attempt++)
+        {
+            using var content  = new StringContent(json, Encoding.UTF8, "application/json");
+            using var response = await _http.PostAsync($"{_baseUrl}/generate", content, ct);
 
-        response.EnsureSuccessStatusCode();
-        string body = await response.Content.ReadAsStringAsync(ct);
-        var result  = JsonSerializer.Deserialize<GenerateResponse>(body, _jsonOpts);
-        return result?.Text ?? string.Empty;
+            if (response.StatusCode == HttpStatusCode.TooManyRequests)
+                throw new InferenceInFlightException();
+
+            if (response.StatusCode == HttpStatusCode.ServiceUnavailable && attempt < MaxRetries503)
+            {
+                await Task.Delay(Retry503Delay, ct);
+                continue;
+            }
+
+            response.EnsureSuccessStatusCode();
+            string body = await response.Content.ReadAsStringAsync(ct);
+            var result  = JsonSerializer.Deserialize<GenerateResponse>(body, _jsonOpts);
+            return result?.Text ?? string.Empty;
+        }
     }
 
     public void Dispose() => _http.Dispose();
