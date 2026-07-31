@@ -1237,6 +1237,61 @@ reduces peak VRAM by ~0.6 GB with a small speed cost (~+200ms per response).
 
 ---
 
+## Chapter 16 — Connection Resilience: Retries, Health Checks, and Cold Starts
+
+### The Cold-Start Problem
+
+When P5R launches with the mod active, the mod's `Start()` runs immediately.
+But the Python server may not have finished loading the 4.9 GB model yet.
+First POST to `/generate` → 503 Service Unavailable.
+
+Without retry logic, the first hang-out of every game session gets no LLM
+response. With retry logic (3 retries × 8s delay), the C# side waits up to
+24s for the model to finish loading — more than enough for the ~20s load time.
+
+### Why Not Retry Indefinitely?
+
+Two reasons:
+1. The `CancellationTokenSource` timeout in `DialogueBridge` (default 30s) cancels
+   the whole operation regardless. Infinite retries wouldn't exceed 30s anyway.
+2. A 503 that persists after 3 retries means the server is broken (missing model
+   file, CUDA OOM, etc.) — retrying forever masks the real error.
+
+### The Health-Check Approach (Complementary)
+
+`ServerHealthChecker.CheckAsync()` runs 2s after startup, reads `/health`, and
+logs the server's state. This is not a retry loop — it's observability: it tells
+the developer what the server thinks of itself without blocking the game.
+
+If `/health → model_not_loaded`, you know to wait. If `/health → ready`, the
+mod is ready to dispatch. The 2s delay is a best-effort guess at when the health
+endpoint will reflect the final state.
+
+### HTTP Timeout Layering
+
+Three timeout layers protect the system:
+
+```
+CancellationTokenSource (30s)  ←  DialogueBridge: outer hard deadline
+    │
+    └─► HttpClient.Timeout (60s)    ←  LLMClient: TCP-level connection timeout
+            │
+            └─► Retry loop (3 × 8s = 24s)  ←  503 wait: model loading
+```
+
+The HttpClient timeout (60s) is set longer than the CTS timeout (30s) so the
+CTS always fires first — we never want HttpClient to terminate a connection that
+the business logic still considers in-flight.
+
+### The InferenceInFlightException Fast Path
+
+429 is never retried. The InferenceQueue on the server drops concurrent requests
+rather than queueing them — a stale response queued for 10 seconds would appear
+after the conversation has moved on. Immediate exception → immediate fallback to
+scripted dialogue is the correct behavior.
+
+---
+
 ## Chapter 15 — Context Engineering: Making the LLM Sound Like P5R
 
 ### Why Prompt Design Matters More Than Model Size
