@@ -24,9 +24,9 @@ internal sealed class SocialLinkReader
     {
         if (!MemoryGuard.IsReadable(sessionPtr, 0x10)) return null;
 
-        int confidantId   = *(int*)(sessionPtr + P5ROffsets.CONFIDANT_ID);
-        int rankLevel     = *(int*)(sessionPtr + P5ROffsets.RANK_LEVEL);
-        int dialogueIndex = *(short*)(sessionPtr + P5ROffsets.DIALOGUE_INDEX);
+        int confidantId   = *(int*)  (sessionPtr + P5ROffsets.CONFIDANT_ID);
+        int dialogueIndex = *(int*)  (sessionPtr + P5ROffsets.DIALOGUE_INDEX);
+        int rankLevel     = *(byte*) (sessionPtr + P5ROffsets.RANK_LEVEL);
 
         if (confidantId <= 0 || confidantId > 50) return null;  // sanity-filter noise
 
