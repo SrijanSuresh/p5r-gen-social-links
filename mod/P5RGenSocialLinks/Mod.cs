@@ -56,6 +56,11 @@ public class Mod : IModV1
     // Dialogue heap sits above 256 GB; CLR/runtime copies are all below 4 GB.
     private static readonly nuint HeapLow = unchecked((nuint)0x4000000000UL);
 
+    // Dedup set: each unique src address is logged only once per session.
+    // Animation buffers reuse the same addresses every frame — they appear once.
+    // A new dialogue allocation hits a fresh address — it stands out immediately.
+    private readonly System.Collections.Generic.HashSet<nuint> _seenSrcs = new();
+
     private GenConfig _cfg = new();
 
     public void Start(IModLoaderV1 loader)
@@ -109,36 +114,25 @@ public class Mod : IModV1
     {
         _memcpyHook!.OriginalFunction(dst, src, count); // R10←src restored by trampoline
 
-        // Tier 1: cheap numeric gates.
-        // Upper limit 2048: dialogue BF buffers can be larger than originally assumed.
-        if (src < HeapLow || count < 10 || count > 2048) return;
-        if (!_inActiveSession) return;
+        // Diagnostic phase: log every unique high-heap src address once per session.
+        // No content filter — we need to see exactly what flows through this hook
+        // before we know what the dialogue copy looks like.
+        // Animation buffers reuse the same addresses per frame → appear once and stop.
+        // Each new dialogue allocation hits a fresh address → stands out clearly.
+        if (src < HeapLow || !_inActiveSession) return;
 
-        int n = (int)count;
+        bool isNew;
+        lock (_seenSrcs) isNew = _seenSrcs.Add(src);
+        if (!isNew) return;
+
+        // First time we see this address: log count and first 64 printable bytes.
+        int n = (int)Math.Min(count, (nuint)256);
         byte* p = (byte*)dst;
-
-        // Tier 2: reject 4-byte repeating patterns (float/vertex/matrix buffers).
-        if (n >= 16 && p[4] == p[0] && p[5] == p[1] && p[6] == p[2] && p[7] == p[3]
-                    && p[8] == p[0] && p[9] == p[1] && p[10] == p[2] && p[11] == p[3])
-            return;
-
-        // Tier 3: space (0x20) somewhere in first 256 bytes — BF scripts have a header
-        // before the visible text, so searching only the first 64 bytes misses it.
-        int spaces = 0, printable = 0;
-        int check = Math.Min(n, 256);
-        for (int i = 0; i < check && p[i] != 0; i++)
-        {
-            byte b = p[i];
-            if (b == 0x20) spaces++;
-            if (b >= 0x20 && b <= 0x7E) printable++;
-        }
-        if (spaces < 1 || printable < 5) return;
-
-        var sb = new System.Text.StringBuilder(Math.Min(n, 256));
-        for (int i = 0; i < Math.Min(n, 256) && p[i] != 0; i++)
+        var sb = new System.Text.StringBuilder(64);
+        for (int i = 0; i < n && p[i] != 0 && sb.Length < 64; i++)
             sb.Append(p[i] >= 0x20 && p[i] <= 0x7E ? (char)p[i] : '·');
 
-        _modLog!.Info($"[MemcpyHook] ({count}B src=0x{src:X}): \"{sb}\"");
+        _modLog!.Info($"[MemcpyHook][NEW] 0x{src:X} n={count}: \"{sb}\"");
     }
 
     private void TryActivateHook()
@@ -242,6 +236,7 @@ public class Mod : IModV1
                     _bridge!.ResetSession();
                     _poolFindRetries = 0;
                     _inActiveSession = false;
+                    lock (_seenSrcs) _seenSrcs.Clear();
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
                 }
                 lastSession = 0;
