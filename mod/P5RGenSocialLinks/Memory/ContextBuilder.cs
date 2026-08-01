@@ -12,8 +12,9 @@ internal static class ContextBuilder
 {
     internal static string Build(SocialLinkSnapshot snap)
     {
-        string name = ConfidantNames.Resolve(snap.ConfidantId);
-        return $"[Scene {snap.SceneNumber}] Hang-out with {name} (rank {snap.RankLevel}/10). " +
-               $"This is a Social Link conversation where {name} is spending time with the protagonist.";
+        string name  = ConfidantNames.Resolve(snap.ConfidantId);
+        string scene = SceneHints.Describe(snap.ConfidantId, snap.SceneNumber);
+        return $"Hang-out with {name} (rank {snap.RankLevel}/10) at {scene}. " +
+               $"This is a Social Link conversation — {name} and the protagonist are spending time together.";
     }
 }
