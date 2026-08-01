@@ -197,6 +197,7 @@ public class Mod : IModV1
     {
         _cts.Cancel();
         _conversationHook?.Disable();
+        _diffScanner.Reset();
         _logger?.WriteLine("[P5RGenSocialLinks] Suspended.");
     }
 
@@ -214,6 +215,7 @@ public class Mod : IModV1
         _timer?.Dispose();
         _llmClient?.Dispose();
         _conversationHook?.Disable();
+        _diffScanner.Reset();
         _logger?.WriteLine("[P5RGenSocialLinks] Unloaded.");
     }
 
