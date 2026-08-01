@@ -15,16 +15,17 @@ internal static class P5ROffsets
 
     // Field offsets confirmed via hex dump during real Ryuji gym hang-out
     // (session=0x41D7156660):
-    //   +000: 08 00 00 00  → int32 = 8  (Ryuji cmmId)           CONFIRMED
-    //   +004: 00 00 00 00  → int32 = 0  (dialogue line index, starts at 0)  CONFIRMED
-    //   +008: 08           → byte  = 8  (rank level, Ryuji rank 8 mid-game) CONFIRMED
+    //   +000: 08 00 00 00  → int32 = 8  (Ryuji cmmId)                CONFIRMED
+    //   +004: 00 00 00 00  → int32 = 0  (dialogue line, starts at 0) CONFIRMED
+    //   +008: 08           → byte  = 8  (arcana/cmmId repeated — NOT rank)
     //   +009: 00
     //   +00A: 02           → byte  = 2  (event-type, read by CMM_EXEC_EVENT)
-    //   +00C: 33 00        → int16 = 51 (unknown — scene/event number?)
+    //   +00B: 04           → byte  = 4  (rank before this session; Ryuji went 4→5) CONFIRMED
+    //   +00C: 33 00        → int16 = 51 (unknown — scene/event number)
     //   +010: ptr (unknown)
     internal const int CONFIDANT_ID    = 0x00;  // int32
-    internal const int DIALOGUE_INDEX  = 0x04;  // int32 — line 0 = first dialogue
-    internal const int RANK_LEVEL      = 0x08;  // byte  — 1-10
+    internal const int DIALOGUE_INDEX  = 0x04;  // int32 — line 0 = conversation start
+    internal const int RANK_LEVEL      = 0x0B;  // byte  — rank before this session (1-10)
     internal const int DIALOGUE_BUFFER = 0x10;  // ptr candidate — unverified
 }
 

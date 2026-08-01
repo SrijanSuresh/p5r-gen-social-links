@@ -26,7 +26,7 @@ internal sealed class SocialLinkReader
 
         int confidantId   = *(int*)  (sessionPtr + P5ROffsets.CONFIDANT_ID);
         int dialogueIndex = *(int*)  (sessionPtr + P5ROffsets.DIALOGUE_INDEX);
-        int rankLevel     = *(byte*) (sessionPtr + P5ROffsets.RANK_LEVEL);
+        int rankLevel     = *(byte*) (sessionPtr + P5ROffsets.RANK_LEVEL);  // byte at +0x0B
 
         if (confidantId <= 0 || confidantId > 50) return null;  // sanity-filter noise
 
