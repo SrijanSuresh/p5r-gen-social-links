@@ -125,14 +125,22 @@ public class Mod : IModV1
         lock (_seenSrcs) isNew = _seenSrcs.Add(src);
         if (!isNew) return;
 
-        // First time we see this address: log count and first 64 printable bytes.
-        int n = (int)Math.Min(count, (nuint)256);
+        // First time: log header bytes as hex + all printable content from full buffer.
+        // BF dialogue starts with control codes (0x01-0x1F), so we show:
+        //   [AA BB CC DD] hex prefix to identify the format
+        //   then every printable byte found anywhere in the buffer
+        int n = (int)Math.Min(count, (nuint)512);
         byte* p = (byte*)dst;
-        var sb = new System.Text.StringBuilder(64);
-        for (int i = 0; i < n && p[i] != 0 && sb.Length < 64; i++)
-            sb.Append(p[i] >= 0x20 && p[i] <= 0x7E ? (char)p[i] : '·');
 
-        _modLog!.Info($"[MemcpyHook][NEW] 0x{src:X} n={count}: \"{sb}\"");
+        string hex4 = n >= 4
+            ? $"[{p[0]:X2} {p[1]:X2} {p[2]:X2} {p[3]:X2}]"
+            : "[short]";
+
+        var sb = new System.Text.StringBuilder(128);
+        for (int i = 0; i < n; i++)
+            if (p[i] >= 0x20 && p[i] <= 0x7E) sb.Append((char)p[i]);
+
+        _modLog!.Info($"[MemcpyHook][NEW] 0x{src:X} n={count} {hex4}: \"{sb}\"");
     }
 
     private void TryActivateHook()

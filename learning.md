@@ -2844,3 +2844,66 @@ Once we confirm dialogue text appears there (and not noise), we pipe `dst` throu
 `_bridge.DispatchAsync()` and write the LLM response back to `dst`.
 
 This is simpler than everything we built. One mid-function hook, one buffer overwrite.
+
+---
+
+## Chapter 36 — Why Dialogue Text Shows as "" and How Hex-Prefix Logging Reveals BF Format
+
+### The problem
+Our dedup diagnostic logged many entries at addresses like `0x41E19DCC75 n=168: ""` — sizes
+(132–268 bytes) and timing (around StructDiff state changes) that look exactly like dialogue,
+but the content field is completely blank.
+
+### Why the content shows "" when text is present
+Our display loop was:
+```csharp
+for (int i = 0; i < n && p[i] != 0 && sb.Length < 64; i++)
+    sb.Append(p[i] >= 0x20 && p[i] <= 0x7E ? (char)p[i] : '·');
+```
+Two bugs that compound:
+1. **Early termination on `p[i] != 0`**: BF buffers routinely have null bytes inside control-code
+   sequences BEFORE the text starts. A single 0x00 in the header stops the scan immediately.
+2. **`·` is never appended to `sb`**: non-printable bytes produce `·` in the char, but the
+   ternary is inside the loop — we append `·` for non-printable, but only if `p[i] != 0`.
+   If byte 0 is a control code (0x01–0x1F), that's ≥0x20? No — 0x01 < 0x20 → `·` appended,
+   but if byte 0 IS literally 0x00, the whole loop terminates with `sb = ""`.
+
+### What BF format actually looks like
+P5R's BF (Binary Format) dialogue buffers have a header section:
+```
+[01] [len] [type] [00] [00] [00] ... actual Shift-JIS or ASCII text ... [00]
+```
+Byte 0 is 0x01 (message start code). Byte 1 is a length. After several control code bytes,
+the readable text begins. Our `p[i] != 0` guard terminates at the very first null in the
+header — long before reaching the text.
+
+### The hex-prefix fix
+Show the first 4 bytes as hex regardless:
+```csharp
+string hex4 = n >= 4
+    ? $"[{p[0]:X2} {p[1]:X2} {p[2]:X2} {p[3]:X2}]"
+    : "[short]";
+```
+Remove the `p[i] != 0` early-termination guard and scan the FULL buffer:
+```csharp
+for (int i = 0; i < n; i++)
+    if (p[i] >= 0x20 && p[i] <= 0x7E) sb.Append((char)p[i]);
+```
+Now the output looks like:
+```
+[MemcpyHook][NEW] 0x41E19DCC75 n=168 [01 2A 00 03]: "It's a gym in Shibuya."
+```
+The `[01 2A 00 03]` prefix immediately identifies the buffer as BF dialogue (0x01 start code),
+while the full-buffer scan finds the ASCII text that comes after the control codes.
+
+### Why we read from `dst` not `src`
+The original buffer at `src` is fine to read but we use `dst` because after the original
+memcpy runs, `dst` holds the completed copy in a stable location we own for the duration of
+the hook. Reading `src` is equally valid here, but using `dst` is the habit we build for
+write-back: we will eventually need to WRITE to `dst`, so reading from it first confirms we
+can address it correctly.
+
+### What happens next
+If the hex prefix shows `[01 xx]` for those 132–268B entries, we have confirmed dialogue text
+flowing through the hook. The next step is filtering to `p[0] == 0x01` (BF message start) and
+capturing the full text from `dst`, which is the buffer we will overwrite with LLM output.
