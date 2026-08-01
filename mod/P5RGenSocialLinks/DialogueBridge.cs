@@ -71,7 +71,12 @@ internal sealed class DialogueBridge
 
                 if (!string.IsNullOrWhiteSpace(text))
                 {
-                    _history.RecordResponse(snap.SessionBase, text);
+                    bool isNew = _history.RecordResponse(snap.SessionBase, text);
+                    if (!isNew)
+                    {
+                        _log.WriteLine("[P5RGenSocialLinks] LLM: duplicate response suppressed.");
+                        return;
+                    }
                     // TODO: dialogue write-back requires locating the text buffer offset.
                     // For now, log the generated response so we can verify E2E flow.
                     _log.WriteLine($"[P5RGenSocialLinks] LLM: \"{text[..Math.Min(text.Length, 120)]}\"");
