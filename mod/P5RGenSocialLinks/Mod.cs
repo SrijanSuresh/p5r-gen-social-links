@@ -71,6 +71,7 @@ public class Mod : IModV1
 
         TryActivateHook();
         StartPollLoop();
+        ModuleProbe.LogWriteInstructionModule(msg => _logger.WriteLine(msg));
 
         _logger.WriteLine($"[P5RGenSocialLinks] Started — hook:{(_hookActive ? "ON" : "OFF")} poll:ON");
     }
