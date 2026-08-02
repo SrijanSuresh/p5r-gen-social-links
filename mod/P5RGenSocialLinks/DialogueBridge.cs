@@ -49,10 +49,15 @@ internal sealed class DialogueBridge
         _lastDispatch = now;
 
         // Include prior LLM lines this session as context for continuity.
+        // Trim to MaxContextChars so we never exceed Pydantic's max_length=1024.
+        const int MaxContextChars = 1000;
         string priorCtx = _history.BuildPriorContext(snap.SessionBase);
-        string fullCtx  = string.IsNullOrEmpty(priorCtx)
+        string combined = string.IsNullOrEmpty(priorCtx)
             ? contextText
             : $"{contextText} {priorCtx}";
+        string fullCtx = combined.Length > MaxContextChars
+            ? combined[..MaxContextChars]
+            : combined;
 
         _ = Task.Run(async () =>
         {
