@@ -820,3 +820,90 @@ internal const string BeginConversation =
 ```
 with the bytes you found. Run `dotnet build` and then `TryActivateHook()` will find
 the real function on the next P5R launch.
+
+---
+
+## Chapter 9 — Pointer Indirection: Chasing the Dialogue Buffer
+
+### The Problem: Inline String vs. Pointer-to-String
+
+A C struct field `char* dialogueBuffer` and a C struct field `char dialogueText[256]`
+look identical when you only know the field's **offset** — both appear at `+0x10` in
+the struct. But they are fundamentally different in memory:
+
+```
+Inline (char[256]):
+  sessionBase + 0x10 → A B C D E F ...   ← the text itself starts here
+
+Pointer-to-string (char*):
+  sessionBase + 0x10 → 60 66 F2 41 00 00 00 00   ← an 8-byte pointer value
+                             ↓
+             0x41F2E46660 → 43 00 79 00 6F 00 ...  ← "C\0y\0o\0..." (UTF-16LE)
+```
+
+The P5R session struct stores a **pointer** at `+0x10`, not inline text. Reading bytes
+directly from `sessionBase + 0x10` gives you the raw address bits of the dialogue
+string, which looks like garbage when decoded as characters.
+
+### Why P5R Uses Pointer Indirection
+
+P5R's dialogue strings live in a separate heap allocation managed by the CMM/flowscript
+system. The session struct only holds a reference (pointer) to that allocation because:
+
+1. **The text varies in length** — a fixed inline buffer wastes space for short lines
+   and can't hold long ones.
+2. **Strings are shared** — the same scripted line text may be referenced from multiple
+   events. A pointer lets both events point to the same allocation.
+3. **Hot-swap without struct resize** — P5R's streaming system can replace a string
+   in-place by updating the pointer, keeping the session struct's size constant.
+
+### The Double-Dereference Pattern
+
+Reading a `char*` field from a game struct always requires two unsafe reads:
+
+```csharp
+// Step 1: read the pointer stored at struct+offset → nuint
+nuint ptrFieldAddr = sessionBase + P5ROffsets.DIALOGUE_BUFFER;  // where the ptr lives
+if (!MemoryGuard.IsReadable(ptrFieldAddr, sizeof(nuint))) return null;
+nuint strAddr = *(nuint*)ptrFieldAddr;                           // the pointer value
+
+// Step 2: validate the pointed-to address, then read the string
+if (!MemoryGuard.IsReadable(strAddr, 2)) return null;
+char* chars = (char*)strAddr;
+// walk null-terminated UTF-16LE ...
+```
+
+Skipping the first `IsReadable` check crashes with `AccessViolationException` if the
+session struct is partially initialized. Skipping the second crashes if the string
+pointer points at unmapped memory (e.g. freed heap block).
+
+### UTF-16LE: Two Bytes Per Character
+
+P5R stores all in-game text as **UTF-16 Little Endian**. In this encoding every
+ASCII character occupies two bytes with a zero byte appended:
+
+```
+'C' = 0x43 0x00
+'y' = 0x79 0x00
+'o' = 0x6F 0x00
+'\0' (null terminator) = 0x00 0x00
+```
+
+So `ptr[len] != '\0'` (where `char* ptr`) checks the first of the two null bytes.
+C# `char` is already 2 bytes (UTF-16), so iterating `char*` naturally steps by 2
+bytes and aligns with the game's encoding.
+
+### Discovery Loop: Chasing the Pointer Live
+
+Until we confirm `+0x10` is the right field, the poll loop logs the raw 8 bytes at
+`+0x10` as a hex address, then attempts to follow it. In the Reloaded console you
+should see:
+
+```
+[P5RGenSocialLinks] Poll: session=0x41F2E4F090
+[P5RGenSocialLinks] +0x10 ptr=0x41F2E46660
+[P5RGenSocialLinks] +0x10 content (UTF-16): "Yo, what's up man..."
+```
+
+If `+0x10 ptr` is `0x0000000000000000` or unreadable, `+0x10` is not the dialogue
+pointer and we need to scan further offsets with Cheat Engine or Ghidra.

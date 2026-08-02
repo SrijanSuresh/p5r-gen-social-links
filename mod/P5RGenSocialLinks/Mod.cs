@@ -135,6 +135,21 @@ public class Mod : IModV1
             lastSession = session;
             _logger!.WriteLine($"[P5RGenSocialLinks] Poll: session=0x{session:X}");
             _logger!.WriteLine($"[P5RGenSocialLinks] Poll HexDump:{SocialLinkReader.HexDump(session)}");
+
+            // Follow the pointer at +0x10 to discover if it's the dialogue buffer.
+            nuint dialoguePtr = ContextBuilder.PeekDialoguePtr(session);
+            if (dialoguePtr != 0)
+            {
+                _logger!.WriteLine($"[P5RGenSocialLinks] +0x10 ptr=0x{dialoguePtr:X}");
+                string ctx = ContextBuilder.ReadAndBuild(
+                    SocialLinkReader.TryReadFromPtr(session) ??
+                    new SocialLinkSnapshot(0, 0, 0, session));
+                _logger!.WriteLine($"[P5RGenSocialLinks] +0x10 content: \"{ctx}\"");
+            }
+            else
+            {
+                _logger!.WriteLine("[P5RGenSocialLinks] +0x10 ptr=null (not dialogue buffer or session cold)");
+            }
         }
     }
 

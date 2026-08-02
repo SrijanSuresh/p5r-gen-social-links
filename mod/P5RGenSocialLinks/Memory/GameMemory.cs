@@ -30,12 +30,17 @@ internal static class P5ROffsets
 }
 
 // Memory layout of the Social Link session struct (mirrors C++ object in P5R)
+// All fields confirmed from live hex dump during Ryuji gym hang-out (session=0x41D7156660).
+// DIALOGUE_BUFFER at +0x10 is a pointer candidate — see ContextBuilder.ReadAndBuild.
 [System.Runtime.InteropServices.StructLayout(
     System.Runtime.InteropServices.LayoutKind.Explicit, Size = 0x20)]
 internal unsafe struct SocialLinkSession
 {
-    [System.Runtime.InteropServices.FieldOffset(0x00)] public int  ConfidantId;
-    [System.Runtime.InteropServices.FieldOffset(0x04)] public int  RankLevel;
-    [System.Runtime.InteropServices.FieldOffset(0x08)] public int  DialogueIndex;
-    [System.Runtime.InteropServices.FieldOffset(0x10)] public char* DialogueBuffer;
+    [System.Runtime.InteropServices.FieldOffset(0x00)] public int   ConfidantId;    // cmmId (8=Ryuji)
+    [System.Runtime.InteropServices.FieldOffset(0x04)] public int   DialogueIndex;  // line 0 = conversation start
+    [System.Runtime.InteropServices.FieldOffset(0x08)] public byte  CmmIdRepeat;    // arcana/cmmId repeated
+    [System.Runtime.InteropServices.FieldOffset(0x0A)] public byte  EventType;      // read by CMM_EXEC_EVENT
+    [System.Runtime.InteropServices.FieldOffset(0x0B)] public byte  RankLevel;      // rank before this session
+    [System.Runtime.InteropServices.FieldOffset(0x0C)] public short SceneNumber;    // e.g. 51 — scene/event id
+    [System.Runtime.InteropServices.FieldOffset(0x10)] public char* DialogueBuffer; // ptr to UTF-16LE text (unverified)
 }
