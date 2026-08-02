@@ -221,7 +221,49 @@ public class Mod : IModV1
     // ── Poll loop — session lifecycle + text pool discovery ───────────────
 
     private readonly StructDiffScanner _diffScanner = new();
-    private int _poolFindRetries;   // ticks since session start spent retrying Find()
+    private int  _poolFindRetries;
+    private uint _lastBfLineSnap;   // change-detection hash for BF line probe
+
+    /// <summary>
+    /// Reads the current BF dialogue line via two confirmed pointers:
+    ///   PC  = uint16 @ session+0x20  (StructDiff confirmed: advances ~53 bytes per line)
+    ///   buf = *(session+0x0E8)       (Diag confirmed: = session+0x80, 64% printable)
+    /// Logs [BFLine] whenever PC moves (= new dialogue line displayed).
+    /// </summary>
+    private unsafe void ProbeBfLine(nuint session)
+    {
+        // Read 2-byte BF program counter
+        if (!Memory.MemoryGuard.IsReadable(session + 0x20, 2)) return;
+        ushort pc = *(ushort*)((byte*)session + 0x20);
+
+        // Follow the confirmed pointer to BF buffer base
+        if (!Memory.MemoryGuard.IsReadable(session + 0x0E8, 8)) return;
+        nuint bfBase = *(nuint*)((byte*)session + 0x0E8);
+        if (bfBase < HeapLow) return;
+
+        // Current BF instruction = bfBase + pc
+        nuint lineAddr = bfBase + pc;
+        if (!Memory.MemoryGuard.IsReadable(lineAddr, 64)) return;
+        byte* b = (byte*)lineAddr;
+
+        // Change-detect on PC + first 8 bytes (avoids per-tick noise)
+        uint snap = (uint)pc;
+        for (int i = 0; i < 8; i++) snap = snap * 31 + b[i];
+        if (snap == _lastBfLineSnap) return;
+        _lastBfLineSnap = snap;
+
+        // Hex of first 8 bytes to identify BF opcode
+        var hex = new System.Text.StringBuilder(24);
+        for (int i = 0; i < 8; i++) hex.Append($"{b[i]:X2} ");
+
+        // All printable bytes in next 64 = the dialogue text
+        var text = new System.Text.StringBuilder(128);
+        for (int i = 0; i < 64; i++)
+            if (b[i] >= 0x20 && b[i] <= 0x7E) text.Append((char)b[i]);
+
+        _modLog!.Info(
+            $"[BFLine] pc=0x{pc:X4} @0x{lineAddr:X} [{hex}]: \"{text}\"");
+    }
 
     private void StartPollLoop()
     {
@@ -244,6 +286,7 @@ public class Mod : IModV1
                     _bridge!.ResetSession();
                     _poolFindRetries = 0;
                     _inActiveSession = false;
+                    _lastBfLineSnap  = 0;
                     lock (_seenSrcs) _seenSrcs.Clear();
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
                 }
@@ -311,6 +354,11 @@ public class Mod : IModV1
                 if (diff is not null)
                     _modLog!.Info($"[P5RGenSocialLinks] {diff}");
             }
+
+            // BF line probe: read current dialogue text from bfBase+pc on every tick.
+            // Fires only when the PC moves (= a new dialogue line is loaded), so it's
+            // quiet between advances and doesn't need StructDiffEnabled.
+            ProbeBfLine(session);
         }
     }
 

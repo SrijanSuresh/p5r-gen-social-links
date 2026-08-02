@@ -2907,3 +2907,56 @@ can address it correctly.
 If the hex prefix shows `[01 xx]` for those 132–268B entries, we have confirmed dialogue text
 flowing through the hook. The next step is filtering to `p[0] == 0x01` (BF message start) and
 capturing the full text from `dst`, which is the buffer we will overwrite with LLM output.
+
+---
+
+## Chapter 37 — Why the Memcpy Hook Missed Dialogue and How BF Program-Counter Probing Works
+
+### Why the memcpy hook never showed dialogue text
+P5R loads the BF script for a hang-out scene **once**, before the dialogue UI appears.
+The copy sequence:
+1. User selects "Hang out with him" from the menu
+2. The BF interpreter calls `FUN_1405a8570` (our hooked function) to DMA the compiled
+   script file from the asset archive into heap memory
+3. The game transitions to the hang-out scene and sets up the session struct
+4. **Our poll loop now detects the session** → `_inActiveSession = true`
+5. For every line of dialogue thereafter, the BF interpreter reads DIRECTLY from the
+   already-loaded heap buffer — no further memcpy calls are made
+
+So step 2 (the copy) happens BEFORE step 4 (session detection). `_inActiveSession = false`
+during the copy → we skip it. We see every subsequent asset copy but never the one that matters.
+
+### Two confirmed anchor points from prior instrumentation
+
+| Anchor | Source | Value |
+|--------|--------|-------|
+| `session + 0x20` = BF PC | StructDiff log (16 StructDiff events matched 16 dialogue advances) | uint16, starts at 0x04E1, advances ~53 bytes/line |
+| `*(session + 0x0E8)` = BF buffer base | TextPoolFinder Diag `+0x0E8 → 0x4247624840 = session + 0x80` | nuint pointer into heap |
+
+The BF program counter at `session+0x20` tells us WHERE in the BF script the interpreter
+is currently executing. The buffer pointer at `*(session+0x0E8)` tells us the base address
+of the BF script in heap memory. Together: **current dialogue line = bfBase + pc**.
+
+### The BF instruction at bfBase+pc
+P5R's BF format stores a text-display instruction as roughly:
+```
+[opcode 1B] [speaker 1B] [flags ...] [text bytes...] [00 terminator]
+```
+The first 8 bytes are binary opcodes; the actual dialogue text starts somewhere in the
+middle of the instruction payload. By logging "all printable bytes in the first 64 bytes
+at bfBase+pc", we surface the English text from the current instruction.
+
+### Change detection (avoiding per-tick spam)
+The PC at `session+0x20` is stable between dialogue advances (the game waits for the
+player to press X before advancing). We hash `pc + first 8 bytes at lineAddr` to get a
+32-bit snapshot. Only when the snapshot changes (= a new line loaded) do we log.
+This gives exactly one `[BFLine]` entry per dialogue line, at 200 ms latency from the
+button press — fast enough for LLM write-back.
+
+### Write-back plan (next milestone)
+Once `[BFLine]` entries confirm we're reading the correct text:
+1. At CmmExecEvent fire: read current line text from bfBase+pc
+2. Send to LLM (`DialogueBridge.DispatchAsync`)
+3. When LLM responds: find the text region in bfBase+pc (skip past opcode bytes)
+4. `Marshal.Copy(llmBytes, 0, (nint)(lineAddr + textOffset), llmBytes.Length)`
+5. Write null terminator at llmBytes.Length
