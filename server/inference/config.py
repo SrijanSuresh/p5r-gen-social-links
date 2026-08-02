@@ -34,3 +34,13 @@ class ModelConfig:
 
     # Dialogue must fit in P5R's display area — hard cap before sending to game.
     max_response_chars: int = 200
+
+    def __post_init__(self) -> None:
+        if not (0.0 <= self.temperature <= 2.0):
+            raise ValueError(f"temperature must be in [0, 2], got {self.temperature}")
+        if not (0.0 < self.top_p <= 1.0):
+            raise ValueError(f"top_p must be in (0, 1], got {self.top_p}")
+        if not (1 <= self.max_tokens <= 512):
+            raise ValueError(f"max_tokens must be in [1, 512], got {self.max_tokens}")
+        if not (128 <= self.n_ctx <= 32768):
+            raise ValueError(f"n_ctx must be in [128, 32768], got {self.n_ctx}")
