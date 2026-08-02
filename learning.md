@@ -1494,3 +1494,58 @@ that logs on first fire.
               │  ~2s per response          │
               └────────────────────────────┘
 ```
+
+---
+
+## Chapter 17 — Session State Management: History, Deduplication, and Context Budget
+
+### Why Session State Is Necessary
+
+Phase 1 dispatches once per hang-out: the LLM has no memory of previous responses
+within the same conversation. In Phase 2 (per-line), the LLM might generate the
+same line twice if the per-line trigger fires on the same dialogue beat.
+
+Three problems to solve:
+1. **Continuity**: Each generated line should build on the previous ones
+2. **Deduplication**: The same response should never appear twice
+3. **Context budget**: Prior dialogue text grows with each line; Pydantic's
+   max_length=1024 on the context field is a hard ceiling
+
+### SessionHistory: Rolling Buffer + Hash Deduplication
+
+SessionHistory stores the last 8 LLM responses as a List<string>. On each new
+dispatch, the prior lines are joined with ' | ' and prepended to the context
+string as "Prior dialogue: [line1] | [line2]".
+
+For deduplication, a HashSet<int> stores the OrdinalIgnoreCase GetHashCode of
+each recorded response. RecordResponse() returns false on a hash collision —
+DialogueBridge then suppresses the duplicate and skips the log line.
+
+Hash collisions (two different strings with the same hash) are possible but
+extremely rare for dialogue lines. A full string equality check on every entry
+would be O(n×m) per insertion; the hash approach is O(1) with acceptable FP rate.
+
+### The Context Budget Problem
+
+With 8 entries of ~120 chars each, prior dialogue can be ~960 chars. Add the
+base context string (~150 chars) and you get ~1110 chars — over Pydantic's
+max_length=1024 field constraint. The server would return 422 Unprocessable Entity.
+
+Fix: hard-trim the combined context to 1000 chars before building the request.
+The 24-char safety margin accounts for ' | ' separators. The trim is a dumb
+character count (may split mid-word) but that's fine — the LLM handles partial
+sentences gracefully, and the important content (character name, rank, setting)
+is always at the start of the context string.
+
+### Context String Priority Order
+
+The context string is built as:
+```
+"Hang-out with {name} (rank N/10) at {scene}. This is a Social Link conversation...
+ Prior dialogue: [line1] | [line2] | ..."
+```
+
+Most important info is at the START because if we do trim, we lose the END first.
+The scene hints and character info come before the prior dialogue — we would rather
+lose "Prior dialogue: line7 | line8" than lose "Ryuji Sakamoto at gym".
+
