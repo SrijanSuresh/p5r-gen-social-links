@@ -15,6 +15,7 @@ from inference.config import ModelConfig
 from inference.pipeline import InferencePipeline
 from inference.queue import InferenceQueue
 from social_link.arcana import get_confidant
+from social_link.mock_responses import get_mock_response
 
 log = logging.getLogger(__name__)
 
@@ -106,13 +107,7 @@ async def generate(req: GenerateRequest) -> GenerateResponse:
         raise HTTPException(status_code=503, detail="Model not loaded.")
 
     if _pipeline is _MOCK:
-        try:
-            name = get_confidant(req.confidant_id).name
-        except KeyError:
-            name = f"Confidant #{req.confidant_id}"
-        return GenerateResponse(
-            text=f"[MOCK] {name} (rank {req.rank}): Yo, let's do this! {req.context[:40]}"
-        )
+        return GenerateResponse(text=get_mock_response(req.confidant_id, req.rank))
 
     async def _run() -> str:
         return _pipeline.generate(req.confidant_id, req.rank, req.context)  # type: ignore[union-attr]
