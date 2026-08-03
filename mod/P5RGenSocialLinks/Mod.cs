@@ -121,36 +121,80 @@ public class Mod : IModV1
     private void StartPollLoop()
     {
         _cts      = new CancellationTokenSource();
-        _timer    = new PeriodicTimer(TimeSpan.FromSeconds(1));
+        _timer    = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
         _pollTask = Task.Run(() => PollLoopAsync(_cts.Token));
     }
 
     private async Task PollLoopAsync(CancellationToken ct)
     {
-        nuint lastSession = 0;
+        nuint lastSession     = 0;
+        nuint lastDialoguePtr = 0;
+        int   lastDialogueIdx = -1;
+
         while (await _timer!.WaitForNextTickAsync(ct))
         {
-            if (!_reader!.TryResolve(out nuint session)) { lastSession = 0; continue; }
-            if (session == lastSession) continue;  // only log on change
-            lastSession = session;
-            _logger!.WriteLine($"[P5RGenSocialLinks] Poll: session=0x{session:X}");
-            _logger!.WriteLine($"[P5RGenSocialLinks] Poll HexDump:{SocialLinkReader.HexDump(session)}");
-
-            // Follow the pointer at +0x10 to discover if it's the dialogue buffer.
-            nuint dialoguePtr = ContextBuilder.PeekDialoguePtr(session);
-            if (dialoguePtr != 0)
+            if (!_reader!.TryResolve(out nuint session))
             {
-                _logger!.WriteLine($"[P5RGenSocialLinks] +0x10 ptr=0x{dialoguePtr:X}");
-                string ctx = ContextBuilder.ReadAndBuild(
-                    SocialLinkReader.TryReadFromPtr(session) ??
-                    new SocialLinkSnapshot(0, 0, 0, session));
-                _logger!.WriteLine($"[P5RGenSocialLinks] +0x10 content: \"{ctx}\"");
+                lastSession = lastDialoguePtr = 0;
+                lastDialogueIdx = -1;
+                continue;
             }
-            else
+
+            // Full hex-dump only when a new conversation starts.
+            if (session != lastSession)
             {
-                _logger!.WriteLine("[P5RGenSocialLinks] +0x10 ptr=null (not dialogue buffer or session cold)");
+                lastSession     = session;
+                lastDialoguePtr = 0;
+                lastDialogueIdx = -1;
+                _logger!.WriteLine($"[P5RGenSocialLinks] Poll: session=0x{session:X}");
+                _logger!.WriteLine($"[P5RGenSocialLinks] Poll HexDump:{SocialLinkReader.HexDump(session)}");
+                unsafe { ScanPtrCandidates(session); }
+            }
+
+            // Track dialogue-index changes within the session.
+            SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
+            if (snap is not null && snap.DialogueIndex != lastDialogueIdx)
+            {
+                lastDialogueIdx = snap.DialogueIndex;
+                _logger!.WriteLine(
+                    $"[P5RGenSocialLinks] Line {snap.DialogueIndex} | Confidant={snap.ConfidantId} Rank={snap.RankLevel}");
+                unsafe { ScanPtrCandidates(session); }
+            }
+
+            // Track dialogue-ptr changes within the session.
+            nuint dPtr = ContextBuilder.PeekDialoguePtr(session);
+            if (dPtr != lastDialoguePtr)
+            {
+                lastDialoguePtr = dPtr;
+                if (dPtr != 0)
+                {
+                    string ctx = ContextBuilder.ReadAndBuild(snap ?? new SocialLinkSnapshot(0, 0, 0, session));
+                    _logger!.WriteLine($"[P5RGenSocialLinks] +0x10 ptr=0x{dPtr:X} → {ctx}");
+                }
+                else
+                {
+                    _logger!.WriteLine("[P5RGenSocialLinks] +0x10 ptr cleared");
+                }
             }
         }
+    }
+
+    // Scans every 8-byte-aligned word in the first 0x80 bytes of the session struct
+    // looking for non-null readable pointers that might contain dialogue text.
+    private unsafe void ScanPtrCandidates(nuint sessionBase)
+    {
+        _logger!.WriteLine("[P5RGenSocialLinks] --- ptr scan ---");
+        for (nuint off = 0x10; off <= 0x70; off += 8)
+        {
+            nuint candidate = *(nuint*)(sessionBase + off);
+            if (candidate == 0) continue;
+            if (!MemoryGuard.IsReadable(candidate, 4)) continue;
+            // Read first two chars as quick content probe
+            char* chars = (char*)candidate;
+            _logger!.WriteLine(
+                $"[P5RGenSocialLinks]   +0x{off:X2} → 0x{candidate:X}  [{(int)chars[0]:X4} {(int)chars[1]:X4}]");
+        }
+        _logger!.WriteLine("[P5RGenSocialLinks] --- end scan ---");
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────

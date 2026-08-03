@@ -907,3 +907,70 @@ should see:
 
 If `+0x10 ptr` is `0x0000000000000000` or unreadable, `+0x10` is not the dialogue
 pointer and we need to scan further offsets with Cheat Engine or Ghidra.
+
+---
+
+## Chapter 10 — Intra-Session Change Detection and Dialogue Pointer Scanning
+
+### Why Session-Change Gating Is Wrong Here
+
+The original poll loop logged only when `session != lastSession` — i.e., when a
+completely new conversation started. That fires once (at session creation) and then
+goes silent for the entire conversation.
+
+The problem: the dialogue buffer pointer and the dialogue-index field both CHANGE
+**within** the same session, every time the player advances to a new line. If we only
+log on session change, we will always see the cold, partially-initialized struct and
+miss every mid-conversation state.
+
+**Fix**: track three separate "last seen" values:
+
+```
+lastSession      → triggers full struct hex-dump (expensive, only on new conversation)
+lastDialoguePtr  → triggers follow + decode (fires per-line during conversation)
+lastDialogueIdx  → fires on every line advance even if ptr hasn't changed
+```
+
+### Scanning Multiple Ptr Candidates
+
+When `+0x10` is null at session init, the dialogue ptr might live at a later offset.
+The hex dump revealed `+0x18 = 0x70BAA0B8` (non-null) and everything else null/data.
+A systematic scan deferences every 8-byte-aligned word in the first 0x80 bytes of the
+struct and asks: "is this address readable and does it contain any non-zero chars?"
+
+```csharp
+for (nuint off = 0x10; off <= 0x70; off += 8)
+{
+    nuint candidate = *(nuint*)(sessionBase + off);
+    if (candidate == 0) continue;
+    if (!MemoryGuard.IsReadable(candidate, 2)) continue;
+    char* chars = (char*)candidate;
+    if (chars[0] != '\0')
+        _logger.WriteLine($"  ptr at +0x{off:X2} → 0x{candidate:X} = '{chars[0]}{chars[1]}...'");
+}
+```
+
+Running this every time `dialogueIdx` ticks up shows which offset "wakes up" as
+dialogue begins — that is the real dialogue buffer pointer.
+
+### Why DIALOGUE_INDEX Is Useful Even Without the Buffer
+
+Even if we never find the text buffer, `dialogueIndex` (int32 at `+0x04`) increments
+every time the player taps the text-advance button. Combined with the known
+`confidantId` and `rankLevel`, it uniquely identifies which scripted line is playing.
+
+P5R's flowscripts (`.flow` files) contain every dialogue line indexed by scene number
+and line offset. ShrineFox's Atlus Script Tools can decompile them. Once extracted,
+we can build a lookup table:
+
+```python
+{ (confidant_id, rank, dialogue_index): "scripted line text" }
+```
+
+The mod sends `(confidantId, rank, dialogueIndex)` to the server. The server looks up
+the scripted line to use as **context** for the LLM, then generates an alternative.
+This approach completely bypasses the dialogue buffer problem — we never need to read
+live game memory for the text at all.
+
+The tradeoff: the lookup database requires a one-time offline extraction step, and it
+only works for scenes that are in the flowscripts (not runtime-generated text).
