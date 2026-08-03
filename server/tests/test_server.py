@@ -64,6 +64,28 @@ async def test_stats_endpoint_returns_expected_keys() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ready_false_without_model() -> None:
+    import main as srv
+    srv._pipeline = None
+    transport = ASGITransport(app=srv.app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        r = await client.get("/ready")
+    assert r.status_code == 200
+    assert r.json() == {"ready": False}
+
+
+@pytest.mark.asyncio
+async def test_ready_true_with_mock_pipeline() -> None:
+    import main as srv
+    srv._pipeline = srv._MOCK
+    transport = ASGITransport(app=srv.app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        r = await client.get("/ready")
+    assert r.json() == {"ready": True}
+    srv._pipeline = None
+
+
+@pytest.mark.asyncio
 async def test_model_info_no_model() -> None:
     import main as srv
     srv._pipeline = None

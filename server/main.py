@@ -67,6 +67,13 @@ async def health() -> dict[str, str]:
     return {"status": status}
 
 
+@app.get("/ready")
+async def ready() -> dict[str, bool]:
+    """Returns {"ready": true} once the model is loaded and inference can begin."""
+    is_ready = _pipeline is not None
+    return {"ready": is_ready}
+
+
 @app.get("/stats")
 async def stats() -> dict[str, object]:
     return {
