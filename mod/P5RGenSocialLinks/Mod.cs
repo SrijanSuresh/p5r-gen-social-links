@@ -221,48 +221,59 @@ public class Mod : IModV1
     // ── Poll loop — session lifecycle + text pool discovery ───────────────
 
     private readonly StructDiffScanner _diffScanner = new();
-    private int  _poolFindRetries;
-    private uint _lastBfLineSnap;   // change-detection hash for BF line probe
+    private int    _poolFindRetries;
+    private ushort _lastBfPc;       // change-detection: fires only when PC moves
 
     /// <summary>
-    /// Reads the current BF dialogue line via two confirmed pointers:
-    ///   PC  = uint16 @ session+0x20  (StructDiff confirmed: advances ~53 bytes per line)
-    ///   buf = *(session+0x0E8)       (Diag confirmed: = session+0x80, 64% printable)
-    /// Logs [BFLine] whenever PC moves (= new dialogue line displayed).
+    /// Fires whenever the BF program counter (uint16 @ session+0x20) advances.
+    /// Session struct layout varies by scene type, so instead of hardcoding a
+    /// pointer offset, we scan EVERY 8-byte heap address in the first 512 bytes
+    /// of the session struct and probe [ptr + pc] for printable text.
+    /// The BF script buffer is the one where [ptr + pc] contains ≥8 printable bytes.
     /// </summary>
     private unsafe void ProbeBfLine(nuint session)
     {
-        // Read 2-byte BF program counter
+        const int scanBytes = 512;
+
+        // BF program counter — confirmed stable at session+0x20
         if (!Memory.MemoryGuard.IsReadable(session + 0x20, 2)) return;
         ushort pc = *(ushort*)((byte*)session + 0x20);
+        if (pc == _lastBfPc) return;   // no new line yet
+        _lastBfPc = pc;
 
-        // Follow the confirmed pointer to BF buffer base
-        if (!Memory.MemoryGuard.IsReadable(session + 0x0E8, 8)) return;
-        nuint bfBase = *(nuint*)((byte*)session + 0x0E8);
-        if (bfBase < HeapLow) return;
+        if (!Memory.MemoryGuard.IsReadable(session, scanBytes)) return;
+        byte* sp = (byte*)session;
 
-        // Current BF instruction = bfBase + pc
-        nuint lineAddr = bfBase + pc;
-        if (!Memory.MemoryGuard.IsReadable(lineAddr, 64)) return;
-        byte* b = (byte*)lineAddr;
+        bool anyHit = false;
+        for (int off = 0; off + 8 <= scanBytes; off += 8)
+        {
+            nuint ptr = *(nuint*)(sp + off);
+            if (ptr < HeapLow) continue;
 
-        // Change-detect on PC + first 8 bytes (avoids per-tick noise)
-        uint snap = (uint)pc;
-        for (int i = 0; i < 8; i++) snap = snap * 31 + b[i];
-        if (snap == _lastBfLineSnap) return;
-        _lastBfLineSnap = snap;
+            nuint lineAddr = ptr + pc;
+            if (!Memory.MemoryGuard.IsReadable(lineAddr, 64)) continue;
+            byte* b = (byte*)lineAddr;
 
-        // Hex of first 8 bytes to identify BF opcode
-        var hex = new System.Text.StringBuilder(24);
-        for (int i = 0; i < 8; i++) hex.Append($"{b[i]:X2} ");
+            // Count printable bytes; skip if this looks like binary (animation/texture)
+            int printable = 0;
+            for (int i = 0; i < 64; i++)
+                if (b[i] >= 0x20 && b[i] <= 0x7E) printable++;
+            if (printable < 8) continue;
 
-        // All printable bytes in next 64 = the dialogue text
-        var text = new System.Text.StringBuilder(128);
-        for (int i = 0; i < 64; i++)
-            if (b[i] >= 0x20 && b[i] <= 0x7E) text.Append((char)b[i]);
+            var hex  = new System.Text.StringBuilder(24);
+            for (int i = 0; i < 8; i++) hex.Append($"{b[i]:X2} ");
 
-        _modLog!.Info(
-            $"[BFLine] pc=0x{pc:X4} @0x{lineAddr:X} [{hex}]: \"{text}\"");
+            var text = new System.Text.StringBuilder(128);
+            for (int i = 0; i < 64; i++)
+                if (b[i] >= 0x20 && b[i] <= 0x7E) text.Append((char)b[i]);
+
+            _modLog!.Info(
+                $"[BFLine] pc=0x{pc:X4} [sess+0x{off:X3}+pc] [{hex}]: \"{text}\"");
+            anyHit = true;
+        }
+
+        if (!anyHit)
+            _modLog!.Info($"[BFLine] pc=0x{pc:X4}: no heap-ptr+pc with ≥8 printable bytes");
     }
 
     private void StartPollLoop()
@@ -286,7 +297,7 @@ public class Mod : IModV1
                     _bridge!.ResetSession();
                     _poolFindRetries = 0;
                     _inActiveSession = false;
-                    _lastBfLineSnap  = 0;
+                    _lastBfPc        = 0;
                     lock (_seenSrcs) _seenSrcs.Clear();
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
                 }

@@ -2960,3 +2960,49 @@ Once `[BFLine]` entries confirm we're reading the correct text:
 3. When LLM responds: find the text region in bfBase+pc (skip past opcode bytes)
 4. `Marshal.Copy(llmBytes, 0, (nint)(lineAddr + textOffset), llmBytes.Length)`
 5. Write null terminator at llmBytes.Length
+
+---
+
+## Chapter 38 — Session Struct Layout Varies; Robust BF Buffer Discovery via ptr+PC Scan
+
+### What broke
+We hardcoded `*(session + 0x0E8)` as the BF buffer base from one test session
+(`0x4247624760`). A different Ryuji hangout session (`0x418A26AAE0`) has the heap
+pointers at completely different offsets (`+0x1B8`, `+0x1C0`, `+0x1F0`, `+0x1F8`).
+Hardcoding a single offset breaks whenever the game allocates a different session
+struct layout (different scene type, different confidant rank, different play order).
+
+### Why session struct layout varies in P5R
+P5R uses C++ inheritance for its social link / event system. Different scene types
+derive from a common `SocialLinkSession` base class but add their own virtual method
+tables and fields. A gym hangout might be `GymHangoutSession` (adds a gym-data pointer
+at +0x80), while a festival scene might be `FestivalHangoutSession` (completely different
+field layout). The base class fields (like the BF PC at +0x20) are fixed; the derived
+fields (like the BF script buffer pointer) are at class-specific offsets.
+
+### The robust approach: ptr+PC scan
+Two things are STABLE across session types:
+1. **PC at session+0x20** — StructDiff confirmed it advances ~53 bytes per dialogue line
+   in BOTH sessions tested. It's in the base class.
+2. **The BF buffer, when indexed by the PC, contains printable English text.**
+
+Instead of guessing which heap pointer is the BF buffer, we probe ALL of them:
+```
+for each 8-byte value V in first 512 bytes of session struct:
+    if V is a heap address (> 256 GB):
+        probe = V + pc
+        if MemoryGuard.IsReadable(probe, 64) AND printable_chars(probe, 64) >= 8:
+            → this is the BF buffer pointer; log it
+```
+
+The BF script + pc lands on the current dialogue instruction, which contains ASCII text.
+Every other heap pointer + pc lands on binary data (animation frames, texture headers, etc.)
+which has <8 printable bytes in 64. The separation is strong because dialogue text has
+~50-70% printable bytes while packed float/bone data has <10%.
+
+### Expected output
+```
+[BFLine] pc=0x04F7 [sess+0x1B8+pc] [01 21 00 05 ...]: "It's a gym over in Shibuya."
+```
+The `[sess+0x1B8+pc]` part tells us which pointer offset in the struct is the BF buffer —
+which we can then use directly for write-back.
