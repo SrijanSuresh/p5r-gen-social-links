@@ -2266,3 +2266,71 @@ protection flags. We need `IsWritable`, which additionally requires:
 Heap memory is always `PAGE_READWRITE`, so in practice this is just checking that
 flag. But we guard it properly to avoid an access violation if the protection ever
 changes (e.g., after a `VirtualProtect` call by the game's anti-tamper layer).
+
+---
+
+## Chapter 27: Following Pointer Chains to Nested Sub-Objects
+
+### Why the Counter Isn't at the Top Level
+
+We scanned 256 bytes of the session struct while the player fast-forwarded through
+dialogue with Shift+F — dozens of line-advance presses in a few seconds. Only the
+game clock at +0x20/+0x21 changed. This rules out any per-line counter in the first
+256 bytes of the session struct.
+
+So where is it? Game engines decompose large systems into nested objects. P5R's
+CommunityManager session is not a flat blob; it's a root object that holds **pointers
+to sub-objects** for each subsystem: dialogue display, voice playback, camera control,
+etc. The line counter almost certainly lives inside one of those sub-objects.
+
+### What We Saw at Hang-Out Start
+
+The StructDiff log showed bytes changing at session struct offsets **+0xE0, +0xE8,
++0xF0** at the moment the hang-out began — then staying constant for the rest of the
+session. That pattern is diagnostic: it's a set of pointers being written into the
+struct at initialization. Before the hang-out, those slots held 0 (or a prior
+hang-out's stale pointer). When CMM_EXEC_EVENT fires, the engine allocates sub-objects
+for this session and stores their addresses in those slots.
+
+### Pointer Following as a Scanning Strategy
+
+Instead of guessing the counter's offset in the session struct (where it doesn't
+exist), we follow the known pointers:
+
+```
+session_struct + 0xE0  →  dialogue_manager_A  (8-byte pointer)
+session_struct + 0xE8  →  dialogue_manager_B  (8-byte pointer)
+session_struct + 0xF0  →  dialogue_manager_C  (8-byte pointer)
+```
+
+For each of those addresses, we run the same StructDiff scan we ran on the session
+struct — polling every 500 ms, recording which bytes change. A byte that increments
+monotonically with each line advance is the counter.
+
+### Reading a Raw Pointer in Unsafe C#
+
+```csharp
+nuint ptrAddr = sessionPtr + 0xE0;           // address of the slot
+nuint target  = *(nuint*)ptrAddr;            // dereference: read the 8-byte pointer
+byte* subObj  = (byte*)target;               // cast to byte* to scan sub-object
+```
+
+This is identical to the two-level dereference our PointerChainResolver already does:
+`[module + SL_STATIC_PTR]` → `[result + CMM_SESSION_OFFSET]`. We're just adding a
+third level, but because the first two levels are stable (module-relative), and we
+call `MemoryGuard.IsReadable` before every dereference, it's safe.
+
+### The PointerFollowScanner Design
+
+`PointerFollowScanner` captures the three pointer values once at hang-out start
+(right after StructDiff.Reset), then on every poll tick it diffs the 256 bytes each
+pointer points to. Output is labelled with the source offset and target address so
+we can immediately identify which sub-object contains the counter:
+
+```
+[PtrFollow +0xE0 → 0x41DE91A000] +0x18:00→01  ← this is our counter
+```
+
+Once we see monotonically incrementing bytes, we have the offset. We then hard-code
+that as a new field in `P5ROffsets` — exactly like we did for `CMM_SESSION_OFFSET`
+after the Ghidra analysis.

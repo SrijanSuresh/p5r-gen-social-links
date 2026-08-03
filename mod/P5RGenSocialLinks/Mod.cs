@@ -146,8 +146,9 @@ public class Mod : IModV1
 
     // ── Poll loop (fallback + struct discovery) ───────────────────────────
 
-    private readonly StructDiffScanner   _diffScanner    = new();
-    private readonly LineCounterMonitor  _lineMonitor    = new();
+    private readonly StructDiffScanner    _diffScanner    = new();
+    private readonly PointerFollowScanner _ptrFollower    = new();
+    private readonly LineCounterMonitor   _lineMonitor    = new();
 
     private void StartPollLoop()
     {
@@ -167,6 +168,7 @@ public class Mod : IModV1
                 if (lastSession != 0)
                 {
                     _diffScanner.Reset();
+                    _ptrFollower.Reset();
                     _lineMonitor.Deactivate();
                     _bridge!.ResetSession();
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
@@ -179,6 +181,7 @@ public class Mod : IModV1
             {
                 lastSession = session;
                 _diffScanner.Reset();
+                _ptrFollower.Capture(session);
                 _lineMonitor.Activate();
                 LineCounterMonitor.Diagnose(msg => _modLog!.Info(msg));
 
@@ -224,6 +227,9 @@ public class Mod : IModV1
                 string? diff = _diffScanner.Diff(session);
                 if (diff is not null)
                     _modLog!.Info($"[P5RGenSocialLinks] {diff}");
+
+                foreach (string ptrDiff in _ptrFollower.Diff())
+                    _modLog!.Info($"[P5RGenSocialLinks] {ptrDiff}");
             }
         }
     }
