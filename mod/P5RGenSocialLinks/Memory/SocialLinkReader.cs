@@ -24,13 +24,14 @@ internal sealed class SocialLinkReader
     {
         if (!MemoryGuard.IsReadable(sessionPtr, 0x10)) return null;
 
-        int confidantId   = *(int*)  (sessionPtr + P5ROffsets.CONFIDANT_ID);
-        int dialogueIndex = *(int*)  (sessionPtr + P5ROffsets.DIALOGUE_INDEX);
-        int rankLevel     = *(byte*) (sessionPtr + P5ROffsets.RANK_LEVEL);  // byte at +0x0B
+        int confidantId   = *(int*)   (sessionPtr + P5ROffsets.CONFIDANT_ID);
+        int dialogueIndex = *(int*)   (sessionPtr + P5ROffsets.DIALOGUE_INDEX);
+        int rankLevel     = *(byte*)  (sessionPtr + P5ROffsets.RANK_LEVEL);
+        int sceneNumber   = *(short*) (sessionPtr + P5ROffsets.SCENE_NUMBER);
 
-        if (confidantId <= 0 || confidantId > 50) return null;  // sanity-filter noise
+        if (confidantId <= 0 || confidantId > 50) return null;
 
-        return new SocialLinkSnapshot(confidantId, rankLevel, dialogueIndex, sessionPtr);
+        return new SocialLinkSnapshot(confidantId, rankLevel, dialogueIndex, sceneNumber, sessionPtr);
     }
 
     /// <summary>
@@ -69,5 +70,6 @@ internal sealed record SocialLinkSnapshot(
     int   ConfidantId,
     int   RankLevel,
     int   DialogueIndex,
+    int   SceneNumber,
     nuint SessionBase
 );

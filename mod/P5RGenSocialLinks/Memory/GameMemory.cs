@@ -24,9 +24,9 @@ internal static class P5ROffsets
     //   +00C: 33 00        → int16 = 51 (unknown — scene/event number)
     //   +010: ptr (unknown)
     internal const int CONFIDANT_ID    = 0x00;  // int32
-    internal const int DIALOGUE_INDEX  = 0x04;  // int32 — line 0 = conversation start
+    internal const int DIALOGUE_INDEX  = 0x04;  // int32 — increments with each line advance
     internal const int RANK_LEVEL      = 0x0B;  // byte  — rank before this session (1-10)
-    internal const int DIALOGUE_BUFFER = 0x10;  // ptr candidate — unverified
+    internal const int SCENE_NUMBER    = 0x0C;  // int16 — specific hang-out scene id (e.g. 51)
 }
 
 // Memory layout of the Social Link session struct (mirrors C++ object in P5R)
@@ -42,5 +42,5 @@ internal unsafe struct SocialLinkSession
     [System.Runtime.InteropServices.FieldOffset(0x0A)] public byte  EventType;      // read by CMM_EXEC_EVENT
     [System.Runtime.InteropServices.FieldOffset(0x0B)] public byte  RankLevel;      // rank before this session
     [System.Runtime.InteropServices.FieldOffset(0x0C)] public short SceneNumber;    // e.g. 51 — scene/event id
-    [System.Runtime.InteropServices.FieldOffset(0x10)] public char* DialogueBuffer; // ptr to UTF-16LE text (unverified)
+    // +0x10 onwards: internal CMM pointers — no dialogue text accessible from here.
 }

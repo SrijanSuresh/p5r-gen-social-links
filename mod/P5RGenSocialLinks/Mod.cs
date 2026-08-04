@@ -99,14 +99,13 @@ public class Mod : IModV1
             }
 
             _logger?.WriteLine($"[P5RGenSocialLinks] CmmExecEvent session=0x{session:X}");
-            _logger?.WriteLine($"[P5RGenSocialLinks] HexDump:{SocialLinkReader.HexDump(session)}");
 
             SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
             if (snap is null) return result;
 
             _logger?.WriteLine(
-                $"[P5RGenSocialLinks] Confidant={snap.ConfidantId} Rank={snap.RankLevel}");
-            _bridge!.DispatchAsync(snap, ContextBuilder.ReadAndBuild(snap));
+                $"[P5RGenSocialLinks] Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber} Line={snap.DialogueIndex}");
+            _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap));
         }
         catch (Exception ex)
         {
@@ -128,14 +127,13 @@ public class Mod : IModV1
     private async Task PollLoopAsync(CancellationToken ct)
     {
         nuint lastSession     = 0;
-        nuint lastDialoguePtr = 0;
         int   lastDialogueIdx = -1;
 
         while (await _timer!.WaitForNextTickAsync(ct))
         {
             if (!_reader!.TryResolve(out nuint session))
             {
-                lastSession = lastDialoguePtr = 0;
+                lastSession     = 0;
                 lastDialogueIdx = -1;
                 continue;
             }
@@ -144,7 +142,6 @@ public class Mod : IModV1
             if (session != lastSession)
             {
                 lastSession     = session;
-                lastDialoguePtr = 0;
                 lastDialogueIdx = -1;
                 _logger!.WriteLine($"[P5RGenSocialLinks] Poll: session=0x{session:X}");
                 _logger!.WriteLine($"[P5RGenSocialLinks] Poll HexDump:{SocialLinkReader.HexDump(session)}");
@@ -157,25 +154,11 @@ public class Mod : IModV1
             {
                 lastDialogueIdx = snap.DialogueIndex;
                 _logger!.WriteLine(
-                    $"[P5RGenSocialLinks] Line {snap.DialogueIndex} | Confidant={snap.ConfidantId} Rank={snap.RankLevel}");
+                    $"[P5RGenSocialLinks] Line {snap.DialogueIndex} | Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber}");
                 unsafe { ScanPtrCandidates(session); }
+                _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap));
             }
 
-            // Track dialogue-ptr changes within the session.
-            nuint dPtr = ContextBuilder.PeekDialoguePtr(session);
-            if (dPtr != lastDialoguePtr)
-            {
-                lastDialoguePtr = dPtr;
-                if (dPtr != 0)
-                {
-                    string ctx = ContextBuilder.ReadAndBuild(snap ?? new SocialLinkSnapshot(0, 0, 0, session));
-                    _logger!.WriteLine($"[P5RGenSocialLinks] +0x10 ptr=0x{dPtr:X} → {ctx}");
-                }
-                else
-                {
-                    _logger!.WriteLine("[P5RGenSocialLinks] +0x10 ptr cleared");
-                }
-            }
         }
     }
 

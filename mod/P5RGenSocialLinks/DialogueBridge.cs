@@ -54,8 +54,9 @@ internal sealed class DialogueBridge
 
                 if (!string.IsNullOrWhiteSpace(text))
                 {
-                    unsafe { DialogueWriter.Write(snap.SessionBase + (nuint)P5ROffsets.DIALOGUE_BUFFER, text); }
-                    _log.WriteLine($"[P5RGenSocialLinks] Injected: \"{text[..Math.Min(text.Length, 60)]}â€¦\"");
+                    // TODO: dialogue write-back requires locating the text buffer offset.
+                    // For now, log the generated response so we can verify E2E flow.
+                    _log.WriteLine($"[P5RGenSocialLinks] LLM: \"{text[..Math.Min(text.Length, 80)]}\"");
                 }
             }
             catch (InferenceInFlightException)

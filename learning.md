@@ -974,3 +974,74 @@ live game memory for the text at all.
 
 The tradeoff: the lookup database requires a one-time offline extraction step, and it
 only works for scenes that are in the flowscripts (not runtime-generated text).
+
+---
+
+## Chapter 11 — Pivoting from Live-Text Reading to Metadata-Driven Context
+
+### Why Pointer Scanning Failed
+
+The ptr scan at session init revealed no pointer to readable text:
+
+```
++0x18 → 0x70D15418  [0008 0402]  ← binary data (backspace + device-control bytes)
++0x28 → 0x420A560000 [000B 000A]  ← LF + VT control bytes (likely a script binary header)
++0x30 → 0x420A56F7D8 [DE40 7D5E]  ← first char is a lone low-surrogate (invalid UTF-16)
++0x48 → 0x420BAC39F0 [0000 0000]  ← self-referential pointer, all zeros
+```
+
+This is expected. The CMM session struct is a **controller object**: it tracks *which*
+conversation is happening, not *what text* is being displayed. The dialogue text is
+managed by a completely separate subsystem — P5R's flowscript/VMD engine — with its
+own allocator and display pipeline. There is no direct pointer from the session struct
+to the text buffer.
+
+Finding that text pointer would require either:
+1. Hooking the text-render function (requires more Ghidra analysis)
+2. Scanning process memory for the live text string during display
+
+Both are feasible but complex. We don't need to do either.
+
+### The Three Fields We Already Have Are Enough
+
+```
+ConfidantId   (int32 +0x00) = 8          → "Ryuji Sakamoto"
+RankLevel     (byte  +0x0B) = 4          → rank 4 Social Link
+SceneNumber   (int16 +0x0C) = 0x33 = 51  → specific hang-out event script
+DialogueIndex (int32 +0x04) = 0, 1, 2…  → line within that scene
+```
+
+These four values **uniquely identify every scripted line** in P5R. The game's
+flowscript database (`.flow` files extracted with ShrineFox's Atlus Script Tools)
+is indexed by exactly this tuple. We can:
+
+- Phase 1 (current): Send the tuple to the LLM with no text context — the LLM
+  knows Ryuji's character and generates believable rank-4 dialogue from that alone.
+
+- Phase 2 (later): Build a `(confidantId, sceneNumber, lineIndex) → text` lookup
+  from extracted scripts, pass the scripted line as user-prompt context.
+
+Phase 1 gives us a working E2E pipeline immediately. Phase 2 improves prompt quality
+without changing the architecture.
+
+### Why the LLM Can Generate Without the Scripted Text
+
+The system prompt already injects full character context:
+```
+"You are Ryuji Sakamoto from Persona 5 Royal. Your arcana is Chariot.
+ Character notes: Loud, loyal, hot-headed best friend; talks in street slang.
+ Match the emotional tone appropriate for Social Link rank 4/10."
+```
+
+P5R Social Link conversations at rank 4 follow a known emotional arc (Ryuji is working
+through his track team trauma). An LLM trained on internet text has extensive P5R
+fan-fiction, wiki content, and dialogue transcripts in its training data. The rank +
+character identity is sufficient to generate plausible, in-character lines.
+
+The `context` field sent to the server can be:
+```
+"[Scene 51, Line 0] Social Link conversation — Ryuji, rank 4"
+```
+
+This tells the LLM: beginning of a scene-51 hang-out, early in their friendship.
+That's enough to produce good output.
