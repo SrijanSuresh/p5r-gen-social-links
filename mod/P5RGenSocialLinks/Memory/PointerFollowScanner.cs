@@ -5,19 +5,22 @@ using System.Text;
 namespace P5RGenSocialLinks.Memory;
 
 /// <summary>
-/// Follows the session-struct pointers that appeared at hang-out start (+0xE0, +0xE8, +0xF0)
-/// and diffs the first 256 bytes of each pointed-to sub-object on every poll tick.
+/// On every poll tick, reads the session-struct pointer slots at +0xE0/+0xE8/+0xF0 and
+/// diffs 256 bytes at each pointed-to address. Unlike Capture (one-shot at session start),
+/// Update runs every tick so it catches pointers that appear transiently mid-session.
 ///
-/// Rationale: StructDiffScanner confirmed the line counter is not in the first 512 bytes
-/// of the session struct. Those three slots hold pointers to CMM dialogue subsystem objects.
-/// One of them contains the per-line counter. When Diff() reports a byte incrementing
-/// monotonically with each dialogue advance, that offset becomes the new CMM_LINE_COUNTER_ADDR.
+/// Once a valid user-mode heap address is captured for a slot, it stays locked in for the
+/// rest of the hang-out — we keep scanning even after the slot reverts to garbage, because
+/// the sub-object itself persists on the heap.
 /// </summary>
 internal sealed unsafe class PointerFollowScanner
 {
-    // Session-struct offsets that held pointer-like values (zero → heap addr) at hang-out start.
-    // Observed in Takemi Session 40 StructDiff log (2026-08-10).
+    // Offsets confirmed in Takemi Session 40 StructDiff: pointer-like values flashed here.
     private static readonly int[] PtrOffsets = { 0xE0, 0xE8, 0xF0 };
+
+    // User-mode address range on Windows x64.
+    private const nuint UserModeMin = 0x10000;
+    private static readonly nuint UserModeMax = unchecked((nuint)0x0000_7FFF_FFFF_FFFFul);
 
     private const int SubScanBytes = 256;
 
@@ -36,46 +39,48 @@ internal sealed unsafe class PointerFollowScanner
     }
 
     /// <summary>
-    /// Reads and caches the pointer values stored in the session struct at the known offsets.
-    /// Call once per hang-out, right after the session pointer is resolved.
+    /// Reads the pointer slots in the session struct. If a slot holds a valid user-mode
+    /// address that differs from the current target, the target is updated and logged.
+    /// Call on every poll tick so transient pointers are not missed.
     /// </summary>
-    internal void Capture(nuint sessionPtr)
+    internal void Update(nuint sessionPtr, Action<string>? log = null)
     {
         for (int i = 0; i < PtrOffsets.Length; i++)
         {
-            _hasSnapshot[i] = false;
             nuint slot = sessionPtr + (nuint)PtrOffsets[i];
-            if (!MemoryGuard.IsReadable(slot, sizeof(nuint)))
-            {
-                _targets[i] = 0;
-                continue;
-            }
-            _targets[i] = *(nuint*)slot;
+            if (!MemoryGuard.IsReadable(slot, sizeof(nuint))) continue;
+
+            nuint candidate = *(nuint*)slot;
+
+            // Ignore garbage / non-heap values; keep any previously captured valid target.
+            if (candidate < UserModeMin || candidate > UserModeMax) continue;
+            if (candidate == _targets[i]) continue;
+
+            _targets[i]     = candidate;
+            _hasSnapshot[i] = false;
+            log?.Invoke($"[PtrFollow] +0x{PtrOffsets[i]:X2} captured target 0x{candidate:X}");
         }
     }
 
     /// <summary>
-    /// Diffs each pointed-to sub-object against the previous snapshot.
-    /// Returns one log string per sub-object that has changed bytes this tick.
-    /// On first call per sub-object (no snapshot yet), establishes baseline silently.
+    /// Diffs each captured sub-object against its previous snapshot.
+    /// Returns one log line per sub-object that has bytes changed this tick.
+    /// On first Diff() after a new target is captured, silently establishes baseline.
     /// </summary>
     internal List<string> Diff()
     {
         var results = new List<string>();
-
         for (int i = 0; i < PtrOffsets.Length; i++)
         {
             nuint target = _targets[i];
             if (target == 0) continue;
             if (!MemoryGuard.IsReadable(target, SubScanBytes)) continue;
-
             DiffOne(i, target, results);
         }
-
         return results;
     }
 
-    private unsafe void DiffOne(int i, nuint target, List<string> results)
+    private void DiffOne(int i, nuint target, List<string> results)
     {
         byte* p = (byte*)target;
 
@@ -102,7 +107,7 @@ internal sealed unsafe class PointerFollowScanner
             results.Add(sb.ToString());
     }
 
-    /// <summary>Clears all captured pointers and snapshots. Call when hang-out ends.</summary>
+    /// <summary>Clears all targets and snapshots. Call when hang-out ends.</summary>
     internal void Reset()
     {
         for (int i = 0; i < PtrOffsets.Length; i++)

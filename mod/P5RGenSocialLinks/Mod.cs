@@ -167,6 +167,9 @@ public class Mod : IModV1
             {
                 if (lastSession != 0)
                 {
+                    byte finalCount = _lineMonitor.CurrentValue();
+                    _modLog!.Info(
+                        $"[LineCounter] Session end: 0x{P5ROffsets.CMM_LINE_COUNTER_ADDR:X} = {finalCount}");
                     _diffScanner.Reset();
                     _ptrFollower.Reset();
                     _lineMonitor.Deactivate();
@@ -181,7 +184,7 @@ public class Mod : IModV1
             {
                 lastSession = session;
                 _diffScanner.Reset();
-                _ptrFollower.Capture(session);
+                _ptrFollower.Reset();
                 _lineMonitor.Activate();
                 LineCounterMonitor.Diagnose(msg => _modLog!.Info(msg));
 
@@ -224,6 +227,8 @@ public class Mod : IModV1
             // Struct diff — passive discovery of per-line changing fields.
             if (_cfg.StructDiffEnabled)
             {
+                _ptrFollower.Update(session, msg => _modLog!.Info($"[P5RGenSocialLinks] {msg}"));
+
                 string? diff = _diffScanner.Diff(session);
                 if (diff is not null)
                     _modLog!.Info($"[P5RGenSocialLinks] {diff}");
