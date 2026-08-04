@@ -51,15 +51,9 @@ public class Mod : IModV1
     private delegate void MemcpyInnerDelegate(nuint dst, nuint src, nuint count);
 
     private IHook<MemcpyInnerDelegate>? _memcpyHook;
-    private volatile bool               _inActiveSession;
 
     // Dialogue heap sits above 256 GB; CLR/runtime copies are all below 4 GB.
     private static readonly nuint HeapLow = unchecked((nuint)0x4000000000UL);
-
-    // Dedup set: each unique src address is logged only once per session.
-    // Animation buffers reuse the same addresses every frame — they appear once.
-    // A new dialogue allocation hits a fresh address — it stands out immediately.
-    private readonly System.Collections.Generic.HashSet<nuint> _seenSrcs = new();
 
     private GenConfig _cfg = new();
 
@@ -112,35 +106,10 @@ public class Mod : IModV1
 
     private unsafe void OnGameMemcpy(nuint dst, nuint src, nuint count)
     {
-        _memcpyHook!.OriginalFunction(dst, src, count); // R10←src restored by trampoline
-
-        // Diagnostic phase: log every unique high-heap src address once per session.
-        // No content filter — we need to see exactly what flows through this hook
-        // before we know what the dialogue copy looks like.
-        // Animation buffers reuse the same addresses per frame → appear once and stop.
-        // Each new dialogue allocation hits a fresh address → stands out clearly.
-        if (src < HeapLow || !_inActiveSession) return;
-
-        bool isNew;
-        lock (_seenSrcs) isNew = _seenSrcs.Add(src);
-        if (!isNew) return;
-
-        // First time: log header bytes as hex + all printable content from full buffer.
-        // BF dialogue starts with control codes (0x01-0x1F), so we show:
-        //   [AA BB CC DD] hex prefix to identify the format
-        //   then every printable byte found anywhere in the buffer
-        int n = (int)Math.Min(count, (nuint)512);
-        byte* p = (byte*)dst;
-
-        string hex4 = n >= 4
-            ? $"[{p[0]:X2} {p[1]:X2} {p[2]:X2} {p[3]:X2}]"
-            : "[short]";
-
-        var sb = new System.Text.StringBuilder(128);
-        for (int i = 0; i < n; i++)
-            if (p[i] >= 0x20 && p[i] <= 0x7E) sb.Append((char)p[i]);
-
-        _modLog!.Info($"[MemcpyHook][NEW] 0x{src:X} n={count} {hex4}: \"{sb}\"");
+        // Diagnostic logging disabled — memcpy hook served its purpose (confirmed the
+        // BF script is loaded once before session detection, not per-line).
+        // [BFLine] probe via ProbeBfLine() is the active diagnostic path now.
+        _memcpyHook!.OriginalFunction(dst, src, count);
     }
 
     private void TryActivateHook()
@@ -296,9 +265,7 @@ public class Mod : IModV1
                     _diffScanner.Reset();
                     _bridge!.ResetSession();
                     _poolFindRetries = 0;
-                    _inActiveSession = false;
                     _lastBfPc        = 0;
-                    lock (_seenSrcs) _seenSrcs.Clear();
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
                 }
                 lastSession = 0;
@@ -310,7 +277,6 @@ public class Mod : IModV1
                 lastSession = session;
                 _diffScanner.Reset();
                 _poolFindRetries = 0;
-                _inActiveSession = true;
 
                 SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
                 if (snap is null) continue;
@@ -380,7 +346,6 @@ public class Mod : IModV1
         _cts.Cancel();
         _conversationHook?.Disable();
         _memcpyHook?.Disable();
-        _inActiveSession = false;
         _diffScanner.Reset();
         _logger?.WriteLine("[P5RGenSocialLinks] Suspended.");
     }
@@ -401,7 +366,6 @@ public class Mod : IModV1
         _llmClient?.Dispose();
         _conversationHook?.Disable();
         _memcpyHook?.Disable();
-        _inActiveSession = false;
         _diffScanner.Reset();
         _logger?.WriteLine("[P5RGenSocialLinks] Unloaded.");
     }
