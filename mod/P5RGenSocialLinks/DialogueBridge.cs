@@ -103,4 +103,15 @@ internal sealed class DialogueBridge
 
         return true;
     }
+
+    /// <summary>
+    /// Clears session history and resets the dispatch throttle.
+    /// Call when the hang-out ends (session pointer drops to 0) to ensure the next
+    /// hang-out starts with a clean slate and no throttle carry-over.
+    /// </summary>
+    internal void ResetSession()
+    {
+        _history.Reset();
+        _lastDispatch = DateTimeOffset.MinValue;
+    }
 }

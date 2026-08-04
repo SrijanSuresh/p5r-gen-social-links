@@ -159,7 +159,12 @@ public class Mod : IModV1
         {
             if (!_reader!.TryResolve(out nuint session))
             {
-                if (lastSession != 0) _diffScanner.Reset();
+                if (lastSession != 0)
+                {
+                    _diffScanner.Reset();
+                    _bridge!.ResetSession();
+                    _logger!.WriteLine("[P5RGenSocialLinks] Hang-out ended — session cleared.");
+                }
                 lastSession = 0;
                 continue;
             }
