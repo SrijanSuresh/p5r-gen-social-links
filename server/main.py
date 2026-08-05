@@ -86,6 +86,13 @@ async def stats() -> dict[str, object]:
     }
 
 
+@app.post("/clear-stats")
+async def clear_stats() -> dict[str, str]:
+    """Reset inference counters — useful between test sessions without restarting."""
+    _queue.clear_stats()
+    return {"result": "cleared"}
+
+
 @app.get("/model-info")
 async def model_info() -> dict[str, object]:
     is_mock  = _pipeline is _MOCK

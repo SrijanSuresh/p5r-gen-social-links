@@ -29,6 +29,13 @@ class InferenceQueue:
             return None
         return sum(self._latencies) / len(self._latencies) * 1000
 
+    def clear_stats(self) -> None:
+        """Reset all counters and the latency buffer. Thread-safe for async use."""
+        self.total_requests = 0
+        self.total_drops = 0
+        self.total_completions = 0
+        self._latencies.clear()
+
     async def run_if_idle(
         self,
         task: Callable[[], Awaitable[str]],
