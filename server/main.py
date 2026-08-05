@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -13,10 +14,14 @@ import uvicorn
 from inference.config import ModelConfig
 from inference.pipeline import InferencePipeline
 from inference.queue import InferenceQueue
+from social_link.arcana import get_confidant
 
 log = logging.getLogger(__name__)
 
-_pipeline: InferencePipeline | None = None
+# Sentinel object used when MOCK_LLM=1 is set — avoids loading any model.
+_MOCK = object()
+
+_pipeline: InferencePipeline | object | None = None
 _queue    = InferenceQueue()
 _cfg      = ModelConfig()
 
@@ -24,14 +29,18 @@ _cfg      = ModelConfig()
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     global _pipeline
-    log.info("Loading model %s …", _cfg.model_id)
-    try:
-        from inference.model_loader import load_model
-        model, tokenizer = load_model(_cfg)
-        _pipeline = InferencePipeline(model, tokenizer, _cfg)
-        log.info("Model ready.")
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Model load failed (%s). /generate will return 503.", exc)
+    if os.getenv("MOCK_LLM"):
+        log.info("MOCK_LLM=1 — skipping model load, returning canned responses.")
+        _pipeline = _MOCK
+    else:
+        log.info("Loading model %s …", _cfg.model_id)
+        try:
+            from inference.model_loader import load_model
+            model, tokenizer = load_model(_cfg)
+            _pipeline = InferencePipeline(model, tokenizer, _cfg)
+            log.info("Model ready.")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Model load failed (%s). /generate will return 503.", exc)
     yield
     _pipeline = None
 
@@ -52,6 +61,8 @@ class GenerateResponse(BaseModel):
 
 @app.get("/health")
 async def health() -> dict[str, str]:
+    if _pipeline is _MOCK:
+        return {"status": "mock"}
     status = "ready" if _pipeline is not None else "model_not_loaded"
     return {"status": status}
 
@@ -60,6 +71,15 @@ async def health() -> dict[str, str]:
 async def generate(req: GenerateRequest) -> GenerateResponse:
     if _pipeline is None:
         raise HTTPException(status_code=503, detail="Model not loaded.")
+
+    if _pipeline is _MOCK:
+        try:
+            name = get_confidant(req.confidant_id).name
+        except KeyError:
+            name = f"Confidant #{req.confidant_id}"
+        return GenerateResponse(
+            text=f"[MOCK] {name} (rank {req.rank}): Yo, let's do this! {req.context[:40]}"
+        )
 
     async def _run() -> str:
         return _pipeline.generate(req.confidant_id, req.rank, req.context)  # type: ignore[union-attr]

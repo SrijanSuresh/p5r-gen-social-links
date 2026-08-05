@@ -37,10 +37,16 @@ internal sealed class LLMClient : IDisposable
         _http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
     }
 
+    // Pydantic expects snake_case JSON keys (confidant_id, character_name, etc.)
+    private static readonly JsonSerializerOptions _jsonOpts = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+    };
+
     /// <returns>Generated text, or throws <see cref="InferenceInFlightException"/> on 429.</returns>
     internal async Task<string> GenerateAsync(GenerateRequest request, CancellationToken ct = default)
     {
-        string json = JsonSerializer.Serialize(request);
+        string json = JsonSerializer.Serialize(request, _jsonOpts);
         using var content  = new StringContent(json, Encoding.UTF8, "application/json");
         using var response = await _http.PostAsync($"{BaseUrl}/generate", content, ct);
 

@@ -29,7 +29,7 @@ def load_model(cfg: ModelConfig) -> tuple["AutoGPTQForCausalLM", "AutoTokenizer"
         use_safetensors=True,
         trust_remote_code=False,
         device=cfg.device,
-        use_triton=True,          # swap standard matmul for our Triton kernel
+        use_triton=cfg.use_triton,   # False on Windows; True only on Linux with triton installed
         inject_fused_attention=True,
         inject_fused_mlp=True,
     )

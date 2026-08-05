@@ -1038,6 +1038,64 @@ through his track team trauma). An LLM trained on internet text has extensive P5
 fan-fiction, wiki content, and dialogue transcripts in its training data. The rank +
 character identity is sufficient to generate plausible, in-character lines.
 
+### JSON Serialization: PascalCase vs snake_case
+
+C# `System.Text.Json` serializes property names **as-is** (PascalCase by default):
+```json
+{"ConfidantId": 8, "Rank": 4, "Context": "...", "CharacterName": "Ryuji"}
+```
+
+Python Pydantic (v2) expects field names as declared — snake_case:
+```python
+confidant_id: int   # Pydantic sees the JSON key "ConfidantId" and finds no match
+```
+
+This causes a **422 Unprocessable Entity** silently: Pydantic rejects the request and
+the mod logs "LLM error: 422". Fix on the C# side using `JsonNamingPolicy.SnakeCaseLower`
+(available in .NET 8):
+
+```csharp
+private static readonly JsonSerializerOptions _jsonOpts = new()
+{
+    PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+};
+string json = JsonSerializer.Serialize(request, _jsonOpts);
+```
+
+This converts `ConfidantId → confidant_id`, `CharacterName → character_name` at the
+call site, without changing the C# class definition.
+
+### Triton on Windows
+
+`triton` (the NVIDIA Triton GPU compiler) only supports **Linux**. On Windows it either
+fails to install or crashes at import time. The auto-gptq `use_triton=True` flag
+switches the matmul backend to Triton — on Windows this must be `False` so auto-gptq
+falls back to its built-in CUDA or ExLlama kernels.
+
+Our custom Triton kernel (`dequant_matmul.py`) is still valid and runs in WSL2 or a
+Linux deployment. For the Windows dev loop, we use `use_triton=False`.
+
+### Mock Mode for Dev/E2E Testing
+
+Loading a 4-bit Llama-7B model takes ~30 seconds and requires 4 GB VRAM. During
+development we want instant E2E tests. A `MOCK_LLM=1` env-var makes the server skip
+model loading and return a canned Ryuji response:
+
+```python
+if os.getenv("MOCK_LLM"):
+    _pipeline = _MOCK_SENTINEL   # truthy sentinel
+```
+
+```python
+@app.post("/generate")
+async def generate(req: GenerateRequest) -> GenerateResponse:
+    if _pipeline is _MOCK_SENTINEL:
+        return GenerateResponse(text=f"[MOCK] Yo, Confidant #{req.confidant_id} rank {req.rank}. Let's roll!")
+```
+
+This lets us run `MOCK_LLM=1 python main.py` and verify the full HTTP round-trip
+(C# POST → Pydantic parse → JSON response → C# log) without any GPU or model download.
+
 The `context` field sent to the server can be:
 ```
 "[Scene 51, Line 0] Social Link conversation — Ryuji, rank 4"
