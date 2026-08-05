@@ -1237,6 +1237,67 @@ reduces peak VRAM by ~0.6 GB with a small speed cost (~+200ms per response).
 
 ---
 
+## Chapter 18 — Finding the Per-Line Trigger: StructDiff and Hook Diagnostics
+
+### What We Know So Far
+
+Phase 1 dispatches one LLM call per hang-out session (triggered by session pointer
+change). Phase 2 needs one call per NPC speech bubble. We have two unknowns:
+
+1. **Is CMM_EXEC_EVENT firing at all?** The startup log now prints
+   `hook:ON` or `hook:OFF`. If it says ON but we never see `CmmExecEvent #N:`
+   in the console during a hang-out, the function exists but never gets called
+   for gym sessions. If it says OFF, either `IReloadedHooks` is null or the
+   signature scan failed.
+
+2. **What struct field changes per dialogue line?** The `StructDiffScanner`
+   in the poll loop diffs the first 64 bytes of the session struct every 500ms.
+   Any `+0xNN:prev→cur` log line during a hang-out reveals a live field.
+
+### Reading the StructDiff Output
+
+Example log output during a hang-out (hypothetical):
+```
+[StructDiff] +0x04:00→01
+[StructDiff] +0x04:01→02
+[StructDiff] +0x04:02→03
+```
+
+If +0x04 increments each time the player presses confirm to advance dialogue,
+that's our per-line counter! We already know +0x04 was always 0 in Phase 1
+testing (we renamed it SESSION_PHASE). But that was during a gym hang-out
+with a specific Ryuji scene. Other scenes might behave differently.
+
+Fields to watch for:
+- **Counter fields**: unsigned int that increments, resets on new scene
+- **Pointer fields**: change when a new dialogue string is pointed to
+- **Bitfield flags**: single-bit changes that toggle on each line
+
+### The StructDiff Scanner Design
+
+StructDiffScanner captures 64 bytes at session start (`_hasPrevious = false`
+→ first call stores baseline). Every subsequent poll tick: byte-by-byte
+comparison, log any that changed, update `_previous`. It auto-resets when
+`sessionPtr` changes (new hang-out).
+
+This is passive — we make no writes to memory, only reads. The 500ms poll
+interval means we catch changes that last at least 500ms (too fast = aliasing).
+For a player that advances dialogue every ~1-2s, 500ms should catch every line.
+
+### If StructDiff Finds Nothing
+
+If NO byte changes during a full gym hang-out with 15 dialogue lines:
+- The session struct is read-once (set at hang-out start, not updated per line)
+- The per-line state lives in a *different* object (a dialogue VM, not CMM)
+- We need to expand the scan: look at [CMM+0x48] child objects, not just
+  the session struct itself
+
+Next step would be to use `HexDump(session + some_offset, 64)` at each
+offset to find a changing sub-object — or use Cheat Engine's "what accesses
+this address" feature to find what the game reads when rendering each line.
+
+---
+
 ## Chapter 16 — Connection Resilience: Retries, Health Checks, and Cold Starts
 
 ### The Cold-Start Problem
