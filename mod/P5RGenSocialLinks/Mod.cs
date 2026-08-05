@@ -55,6 +55,11 @@ public class Mod : IModV1
     // Dialogue heap sits above 256 GB; CLR/runtime copies are all below 4 GB.
     private static readonly nuint HeapLow = unchecked((nuint)0x4000000000UL);
 
+    // Cached BF script buffer address — found by TryFindBfBuffer() on any tick,
+    // then used by ProbeBfLine() for the rest of the session.
+    private nuint  _bfBufferBase;
+    private int    _bfBufferOff;   // session struct offset where we found it (for logging)
+
     private GenConfig _cfg = new();
 
     public void Start(IModLoaderV1 loader)
@@ -190,59 +195,81 @@ public class Mod : IModV1
     // ── Poll loop — session lifecycle + text pool discovery ───────────────
 
     private readonly StructDiffScanner _diffScanner = new();
-    private int    _poolFindRetries;
     private ushort _lastBfPc;       // change-detection: fires only when PC moves
 
     /// <summary>
-    /// Fires whenever the BF program counter (uint16 @ session+0x20) advances.
-    /// Session struct layout varies by scene type, so instead of hardcoding a
-    /// pointer offset, we scan EVERY 8-byte heap address in the first 512 bytes
-    /// of the session struct and probe [ptr + pc] for printable text.
-    /// The BF script buffer is the one where [ptr + pc] contains ≥8 printable bytes.
+    /// Runs every poll tick while in a session. Scans the first 512 bytes of the
+    /// session struct for any heap pointer whose target contains a run of ≥20
+    /// consecutive printable ASCII bytes. English dialogue ("It's a gym over in
+    /// Shibuya.") always satisfies this; binary data (textures, matrices) does not.
+    ///
+    /// The BF buffer pointer is TRANSIENT — it appears briefly at session+0x40 during
+    /// scene loading, then gets cleared. We must scan every tick to catch it.
     /// </summary>
-    private unsafe void ProbeBfLine(nuint session)
+    private unsafe void TryFindBfBuffer(nuint session)
     {
-        const int scanBytes = 512;
+        if (_bfBufferBase != 0) return;   // already cached
+        const int sessionScan = 512;
+        const int probeScan   = 512;
+        const int minRun      = 20;       // ≥20 consecutive printable bytes = English text
 
-        // BF program counter — confirmed stable at session+0x20
-        if (!Memory.MemoryGuard.IsReadable(session + 0x20, 2)) return;
-        ushort pc = *(ushort*)((byte*)session + 0x20);
-        if (pc == _lastBfPc) return;   // no new line yet
-        _lastBfPc = pc;
-
-        if (!Memory.MemoryGuard.IsReadable(session, scanBytes)) return;
+        if (!Memory.MemoryGuard.IsReadable(session, sessionScan)) return;
         byte* sp = (byte*)session;
 
-        bool anyHit = false;
-        for (int off = 0; off + 8 <= scanBytes; off += 8)
+        for (int off = 0; off + 8 <= sessionScan; off += 8)
         {
             nuint ptr = *(nuint*)(sp + off);
             if (ptr < HeapLow) continue;
+            if (!Memory.MemoryGuard.IsReadable(ptr, probeScan)) continue;
+            byte* b = (byte*)ptr;
 
-            nuint lineAddr = ptr + pc;
-            if (!Memory.MemoryGuard.IsReadable(lineAddr, 64)) continue;
-            byte* b = (byte*)lineAddr;
+            int maxRun = 0, run = 0;
+            for (int i = 0; i < probeScan; i++)
+            {
+                if (b[i] >= 0x20 && b[i] <= 0x7E) { if (++run > maxRun) maxRun = run; }
+                else run = 0;
+            }
 
-            // Count printable bytes; skip if this looks like binary (animation/texture)
-            int printable = 0;
-            for (int i = 0; i < 64; i++)
-                if (b[i] >= 0x20 && b[i] <= 0x7E) printable++;
-            if (printable < 8) continue;
+            if (maxRun < minRun) continue;
 
-            var hex  = new System.Text.StringBuilder(24);
-            for (int i = 0; i < 8; i++) hex.Append($"{b[i]:X2} ");
+            _bfBufferBase = ptr;
+            _bfBufferOff  = off;
 
-            var text = new System.Text.StringBuilder(128);
-            for (int i = 0; i < 64; i++)
-                if (b[i] >= 0x20 && b[i] <= 0x7E) text.Append((char)b[i]);
+            var preview = new System.Text.StringBuilder(64);
+            for (int i = 0; i < probeScan && preview.Length < 64; i++)
+                if (b[i] >= 0x20 && b[i] <= 0x7E) preview.Append((char)b[i]);
 
             _modLog!.Info(
-                $"[BFLine] pc=0x{pc:X4} [sess+0x{off:X3}+pc] [{hex}]: \"{text}\"");
-            anyHit = true;
+                $"[BFBuffer] FOUND sess+0x{off:X3} → 0x{ptr:X} (maxRun={maxRun}): \"{preview}\"");
+            return;
         }
+    }
 
-        if (!anyHit)
-            _modLog!.Info($"[BFLine] pc=0x{pc:X4}: no heap-ptr+pc with ≥8 printable bytes");
+    /// <summary>
+    /// Logs one line per dialogue advance using the cached BF buffer + BF PC.
+    /// </summary>
+    private unsafe void ProbeBfLine(nuint session)
+    {
+        if (_bfBufferBase == 0) return;   // buffer not found yet
+
+        if (!Memory.MemoryGuard.IsReadable(session + 0x20, 2)) return;
+        ushort pc = *(ushort*)((byte*)session + 0x20);
+        if (pc == _lastBfPc) return;
+        _lastBfPc = pc;
+
+        nuint lineAddr = _bfBufferBase + pc;
+        if (!Memory.MemoryGuard.IsReadable(lineAddr, 64)) return;
+        byte* b = (byte*)lineAddr;
+
+        var hex  = new System.Text.StringBuilder(24);
+        for (int i = 0; i < 8; i++) hex.Append($"{b[i]:X2} ");
+
+        var text = new System.Text.StringBuilder(128);
+        for (int i = 0; i < 64; i++)
+            if (b[i] >= 0x20 && b[i] <= 0x7E) text.Append((char)b[i]);
+
+        _modLog!.Info(
+            $"[BFLine] pc=0x{pc:X4} @0x{lineAddr:X} [0x{_bfBufferOff:X3}+pc] [{hex}]: \"{text}\"");
     }
 
     private void StartPollLoop()
@@ -264,8 +291,9 @@ public class Mod : IModV1
                 {
                     _diffScanner.Reset();
                     _bridge!.ResetSession();
-                    _poolFindRetries = 0;
-                    _lastBfPc        = 0;
+                    _lastBfPc     = 0;
+                    _bfBufferBase    = 0;
+                    _bfBufferOff     = 0;
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
                 }
                 lastSession = 0;
@@ -276,21 +304,12 @@ public class Mod : IModV1
             {
                 lastSession = session;
                 _diffScanner.Reset();
-                _poolFindRetries = 0;
 
                 SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
                 if (snap is null) continue;
 
                 _modLog!.Info(
                     $"[P5RGenSocialLinks] Hang-out: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber} (0x{session:X})");
-
-                // Attempt 0: probe at detection time (struct may not be populated yet).
-                // diagnoseOnFail=false — retries will diagnose if all 10 attempts fail.
-                nuint poolBase = Memory.DialogueTextPoolFinder.Find(
-                    session, msg => _modLog!.Info(msg), diagnoseOnFail: false);
-                _bridge!.SetPoolBase(poolBase);
-                if (poolBase != 0)
-                    Memory.DialogueTextPoolFinder.LogPoolContents(poolBase, 8, msg => _modLog!.Info(msg));
 
                 // Fallback dispatch if hook isn't active.
                 if (!_hookActive)
@@ -299,30 +318,10 @@ public class Mod : IModV1
                 continue;
             }
 
-            // Retry pool discovery on subsequent ticks — the text pool is allocated lazily by
-            // the BF interpreter (not at session start), so a one-shot probe at detection time
-            // consistently misses it. Retry up to 10 ticks; only emit the verbose Diag on
-            // the final attempt so the log stays clean during the intermediate tries.
-            if (_bridge!.PoolBase == 0 && _poolFindRetries < 10)
-            {
-                _poolFindRetries++;
-                bool isFinalRetry = _poolFindRetries == 10;
-                nuint pool = Memory.DialogueTextPoolFinder.Find(
-                    lastSession,
-                    msg => _modLog!.Info(msg),
-                    diagnoseOnFail: isFinalRetry);
-
-                if (pool != 0)
-                {
-                    _bridge!.SetPoolBase(pool);
-                    _modLog!.Info($"[P5RGenSocialLinks] Text pool found on poll retry #{_poolFindRetries}: 0x{pool:X}");
-                    Memory.DialogueTextPoolFinder.LogPoolContents(pool, 8, msg => _modLog!.Info(msg));
-                }
-                else if (isFinalRetry)
-                {
-                    _modLog!.Info("[TextPoolFinder] No pool found after 10 retries — write-back disabled.");
-                }
-            }
+            // BF buffer discovery: scan every tick until we find the buffer.
+            // The pointer is transient (lives only during scene load), so we must check
+            // every poll tick — not just once at session detection.
+            TryFindBfBuffer(session);
 
             // Passive struct discovery — disabled by default, enable in GenDialogue.json.
             if (_cfg.StructDiffEnabled)

@@ -3006,3 +3006,38 @@ which has <8 printable bytes in 64. The separation is strong because dialogue te
 ```
 The `[sess+0x1B8+pc]` part tells us which pointer offset in the struct is the BF buffer —
 which we can then use directly for write-back.
+
+---
+
+## Chapter 39 — Transient Pointers, Long Text Runs, and Session-Tick Caching
+
+### Why BFLine only found garbage (the ≥8 threshold was too low)
+The probe looked for ≥8 consecutive printable bytes at `[ptr + pc]`. Binary data (textures,
+animation matrices, packed floats) routinely has accidental 8-byte printable runs — `"UUXp"`,
+`"rbrb"` etc. Those fired as false positives from `sess+0x0A0`. The pointer there is a game
+C++ struct, not a BF script. Dialogue lines have LONG runs (20-50 chars) because English
+sentences are long. Binary data almost never exceeds 12 consecutive printable bytes.
+
+### Why the BF buffer pointer disappears before BFLine fires
+The early StructDiff events (during scene load) show bytes `session+0x40` through `+0x44`
+changing as a group:
+```
++0x40:20→F0  +0x41:00→61  +0x42:00→A1  +0x43:00→10  +0x44:01→42
+```
+As little-endian uint64: `0x4210A161F0` — a valid P5R heap address. This is the BF script
+buffer, live during scene initialization. Two StructDiff ticks later it's cleared back to a
+non-heap value. By the time `[BFLine]` first fires (when PC = 0x001F), the pointer is gone.
+
+### The fix: scan every tick, cache on first hit
+Instead of probing `[ptr + pc]` at the moment of dialogue advance, we scan ALL heap pointers
+in the session struct on EVERY poll tick and look for any whose target contains a run of
+≥20 consecutive printable bytes. An English dialogue script always satisfies this (even the
+shortest Ryuji line is 20+ chars). Binary data almost never does. We save (`_bfBufferBase`)
+the first match, and then `ProbeBfLine` uses the cached address forever after.
+
+### Why 20 consecutive printable bytes works as the discriminator
+A BF script file has dialogue lines like "It's a gym over in Shibuya. Pretty damn cheap too."
+= 50 chars in a row. The BF binary header before the first line is ~31 bytes of binary, then
+30-50 chars of ASCII text. Our 0-to-511 scan of each candidate region will always find this
+run within the first 100 bytes. Texture data, vertex buffers, and C++ structs very rarely
+have runs longer than ~12 printable bytes — "DDS ", "GFS0", "FBN0", etc. are exactly 4 chars.
