@@ -149,6 +149,7 @@ public class Mod : IModV1
     private readonly StructDiffScanner    _diffScanner    = new();
     private readonly PointerFollowScanner _ptrFollower    = new();
     private readonly LineCounterMonitor   _lineMonitor    = new();
+    private readonly HeapCounterScanner   _heapScanner    = new();
 
     private void StartPollLoop()
     {
@@ -170,6 +171,20 @@ public class Mod : IModV1
                     byte finalCount = _lineMonitor.CurrentValue();
                     _modLog!.Info(
                         $"[LineCounter] Session end: 0x{P5ROffsets.CMM_LINE_COUNTER_ADDR:X} = {finalCount}");
+
+                    var hits = _heapScanner.FindIncreased();
+                    if (hits.Count > 0)
+                    {
+                        _modLog!.Info($"[HeapScan] {hits.Count} byte(s) increased in low heap — top candidates:");
+                        foreach (string h in hits)
+                            _modLog!.Info($"[HeapScan]   {h}");
+                    }
+                    else
+                    {
+                        _modLog!.Info("[HeapScan] No increases found — counter may be outside 0x10000-0x20000000.");
+                    }
+                    _heapScanner.Clear();
+
                     _diffScanner.Reset();
                     _ptrFollower.Reset();
                     _lineMonitor.Deactivate();
@@ -186,6 +201,7 @@ public class Mod : IModV1
                 _diffScanner.Reset();
                 _ptrFollower.Reset();
                 _lineMonitor.Activate();
+                _heapScanner.TakeSnapshot(msg => _modLog!.Info(msg));
                 LineCounterMonitor.Diagnose(msg => _modLog!.Info(msg));
 
                 SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
