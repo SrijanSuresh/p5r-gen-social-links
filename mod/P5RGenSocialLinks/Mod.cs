@@ -60,7 +60,8 @@ public class Mod : IModV1
         nuint moduleBase = (nuint)Process.GetCurrentProcess().MainModule!.BaseAddress;
         _logger.WriteLine($"[P5RGenSocialLinks] Base: 0x{moduleBase:X}");
 
-        _reader = new SocialLinkReader(moduleBase);
+        _reader = new SocialLinkReader(moduleBase, _cfg.VerboseChain,
+            msg => _logger!.WriteLine(msg));
         _bridge = new DialogueBridge(_llmClient!, new LoggerAdapter(_logger!), _cfg);
 
         // Hooks implementation provided by reloaded.sharedlib.hooks at runtime.

@@ -18,5 +18,10 @@
 
   // Whether to log struct field diffs during hang-out (for offset discovery).
   // Set to false once per-line trigger offsets are confirmed.
-  "struct_diff_enabled": true
+  "struct_diff_enabled": true,
+
+  // Log every pointer chain step with address + dereferenced value.
+  // Enable when TryResolve() fails and you need to find the broken link.
+  // Leave false in normal play — fires every 500ms poll tick.
+  "verbose_chain": false
 }

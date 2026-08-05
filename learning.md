@@ -1610,3 +1610,83 @@ Most important info is at the START because if we do trim, we lose the END first
 The scene hints and character info come before the prior dialogue — we would rather
 lose "Prior dialogue: line7 | line8" than lose "Ryuji Sakamoto at gym".
 
+---
+
+## Chapter 19 — Pointer Chain Verbose Diagnostics
+
+### Why Verbose Mode Matters
+
+When the game boots and our mod's `TryResolve()` returns `false`, the log says nothing
+about *where* in the chain it failed. Was the static pointer zero? Did the first heap
+offset land in unreadable memory? Did the second dereference return null?
+
+Without verbose diagnostics, you open Cheat Engine and manually walk the chain to find
+the broken link. With verbose mode, the Reloaded-II console tells you exactly which
+step failed and what address it tried to read — saving 10–30 minutes per debugging session.
+
+### The Three Failure Modes
+
+A multi-level pointer chain can fail at three distinct points:
+
+```
+[moduleBase + SL_STATIC_PTR]  ← Step 0: static address in .data
+        |
+        v (dereference)
+  heap_object_A               ← could be 0 if CMM not yet initialised
+        |
+        + CMM_SESSION_OFFSET   ← Step 1: field inside heap object A
+        |
+        v (dereference)
+  CmmSession*                 ← could be 0 if no hang-out is active
+```
+
+**Failure 0 — unreadable static**: VirtualQuery says the static address is not
+readable. Happens if the sig scan located the wrong address or if the game uses
+a DRM loader that maps the .data section late.
+
+**Failure 1 — null root pointer**: The static address is readable but contains 0.
+Normal before the CMM subsystem initialises (first few frames after game boot).
+
+**Failure 2 — null session pointer**: The root object exists but the session field
+is 0 because no Social Link hang-out is currently active. This is the most common
+case — the poll loop should silently ignore it rather than logging on every tick.
+
+### Verbose Mode Design
+
+We add a `bool VerboseChain` flag to `GenConfig`. When true, each `TryResolve()` call
+logs the step it reached before returning false. When false (the default), silence
+is preserved for the null-session case which fires hundreds of times per minute.
+
+The log format uses step numbers so you can correlate with the chain array:
+
+```
+[P5RGenSocialLinks] ChainStep 0: addr=0x7FF612345678 → value=0x1A2B3C4D5E6F
+[P5RGenSocialLinks] ChainStep 1: addr=0x1A2B3C4D5EBF → value=0x0000000000000000 (null — no active session)
+```
+
+The `(null — no active session)` suffix is only appended on the LAST step's zero result
+because that's the one that's expected to be zero during idle. Earlier zero results
+indicate a real initialisation problem and get a `(UNEXPECTED NULL)` suffix instead.
+
+### Integration with GenConfig
+
+`GenConfig` already supports loading from `GenDialogue.json` next to the DLL. Adding
+`VerboseChain` follows the same pattern: a `[JsonPropertyName("verbose_chain")]` property
+with a `false` default so existing config files are unaffected.
+
+In `Mod.cs`, the `PointerChainResolver` is constructed once and holds a reference to
+the config. This avoids re-reading the JSON on every tick and lets the user enable
+verbose mode by editing the JSON (plus a mod reload) without recompiling.
+
+### Practical Workflow
+
+1. First boot: leave `verbose_chain: false` — the poll loop runs silently.
+2. If hook or poll loop consistently says "unresolved", set `verbose_chain: true` in
+   `GenDialogue.json`, reload the mod, and reproduce.
+3. The first logged `ChainStep N` with a null or unreadable address is your broken link.
+4. Open Ghidra, navigate to that offset, and update `P5ROffsets.cs` with the correct value.
+5. Set `verbose_chain: false` again once resolved.
+
+This is the "printf debugging for memory" approach — cheap, zero-overhead when off,
+and completely visible in the Reloaded-II console without attaching a debugger.
+

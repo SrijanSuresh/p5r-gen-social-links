@@ -1,3 +1,5 @@
+using System;
+
 namespace P5RGenSocialLinks.Memory;
 
 /// <summary>
@@ -8,9 +10,9 @@ internal sealed class SocialLinkReader
 {
     private readonly PointerChainResolver _resolver;
 
-    internal SocialLinkReader(nuint moduleBase)
+    internal SocialLinkReader(nuint moduleBase, bool verboseChain = false, Action<string>? log = null)
     {
-        _resolver = new PointerChainResolver(moduleBase);
+        _resolver = new PointerChainResolver(moduleBase, verboseChain, log);
     }
 
     internal bool TryResolve(out nuint session) => _resolver.TryResolve(out session);

@@ -27,6 +27,13 @@ internal sealed class GenConfig
     [JsonPropertyName("struct_diff_enabled")]
     public bool StructDiffEnabled { get; init; } = true;
 
+    /// <summary>
+    /// When true, PointerChainResolver logs each chain step with address and dereferenced value.
+    /// Useful for diagnosing broken pointer chains after a game patch; leave false in production.
+    /// </summary>
+    [JsonPropertyName("verbose_chain")]
+    public bool VerboseChain { get; init; } = false;
+
     private static readonly JsonSerializerOptions _opts = new() { ReadCommentHandling = JsonCommentHandling.Skip };
 
     internal static GenConfig Load(string modDirectory)
