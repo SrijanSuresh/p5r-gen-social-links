@@ -58,6 +58,7 @@ class GenerateRequest(BaseModel):
 
 class GenerateResponse(BaseModel):
     text: str
+    session_id: int
 
 
 @app.get("/health")
@@ -114,7 +115,8 @@ async def generate(req: GenerateRequest) -> GenerateResponse:
         raise HTTPException(status_code=503, detail="Model not loaded.")
 
     if _pipeline is _MOCK:
-        return GenerateResponse(text=get_mock_response(req.confidant_id, req.rank))
+        mock_text = get_mock_response(req.confidant_id, req.rank)
+        return GenerateResponse(text=mock_text, session_id=_queue.total_requests)
 
     async def _run() -> str:
         return _pipeline.generate(req.confidant_id, req.rank, req.context)  # type: ignore[union-attr]
@@ -122,7 +124,7 @@ async def generate(req: GenerateRequest) -> GenerateResponse:
     result = await _queue.run_if_idle(_run)
     if result is None:
         raise HTTPException(status_code=429, detail="Inference already in-flight.")
-    return GenerateResponse(text=result)
+    return GenerateResponse(text=result, session_id=_queue.total_completions)
 
 
 if __name__ == "__main__":

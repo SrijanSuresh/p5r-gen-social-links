@@ -54,3 +54,21 @@ async def test_generate_rejects_context_too_long(client_with_mock: AsyncClient) 
     bad = {**RYUJI_REQUEST, "context": "x" * 1025}
     r = await client_with_mock.post("/generate", json=bad)
     assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_generate_response_contains_session_id(client_with_mock: AsyncClient) -> None:
+    """Each /generate response must include a monotonic session_id integer."""
+    r = await client_with_mock.post("/generate", json=RYUJI_REQUEST)
+    assert r.status_code == 200
+    body = r.json()
+    assert "session_id" in body
+    assert isinstance(body["session_id"], int)
+
+
+@pytest.mark.asyncio
+async def test_generate_session_id_increments(client_with_mock: AsyncClient) -> None:
+    """session_id should be strictly greater on the second call than the first."""
+    r1 = await client_with_mock.post("/generate", json=RYUJI_REQUEST)
+    r2 = await client_with_mock.post("/generate", json=RYUJI_REQUEST)
+    assert r2.json()["session_id"] > r1.json()["session_id"]
