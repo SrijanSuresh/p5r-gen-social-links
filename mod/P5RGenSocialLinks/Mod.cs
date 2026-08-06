@@ -198,28 +198,37 @@ public class Mod : IModV1
     private ushort _lastBfPc;       // change-detection: fires only when PC moves
 
     /// <summary>
-    /// Runs every poll tick while in a session. Scans the first 512 bytes of the
-    /// session struct for any heap pointer whose target contains a run of ≥20
-    /// consecutive printable ASCII bytes. English dialogue ("It's a gym over in
-    /// Shibuya.") always satisfies this; binary data (textures, matrices) does not.
+    /// Runs every poll tick while in a session. Scans the first 1024 bytes of the
+    /// session struct for heap pointers whose targets contain ≥20 consecutive printable
+    /// ASCII bytes AND are NOT self-referential (i.e., do not point back into the session
+    /// struct itself — those are embedded metadata/vtable pointers, not BF script buffers).
     ///
-    /// The BF buffer pointer is TRANSIENT — it appears briefly at session+0x40 during
-    /// scene loading, then gets cleared. We must scan every tick to catch it.
+    /// Among all qualifying candidates, the one with the most null-terminated strings of
+    /// ≥4 printable chars is selected as the BF script buffer — because a real BF dialogue
+    /// script has many null-separated lines, while embedded metadata has one or two.
     /// </summary>
     private unsafe void TryFindBfBuffer(nuint session)
     {
         if (_bfBufferBase != 0) return;   // already cached
-        const int sessionScan = 512;
+        const int sessionScan = 1024;   // extended: BF ptr may be past +0x200
         const int probeScan   = 512;
-        const int minRun      = 20;       // ≥20 consecutive printable bytes = English text
+        const int minRun      = 20;
 
         if (!Memory.MemoryGuard.IsReadable(session, sessionScan)) return;
         byte* sp = (byte*)session;
+
+        nuint bestPtr     = 0;
+        int   bestOff     = 0;
+        int   bestStrings = -1;
 
         for (int off = 0; off + 8 <= sessionScan; off += 8)
         {
             nuint ptr = *(nuint*)(sp + off);
             if (ptr < HeapLow) continue;
+            // Self-referential: points back into the session struct itself.
+            // These are embedded sub-objects (ability descriptions, vtable pointers),
+            // never a separately-allocated BF script buffer.
+            if (ptr >= session && ptr < session + sessionScan) continue;
             if (!Memory.MemoryGuard.IsReadable(ptr, probeScan)) continue;
             byte* b = (byte*)ptr;
 
@@ -229,20 +238,52 @@ public class Mod : IModV1
                 if (b[i] >= 0x20 && b[i] <= 0x7E) { if (++run > maxRun) maxRun = run; }
                 else run = 0;
             }
-
             if (maxRun < minRun) continue;
 
-            _bfBufferBase = ptr;
-            _bfBufferOff  = off;
+            // Count null-terminated strings with ≥4 printable chars each.
+            // BF dialogue script → many strings (one per line).
+            // Embedded metadata  → one or two long strings.
+            int strings = CountNullTermStrings(b, probeScan, minPrintable: 4);
 
             var preview = new System.Text.StringBuilder(64);
             for (int i = 0; i < probeScan && preview.Length < 64; i++)
                 if (b[i] >= 0x20 && b[i] <= 0x7E) preview.Append((char)b[i]);
 
             _modLog!.Info(
-                $"[BFBuffer] FOUND sess+0x{off:X3} → 0x{ptr:X} (maxRun={maxRun}): \"{preview}\"");
-            return;
+                $"[BFBuffer] CAND sess+0x{off:X3} → 0x{ptr:X} (maxRun={maxRun} strings={strings}): \"{preview}\"");
+
+            if (strings > bestStrings)
+            {
+                bestStrings = strings;
+                bestPtr     = ptr;
+                bestOff     = off;
+            }
         }
+
+        if (bestPtr == 0) return;
+
+        _bfBufferBase = bestPtr;
+        _bfBufferOff  = bestOff;
+        _modLog!.Info($"[BFBuffer] SELECTED sess+0x{bestOff:X3} → 0x{bestPtr:X} (strings={bestStrings})");
+    }
+
+    private static unsafe int CountNullTermStrings(byte* buf, int maxBytes, int minPrintable)
+    {
+        int count = 0, pos = 0;
+        while (pos < maxBytes)
+        {
+            int start = pos, printable = 0;
+            while (pos < maxBytes && buf[pos] != 0)
+            {
+                if (buf[pos] >= 0x20 && buf[pos] <= 0x7E) printable++;
+                pos++;
+            }
+            int len = pos - start;
+            if (len > 0 && printable >= minPrintable) count++;
+            if (pos >= maxBytes) break;
+            pos++; // skip '\0'
+        }
+        return count;
     }
 
     /// <summary>

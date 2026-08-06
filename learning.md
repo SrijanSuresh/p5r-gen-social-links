@@ -3041,3 +3041,77 @@ A BF script file has dialogue lines like "It's a gym over in Shibuya. Pretty dam
 30-50 chars of ASCII text. Our 0-to-511 scan of each candidate region will always find this
 run within the first 100 bytes. Texture data, vertex buffers, and C++ structs very rarely
 have runs longer than ~12 printable bytes — "DDS ", "GFS0", "FBN0", etc. are exactly 4 chars.
+
+## Chapter 40 — Self-Referential Pointers Are False Positives; String-Count Selects the Real BF Script
+
+### What we found (and why it was wrong)
+
+`TryFindBfBuffer` fired with `[BFBuffer] FOUND sess+0x098 → 0x41DADBA5A0`. The session struct
+was at `0x41DADBA510`. The "buffer" address is `0x41DADBA510 + 0x090 = 0x41DADBA5A0`.
+The pointer at session+0x98 pointed to session+0x90 — **eight bytes before the pointer itself,
+still inside the session struct**. We accepted it because it had maxRun=34, but the text
+("Strongest, most powerful Personas.") is the Chariot arcana's social link *ability description*,
+stored inline as a field in the C++ session object. It is NOT the BF dialogue script.
+
+### What a self-referential pointer means in C++
+
+In a C++ class layout, a pointer at field +0x98 that points to the same object's field +0x90
+is usually one of three things:
+
+1. **A vtable or interface pointer** — the object's secondary vtable table (IUnknown-style).
+2. **A pointer to an embedded sub-object** — the social link session inherits from a base class
+   that contains the ability description as a fixed-size char array at offset +0x90. The pointer
+   at +0x98 lets code treat that sub-object polymorphically.
+3. **A back-pointer** — for doubly-linked structures.
+
+In all three cases, **the target is data that lives inside the session struct itself**, not a
+separately allocated BF script buffer. Real script buffers are allocated by the BF interpreter
+when it opens a `.bf` file: they are `malloc`/`new` calls that land at heap addresses completely
+unrelated to the session address.
+
+### The correct filter: skip any target within the session scan window
+
+```
+if (ptr >= session && ptr < session + sessionScan) continue;
+```
+
+If the target address falls inside the first N bytes of the session struct, the pointer is
+self-referential. Skip it. A real BF script buffer is a separate allocation — its address will
+be thousands or millions of bytes away from the session struct.
+
+### Why we also need to scan ALL candidates, not just the first
+
+`TryFindBfBuffer` returned immediately after the first hit. That is correct for SELECTION but
+wrong during DIAGNOSIS. With the self-ref filter in place, the first non-self-referential
+candidate with ≥20 printable bytes might still not be the BF script (there could be other
+string pools or asset metadata reachable from the session). We log ALL candidates with:
+- `maxRun` — length of the longest printable run
+- `strings` — count of null-terminated segments ≥ 4 printable chars each
+
+### Why null-terminated-string count is the right discriminator
+
+A real BF dialogue script has ONE null-terminated string per dialogue line:
+
+```
+"It's a gym over in Shibuya. Pretty damn cheap too.\0"
+"C'mon, I'll show you the way.\0"
+"Here we are... Protein Lovers gym!\0"
+```
+
+→ many short strings → high `strings` count.
+
+The ability description field might be ONE long string ("Strongest, most powerful Personas.") or
+two strings (the label + the body). Either way, `strings` is low (1–3).
+
+By selecting the candidate with the HIGHEST `strings` count (after applying the self-ref filter),
+we pick the allocation with the most dialogue-like structure, regardless of what scene is active
+or what the dialogue text says. This heuristic works across all confidants and all scenes because
+every BF script is a sequence of null-terminated dialogue lines.
+
+### The expanded scan window: 512 → 1024 bytes
+
+The previous 512-byte scan covered offsets +0x000 through +0x1F8 (64 pointer slots). The session
+struct for complex scenes (gym, festival) appears to be 3 KB+ based on the maximum BF PC value
+observed (0x0C4C = 3148). The BF script pointer could easily be at offset +0x300 or +0x400.
+Expanding to 1024 bytes (128 slots, offsets through +0x3F8) costs one extra VirtualQuery call
+and gives us more surface area to find the script pointer.
