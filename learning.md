@@ -589,3 +589,157 @@ core reason the custom kernel outperforms a CPU dequant loop.
 - Too large → register spill to local memory (slow).
 - `triton.autotune` searches all combinations; we use (16, 64, 32) as a
   starting point and wire autotune in Micro-step 7.
+
+---
+
+## Chapter 7: Wiring the LLM Bridge + GPU Autotune + Finding Real Memory Addresses
+
+### Part A: Wiring DialogueBridge into the Hook
+
+The `DialogueBridge` class already exists with a complete `DispatchAsync` method.
+The missing piece was connecting it to `OnConversationInit` in `Mod.cs`.
+
+Two sub-problems:
+
+**1. The ILogger adapter pattern**
+
+`DialogueBridge` defines its own `internal interface ILogger { void WriteLine(string); }`.
+`Reloaded.Mod.Interfaces.Internal.ILoggerV2` also has `void WriteLine(string)`.
+
+The signatures are identical, but C# interfaces are *nominal* — you cannot pass an
+`ILoggerV2` where a `DialogueBridge.ILogger` is expected even if both have the same
+methods. This is by design: a class opts in to an interface explicitly with `: IFoo`.
+
+Solution: a tiny private adapter class inside `Mod.cs`:
+```csharp
+private sealed class LoggerAdapter : DialogueBridge.ILogger
+{
+    private readonly ILoggerV2 _inner;
+    internal LoggerAdapter(ILoggerV2 inner) => _inner = inner;
+    public void WriteLine(string msg) => _inner.WriteLine(msg);
+}
+```
+One liner per member, zero overhead. This pattern appears constantly in systems code
+whenever two interfaces define the same contract independently.
+
+**2. The context string**
+
+`DispatchAsync(snap, contextText)` — what do we pass for `contextText`?
+
+We don't yet parse the full NPC dialogue text from VRAM (that's a future step once
+we have the real offsets from Cheat Engine). For now we send the dialogue line index:
+`$"Dialogue line {snap.DialogueIndex}"`. The LLM server's `build_prompt` will embed
+this into the user turn so Ryuji / Makoto know roughly where in the conversation they
+are. Good enough for smoke testing.
+
+### Part B: triton.autotune
+
+`@triton.autotune` is a decorator that benchmarks a list of `triton.Config` objects
+the first time the kernel is called with a given `key` combination, then caches the
+winner.
+
+```python
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 16, "BLOCK_N":  64, "BLOCK_K": 32}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N":  64, "BLOCK_K": 32}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N":  64, "BLOCK_K": 32}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=8),
+    ],
+    key=["M", "N", "K"],       # different shapes → different best config
+)
+@triton.jit
+def dequant_matmul_kernel(...):
+    ...
+```
+
+**num_warps**: a warp is 32 GPU threads that execute in lockstep. More warps = more
+occupancy (GPU can hide memory latency by swapping warps), but also more register
+pressure per SM. Typical values: 4 (conservative) to 8 (aggressive for large tiles).
+
+**num_stages**: how many "software pipeline" stages Triton uses to overlap memory
+loads with compute. Higher = more registers used but latency better hidden. 2–4 is
+the useful range.
+
+**Lambda grid**: because BLOCK_M and BLOCK_N are now chosen at runtime by autotune
+(not hardcoded in the wrapper), the grid calculation must be a lambda that reads from
+the `meta` dict that autotune injects:
+```python
+grid = lambda meta: (
+    triton.cdiv(M, meta["BLOCK_M"]),
+    triton.cdiv(N, meta["BLOCK_N"]),
+)
+```
+This is the single biggest API difference from a non-autotuned kernel.
+
+**Cache behaviour**: autotune benchmarks once per unique `(M, N, K)` tuple, writes
+the result to a `.triton_cache` directory, and reuses it on subsequent process starts.
+First inference call is slow (~seconds); all following calls use the cached winner.
+
+### Part C: Finding Real P5R Memory Addresses with Cheat Engine
+
+THIS IS YOUR JOB — the game must be running. Here is the exact step-by-step.
+
+**Goal**: find the real byte address of the function that initializes a Social Link
+conversation, so we can replace the placeholder in `Signatures.cs`.
+
+**Tools needed**:
+- Cheat Engine 7.5+ (free, cheatengine.org)
+- P5R running via Steam (windowed mode is easier)
+- Optionally: x64dbg or Ghidra for the byte extraction step
+
+---
+
+**Step 1 — Attach Cheat Engine to P5R**
+
+1. Launch P5R. Get to a point where you can START but haven't started a Social Link
+   conversation (e.g., talk to Ryuji in Shujin after school).
+2. Open Cheat Engine → click the glowing PC icon (top-left) → select `p5r.exe`.
+3. Change value type to `4 Bytes`, scan type to `Exact Value`.
+
+**Step 2 — Find the ConfidantId address**
+
+1. In-game: begin a Social Link conversation with Ryuji (Chariot = ID 1 in our table).
+2. In Cheat Engine: scan for `1`. You'll get thousands of results — that's fine.
+3. End the conversation. Scan again for `0` (or start a different confidant, scan for
+   their ID). The address that changed is the live ConfidantId field.
+4. Repeat 1–2 more times; you should narrow to 1–5 addresses. Add the survivor to
+   the address list (double-click it).
+
+**Step 3 — Find what WRITES to that address**
+
+1. Right-click the ConfidantId address in the list → "Find out what writes to this
+   address" → "Find out what writes to this address".
+2. Cheat Engine installs a hardware watchpoint. Click "Yes" to any warning.
+3. In-game: trigger a NEW Social Link conversation. Cheat Engine's instruction list
+   will populate with the assembly instruction that just wrote to that address.
+4. The top entry is the instruction inside `BeginConversation`. Note the **instruction
+   address** (left column) and the **instruction bytes** (right column).
+
+**Step 4 — Get the function start and its bytes**
+
+The instruction Cheat Engine shows is inside the function, not at its prologue.
+We need the function's STARTING bytes for our signature.
+
+1. In Cheat Engine: click the instruction → "Show disassembler" (or press Ctrl+D).
+   This opens the memory view at that instruction.
+2. Scroll UP until you see the function prologue — usually starts with:
+   ```
+   40 55           PUSH RBP
+   48 89 5C 24 ??  MOV [RSP+??], RBX
+   ```
+   or similar register-save sequence. Function starts = the first instruction after
+   the `CALL` target (or after `INT3` padding bytes `CC CC CC`).
+3. Note down ~20 bytes from the start. Replace stack-relative offsets (`??`) with
+   wildcards in `Signatures.cs`.
+
+**Step 5 — Update Signatures.cs**
+
+Open `mod/P5RGenSocialLinks/Memory/Signatures.cs` and replace:
+```csharp
+internal const string BeginConversation =
+    "48 89 5C 24 ?? 48 89 6C 24 ?? 48 89 74 24 ?? 57 41 56 41 57";
+```
+with the bytes you found. Run `dotnet build` and then `TryActivateHook()` will find
+the real function on the next P5R launch.
