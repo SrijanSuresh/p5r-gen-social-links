@@ -1098,8 +1098,54 @@ This lets us run `MOCK_LLM=1 python main.py` and verify the full HTTP round-trip
 
 The `context` field sent to the server can be:
 ```
-"[Scene 51, Line 0] Social Link conversation — Ryuji, rank 4"
+"[Scene 51] Social Link hang-out — Confidant #8, rank 4"
 ```
 
-This tells the LLM: beginning of a scene-51 hang-out, early in their friendship.
+This tells the LLM: a scene-51 hang-out, early in Ryuji's friendship arc.
 That's enough to produce good output.
+
+---
+
+## Chapter 12 — First End-to-End Round-Trip (Milestone)
+
+**Date**: 2026-08-08
+
+The full pipeline executed successfully for the first time:
+
+```
+P5R game (Ryuji gym hang-out, rank 4)
+  ↓  CMM session detected by poll loop
+C# mod → SocialLinkSnapshot(ConfidantId=8, RankLevel=4, SceneNumber=51)
+  ↓  ContextBuilder.Build()
+  ↓  "[Scene 51] Social Link hang-out — Confidant #8, rank 4"
+  ↓  DialogueBridge.DispatchAsync()
+  ↓  LLMClient.GenerateAsync() → POST http://localhost:8765/generate
+  ↓  {"confidant_id":8,"rank":4,"context":"[Scene 51]...","character_name":"Ryuji Sakamoto"}
+Python FastAPI server (MOCK_LLM=1)
+  ↓  200 OK
+  ↓  {"text":"[MOCK] Ryuji Sakamoto (rank 4): Yo, let's do this! ..."}
+C# mod
+  ↓  [P5RGenSocialLinks] LLM: "[MOCK] Ryuji Sakamoto (rank 4): Yo, let's do this!..."
+```
+
+### What Was Confirmed
+
+- `JsonNamingPolicy.SnakeCaseLower` correctly converted `ConfidantId → confidant_id`
+  so Pydantic could parse the request without a 422 error.
+- WSL2 `localhost` routes to the Windows host — the C# mod on the Windows P5R process
+  can reach a FastAPI server running inside WSL2 on the same port.
+- The background `Task.Run` in `DialogueBridge.DispatchAsync` returns from the hook
+  immediately, then completes the HTTP call without blocking the game thread.
+- One LLM dispatch fires per new Social Link hang-out (session pointer change), which
+  is the correct Phase 1 granularity.
+
+### What Remains
+
+1. **Dialogue write-back**: The generated text is logged but not injected into the game.
+   The dialogue text buffer is managed by P5R's flowscript engine, not the CMM session
+   struct. Finding it requires hooking the text-render function or a separate CE scan
+   of live text addresses during active dialogue display.
+
+2. **Real model**: Replace `MOCK_LLM=1` with `TheBloke/Llama-2-7B-Chat-GPTQ` running
+   via auto-gptq on CUDA. Requires ~4 GB VRAM and the full `requirements.txt` install
+   (including `torch==2.4.1+cu121` for Windows with CUDA).
