@@ -104,7 +104,7 @@ public class Mod : IModV1
             if (snap is null) return result;
 
             _logger?.WriteLine(
-                $"[P5RGenSocialLinks] Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber} Line={snap.DialogueIndex}");
+                $"[P5RGenSocialLinks] CmmExec: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber}");
             _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap));
         }
         catch (Exception ex)
@@ -126,58 +126,21 @@ public class Mod : IModV1
 
     private async Task PollLoopAsync(CancellationToken ct)
     {
-        nuint lastSession     = 0;
-        int   lastDialogueIdx = -1;
+        nuint lastSession = 0;
 
         while (await _timer!.WaitForNextTickAsync(ct))
         {
-            if (!_reader!.TryResolve(out nuint session))
-            {
-                lastSession     = 0;
-                lastDialogueIdx = -1;
-                continue;
-            }
+            if (!_reader!.TryResolve(out nuint session)) { lastSession = 0; continue; }
+            if (session == lastSession) continue;
+            lastSession = session;
 
-            // Full hex-dump only when a new conversation starts.
-            if (session != lastSession)
-            {
-                lastSession     = session;
-                lastDialogueIdx = -1;
-                _logger!.WriteLine($"[P5RGenSocialLinks] Poll: session=0x{session:X}");
-                _logger!.WriteLine($"[P5RGenSocialLinks] Poll HexDump:{SocialLinkReader.HexDump(session)}");
-                unsafe { ScanPtrCandidates(session); }
-            }
-
-            // Track dialogue-index changes within the session.
             SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
-            if (snap is not null && snap.DialogueIndex != lastDialogueIdx)
-            {
-                lastDialogueIdx = snap.DialogueIndex;
-                _logger!.WriteLine(
-                    $"[P5RGenSocialLinks] Line {snap.DialogueIndex} | Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber}");
-                unsafe { ScanPtrCandidates(session); }
-                _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap));
-            }
+            if (snap is null) continue;
 
-        }
-    }
-
-    // Scans every 8-byte-aligned word in the first 0x80 bytes of the session struct
-    // looking for non-null readable pointers that might contain dialogue text.
-    private unsafe void ScanPtrCandidates(nuint sessionBase)
-    {
-        _logger!.WriteLine("[P5RGenSocialLinks] --- ptr scan ---");
-        for (nuint off = 0x10; off <= 0x70; off += 8)
-        {
-            nuint candidate = *(nuint*)(sessionBase + off);
-            if (candidate == 0) continue;
-            if (!MemoryGuard.IsReadable(candidate, 4)) continue;
-            // Read first two chars as quick content probe
-            char* chars = (char*)candidate;
             _logger!.WriteLine(
-                $"[P5RGenSocialLinks]   +0x{off:X2} → 0x{candidate:X}  [{(int)chars[0]:X4} {(int)chars[1]:X4}]");
+                $"[P5RGenSocialLinks] Hang-out: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber} (0x{session:X})");
+            _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap));
         }
-        _logger!.WriteLine("[P5RGenSocialLinks] --- end scan ---");
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────

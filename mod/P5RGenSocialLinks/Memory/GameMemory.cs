@@ -24,7 +24,9 @@ internal static class P5ROffsets
     //   +00C: 33 00        → int16 = 51 (unknown — scene/event number)
     //   +010: ptr (unknown)
     internal const int CONFIDANT_ID    = 0x00;  // int32
-    internal const int DIALOGUE_INDEX  = 0x04;  // int32 — increments with each line advance
+    // +0x04 is always 0 in every observed session — not a dialogue-line counter.
+    // May track scene phase or be a reserved field. Renamed to avoid confusion.
+    internal const int SESSION_PHASE   = 0x04;  // int32 — always 0 in observed sessions
     internal const int RANK_LEVEL      = 0x0B;  // byte  — rank before this session (1-10)
     internal const int SCENE_NUMBER    = 0x0C;  // int16 — specific hang-out scene id (e.g. 51)
 }
@@ -37,7 +39,7 @@ internal static class P5ROffsets
 internal unsafe struct SocialLinkSession
 {
     [System.Runtime.InteropServices.FieldOffset(0x00)] public int   ConfidantId;    // cmmId (8=Ryuji)
-    [System.Runtime.InteropServices.FieldOffset(0x04)] public int   DialogueIndex;  // line 0 = conversation start
+    [System.Runtime.InteropServices.FieldOffset(0x04)] public int   SessionPhase;   // always 0 in observed sessions
     [System.Runtime.InteropServices.FieldOffset(0x08)] public byte  CmmIdRepeat;    // arcana/cmmId repeated
     [System.Runtime.InteropServices.FieldOffset(0x0A)] public byte  EventType;      // read by CMM_EXEC_EVENT
     [System.Runtime.InteropServices.FieldOffset(0x0B)] public byte  RankLevel;      // rank before this session

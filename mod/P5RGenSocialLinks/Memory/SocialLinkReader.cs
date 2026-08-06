@@ -24,14 +24,13 @@ internal sealed class SocialLinkReader
     {
         if (!MemoryGuard.IsReadable(sessionPtr, 0x10)) return null;
 
-        int confidantId   = *(int*)   (sessionPtr + P5ROffsets.CONFIDANT_ID);
-        int dialogueIndex = *(int*)   (sessionPtr + P5ROffsets.DIALOGUE_INDEX);
-        int rankLevel     = *(byte*)  (sessionPtr + P5ROffsets.RANK_LEVEL);
-        int sceneNumber   = *(short*) (sessionPtr + P5ROffsets.SCENE_NUMBER);
+        int confidantId  = *(int*)   (sessionPtr + P5ROffsets.CONFIDANT_ID);
+        int rankLevel    = *(byte*)  (sessionPtr + P5ROffsets.RANK_LEVEL);
+        int sceneNumber  = *(short*) (sessionPtr + P5ROffsets.SCENE_NUMBER);
 
         if (confidantId <= 0 || confidantId > 50) return null;
 
-        return new SocialLinkSnapshot(confidantId, rankLevel, dialogueIndex, sceneNumber, sessionPtr);
+        return new SocialLinkSnapshot(confidantId, rankLevel, sceneNumber, sessionPtr);
     }
 
     /// <summary>
@@ -65,11 +64,10 @@ internal sealed class SocialLinkReader
     }
 }
 
-/// <summary>Immutable snapshot of one Social Link conversation moment.</summary>
+/// <summary>Immutable snapshot of one Social Link hang-out session.</summary>
 internal sealed record SocialLinkSnapshot(
     int   ConfidantId,
     int   RankLevel,
-    int   DialogueIndex,
     int   SceneNumber,
     nuint SessionBase
 );
