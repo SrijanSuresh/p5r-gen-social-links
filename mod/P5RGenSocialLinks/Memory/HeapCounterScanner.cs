@@ -99,6 +99,9 @@ internal sealed unsafe class HeapCounterScanner
     /// Returns up to maxResults addresses where the byte value increased.
     /// Sorted by delta descending so the biggest movers appear first.
     /// Call at hang-out end, after the player has advanced many dialogue lines.
+    ///
+    /// Reads page-by-page (4 KB chunks) and re-checks readability before each
+    /// page — pages that were freed since the snapshot are skipped safely.
     /// </summary>
     internal List<string> FindIncreased(int minDelta = 1, int maxDelta = 255, int maxResults = 30)
     {
@@ -106,20 +109,28 @@ internal sealed unsafe class HeapCounterScanner
 
         foreach (var (baseAddr, snap) in _regions)
         {
-            if (!MemoryGuard.IsReadable(baseAddr, 1)) continue;
-            byte* p = (byte*)baseAddr;
+            byte* p   = (byte*)baseAddr;
+            int   len = snap.Length;
 
-            for (int i = 0; i < snap.Length; i++)
+            for (int pageStart = 0; pageStart < len; pageStart += 4096)
             {
-                int delta = p[i] - snap[i];
-                if (delta >= minDelta && delta <= maxDelta)
-                    hits.Add((baseAddr + (nuint)i, snap[i], p[i], delta));
+                nuint pageAddr = baseAddr + (nuint)pageStart;
+                // Re-check readability per page: pages may have been freed since snapshot.
+                if (!MemoryGuard.IsReadable(pageAddr, 1)) continue;
+
+                int pageEnd = pageStart + 4096 < len ? pageStart + 4096 : len;
+                for (int i = pageStart; i < pageEnd; i++)
+                {
+                    int delta = p[i] - snap[i];
+                    if (delta >= minDelta && delta <= maxDelta)
+                        hits.Add((baseAddr + (nuint)i, snap[i], p[i], delta));
+                }
             }
         }
 
         hits.Sort((a, b) => b.Delta.CompareTo(a.Delta));
 
-        var lines = new List<string>(hits.Count);
+        var lines = new List<string>(Math.Min(hits.Count, maxResults));
         foreach (var h in hits)
         {
             if (lines.Count >= maxResults) break;
