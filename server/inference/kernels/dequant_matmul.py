@@ -23,6 +23,16 @@ import triton.language as tl            # type: ignore[import-untyped]
 import torch
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 16, "BLOCK_N":  64, "BLOCK_K": 32}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N":  64, "BLOCK_K": 32}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N":  64, "BLOCK_K": 32}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 32}, num_stages=3, num_warps=4),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 64}, num_stages=3, num_warps=8),
+    ],
+    key=["M", "N", "K"],
+)
 @triton.jit
 def dequant_matmul_kernel(
     # Pointers to tensors in GPU global memory
@@ -118,17 +128,15 @@ def dequant_matmul(
 
     out = torch.empty((M, N), device=a.device, dtype=torch.float16)
 
-    # Grid: one program per (BLOCK_M, BLOCK_N) tile
-    BLOCK_M, BLOCK_N, BLOCK_K = 16, 64, 32
-    grid = (
-        triton.cdiv(M, BLOCK_M),
-        triton.cdiv(N, BLOCK_N),
+    # Grid is a lambda so autotune can inject the winning BLOCK_M/N values
+    grid = lambda meta: (  # noqa: E731
+        triton.cdiv(M, meta["BLOCK_M"]),
+        triton.cdiv(N, meta["BLOCK_N"]),
     )
 
     dequant_matmul_kernel[grid](
         a, w_packed, scales, zeros, out,
         M, N, K,
         group_size=group_size,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
     )
     return out
