@@ -267,6 +267,56 @@ public class Mod : IModV1
         _modLog!.Info($"[BFBuffer] SELECTED sess+0x{bestOff:X3} → 0x{bestPtr:X} (strings={bestStrings})");
     }
 
+    /// <summary>
+    /// Probes heap addresses captured in the StructDiff snapshot rather than live session
+    /// memory. Catches transient pointers (e.g. BF script ptr at session+0x60) that are
+    /// set and cleared within a single poll interval — Diff() captures them in _previous[]
+    /// even after live memory has already been cleared.
+    /// </summary>
+    private unsafe void TryFindBfBufferFromSnapshot(nuint session)
+    {
+        if (_bfBufferBase != 0) return;
+        const int probeScan   = 512;
+        const int minRun      = 20;
+        const int sessionScan = 1024;
+
+        nuint bestPtr     = 0;
+        int   bestOff     = 0;
+        int   bestStrings = -1;
+
+        foreach ((int off, nuint ptr) in _diffScanner.SnapshotHeapPointers(HeapLow))
+        {
+            if (ptr >= session && ptr < session + sessionScan) continue;
+            if (!Memory.MemoryGuard.IsReadable(ptr, probeScan)) continue;
+            byte* b = (byte*)ptr;
+
+            int maxRun = 0, run = 0;
+            for (int i = 0; i < probeScan; i++)
+            {
+                if (b[i] >= 0x20 && b[i] <= 0x7E) { if (++run > maxRun) maxRun = run; }
+                else run = 0;
+            }
+            if (maxRun < minRun) continue;
+
+            int strings = CountNullTermStrings(b, probeScan, minPrintable: 4);
+
+            var preview = new System.Text.StringBuilder(64);
+            for (int i = 0; i < probeScan && preview.Length < 64; i++)
+                if (b[i] >= 0x20 && b[i] <= 0x7E) preview.Append((char)b[i]);
+
+            _modLog!.Info(
+                $"[BFBuffer] SNAP sess+0x{off:X3} → 0x{ptr:X} (maxRun={maxRun} strings={strings}): \"{preview}\"");
+
+            if (strings > bestStrings) { bestStrings = strings; bestPtr = ptr; bestOff = off; }
+        }
+
+        if (bestPtr == 0) return;
+
+        _bfBufferBase = bestPtr;
+        _bfBufferOff  = bestOff;
+        _modLog!.Info($"[BFBuffer] SNAP-SELECTED sess+0x{bestOff:X3} → 0x{bestPtr:X} (strings={bestStrings})");
+    }
+
     private static unsafe int CountNullTermStrings(byte* buf, int maxBytes, int minPrintable)
     {
         int count = 0, pos = 0;
@@ -359,22 +409,21 @@ public class Mod : IModV1
                 continue;
             }
 
-            // BF buffer discovery: scan every tick until we find the buffer.
-            // The pointer is transient (lives only during scene load), so we must check
-            // every poll tick — not just once at session detection.
+            // BF buffer discovery: live scan of session struct every tick.
             TryFindBfBuffer(session);
 
-            // Passive struct discovery — disabled by default, enable in GenDialogue.json.
-            if (_cfg.StructDiffEnabled)
-            {
-                string? diff = _diffScanner.Diff(session);
-                if (diff is not null)
-                    _modLog!.Info($"[P5RGenSocialLinks] {diff}");
-            }
+            // Always maintain the diff snapshot — TryFindBfBufferFromSnapshot reads it
+            // to catch the BF script pointer even after it has been cleared from live
+            // memory (it exists for only one poll interval at session+0x60).
+            string? diff = _diffScanner.Diff(session);
+            if (_cfg.StructDiffEnabled && diff is not null)
+                _modLog!.Info($"[P5RGenSocialLinks] {diff}");
+
+            // Snapshot-based discovery: catches transient ptrs that TryFindBfBuffer
+            // missed because the game set+cleared them between our two live reads.
+            TryFindBfBufferFromSnapshot(session);
 
             // BF line probe: read current dialogue text from bfBase+pc on every tick.
-            // Fires only when the PC moves (= a new dialogue line is loaded), so it's
-            // quiet between advances and doesn't need StructDiffEnabled.
             ProbeBfLine(session);
         }
     }

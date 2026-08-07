@@ -57,4 +57,25 @@ internal sealed unsafe class StructDiffScanner
     /// Call this when the session pointer changes.
     /// </summary>
     internal void Reset() => _hasPrevious = false;
+
+    /// <summary>
+    /// Returns all 8-byte-aligned values in the LAST-OBSERVED snapshot that are
+    /// at or above <paramref name="heapLow"/>. Call after Diff() to surface transient
+    /// pointer values (e.g. the BF script ptr at session+0x60 that lives for only
+    /// one poll interval) even after they've been cleared from live memory.
+    /// </summary>
+    internal unsafe (int off, nuint addr)[] SnapshotHeapPointers(nuint heapLow)
+    {
+        if (!_hasPrevious) return Array.Empty<(int, nuint)>();
+        var found = new System.Collections.Generic.List<(int, nuint)>(8);
+        fixed (byte* p = _previous)
+        {
+            for (int off = 0; off + 8 <= ScanBytes; off += 8)
+            {
+                nuint v = *(nuint*)(p + off);
+                if (v >= heapLow) found.Add((off, v));
+            }
+        }
+        return found.ToArray();
+    }
 }
