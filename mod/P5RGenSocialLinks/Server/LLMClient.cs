@@ -55,7 +55,7 @@ internal sealed class LLMClient : IDisposable
 
         response.EnsureSuccessStatusCode();
         string body = await response.Content.ReadAsStringAsync(ct);
-        var result  = JsonSerializer.Deserialize<GenerateResponse>(body);
+        var result  = JsonSerializer.Deserialize<GenerateResponse>(body, _jsonOpts);
         return result?.Text ?? string.Empty;
     }
 
