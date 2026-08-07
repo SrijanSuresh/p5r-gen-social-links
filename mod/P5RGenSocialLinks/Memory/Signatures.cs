@@ -12,9 +12,14 @@ namespace P5RGenSocialLinks.Memory;
 internal static class Signatures
 {
     // void __fastcall SocialLink_BeginConversation(SocialLinkSession* session)
-    // PLACEHOLDER — must be verified against your p5r.exe build via Ghidra.
+    // Captured via Cheat Engine "Find what writes to" ConfidantId field.
+    // 48 89 5C 24 ?? = MOV [RSP+??], RBX  (stack offset wildcarded — compiler-chosen)
+    // 57             = PUSH RDI
+    // 48 83 EC 20    = SUB RSP, 0x20       (shadow space allocation)
+    // 48 89 74 24 ?? = MOV [RSP+??], RSI  (stack offset wildcarded)
+    // 48 8D 99 B8 62 00 00 = LEA RBX, [RCX+0x62B8]  (session field offset — unique)
     internal const string BeginConversation =
-        "48 89 5C 24 ?? 48 89 6C 24 ?? 48 89 74 24 ?? 57 41 56 41 57";
+        "48 89 5C 24 ?? 57 48 83 EC 20 48 89 74 24 ?? 48 8D 99 B8 62 00 00";
 
     // void __fastcall SocialLink_AdvanceLine(SocialLinkSession* session, int lineIndex)
     // PLACEHOLDER
