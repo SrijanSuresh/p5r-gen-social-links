@@ -592,6 +592,83 @@ core reason the custom kernel outperforms a CPU dequant loop.
 
 ---
 
+## Chapter 8: ContextBuilder — Reading Live Dialogue from Game Memory
+
+### Why We Need Context At All
+
+The LLM prompt currently receives `"Dialogue line 3"` as context. That's nearly
+useless — the model doesn't know who's speaking, what the scene is, or what the
+character was about to say. The fix is to read the ACTUAL scripted dialogue line
+from the game's own memory buffer before we overwrite it.
+
+### Timing: The Read-Before-Write Window
+
+Our hook calls `OriginalFunction(sessionPtr)` FIRST. That call runs the real P5R
+conversation-init code, which among other things copies the scripted NPC line into
+the dialogue buffer at `sessionPtr + 0x10`. By the time `OriginalFunction` returns,
+the buffer already contains the game's intended dialogue.
+
+Timeline (all on the game thread):
+```
+OnConversationInit called
+  → OriginalFunction(sessionPtr)   ← game writes scripted line to buffer[0x10]
+  ← OriginalFunction returns
+  → ContextBuilder.Build(snap)     ← WE READ the scripted line (synchronous)
+  → _bridge.DispatchAsync(...)     ← async task fires; game thread returns immediately
+     (later, on thread pool)
+     → HTTP → LLM → write new text → OVERWRITE buffer[0x10]
+```
+
+The read is synchronous and cheap (a handful of cache hits). The overwrite happens
+later on the thread pool. There is no race on the read because the game thread won't
+modify the buffer again until the player advances the dialogue.
+
+### UTF-16LE In-Memory Strings
+
+Windows and all games using Win32 text APIs store strings as UTF-16 Little Endian.
+Each character is 2 bytes. In C# `char` is also 2 bytes (UTF-16), so `char*` maps
+directly to the game's wide-character pointer with zero conversion.
+
+Memory layout of the string "Hi!" in UTF-16LE:
+```
+Address:  [+0x00] [+0x01] [+0x02] [+0x03] [+0x04] [+0x05] [+0x06] [+0x07]
+Bytes:      48 00   69 00   21 00   00 00
+Chars:        H       i       !      \0
+```
+
+Reading it in C#:
+```csharp
+unsafe string ReadWideString(nuint addr, int maxChars = 512)
+{
+    char* ptr = (char*)addr;
+
+    // Walk until null terminator or max — guards against unterminated buffers
+    int len = 0;
+    while (len < maxChars && ptr[len] != '\0')
+        len++;
+
+    // new string(char*, start, length) copies exactly `len` chars from unmanaged memory
+    return len == 0 ? string.Empty : new string(ptr, 0, len);
+}
+```
+
+`new string(char*, 0, len)` is an unsafe constructor that copies from unmanaged
+memory into a managed C# string. The GC then owns the copy — the original buffer
+can be overwritten without affecting the string we just made.
+
+### Separation: Pure Logic vs. Unsafe Read
+
+We split ContextBuilder into two layers:
+1. `ReadCurrentDialogue(snap)` — unsafe, reads from game memory, returns raw string
+2. `Build(dialogueIndex, rawDialogue)` — pure C#, formats the context string
+
+The pure `Build` method can be called from a unit test without a live game. The
+unsafe read is inherently unverifiable in tests — we accept it and rely on the
+"null guard + max length" to make it fail-safe (returns empty string if the buffer
+looks wrong).
+
+---
+
 ## Chapter 7: Wiring the LLM Bridge + GPU Autotune + Finding Real Memory Addresses
 
 ### Part A: Wiring DialogueBridge into the Hook
