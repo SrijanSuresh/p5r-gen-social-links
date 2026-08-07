@@ -2334,3 +2334,70 @@ we can immediately identify which sub-object contains the counter:
 Once we see monotonically incrementing bytes, we have the offset. We then hard-code
 that as a new field in `P5ROffsets` — exactly like we did for `CMM_SESSION_OFFSET`
 after the Ghidra analysis.
+
+---
+
+## Chapter 28 — HeapScan Artefacts: 0xFF Fill Patterns and Mid-Session Comparison
+
+### What we observed
+
+After a full Takemi hang-out the HeapScan reported 30 candidates — all of them
+`0 → 255 (+255)`. The LineCounterMonitor fired with values 48, 144, 0, 112 — jumping
+around non-monotonically. Neither result is the dialogue line counter.
+
+### Why all deltas were exactly +255
+
+Windows game heaps commonly fill freed blocks with `0xDD` (MSVC debug heap) or
+`0xFE`/`0xFF` (release allocators and custom game allocators for use-after-free
+detection). At the moment we called `FindIncreased`, the game scene had already begun
+or completed teardown. Objects allocated during the scene were freed; their backing
+pages were flood-filled with `0xFF`. Our snapshot captured `0x00` (pages that existed
+but held unused/zeroed bytes at session start). By comparison time those same bytes
+held `0xFF`. Delta = 255, exact maximum — for every one of them.
+
+The real dialogue counter, if it incremented from 0 to N (where N = lines pressed ≈
+20–30), would show a delta of +20 to +30. But 30 slots × +255 entries dominated the
+sorted output and our 30-result cap hid anything smaller.
+
+### Why the LineCounterMonitor values made no sense
+
+`0x6FFC28` is ASLR-relocated heap memory that belongs to whichever object the
+allocator placed there in *this boot*. The CE session that identified this address ran
+in a different launch. The allocator placed the counter object at that address then;
+in subsequent boots a different object lives there. The values 48 (`0x30`), 144
+(`0x90`), 0, 112 (`0x70`) are bytes written by *that other object* — likely an audio
+channel state or animation frame byte — not by the dialogue counter. `HasAdvanced()`
+fires on any change; the byte at `0x6FFC28` changes because that other object updates,
+not because a dialogue line advanced.
+
+### The two-pronged fix
+
+**Fix 1 — Cap maxDelta at 50.** A dialogue scene with 20–30 button presses produces a
+counter increment of 20–30. No one presses 255 lines in a single hang-out. By passing
+`maxDelta: 50` we exclude every 0xFF teardown byte and surface only genuine small-step
+increments. If the counter *is* in our scan range (0x10000–0x20000000), it will appear
+in the filtered results after this change.
+
+**Fix 2 — Mid-session comparison at tick 20 (≈10 s).** The snapshot is taken at
+session start. If we compare too early nothing has changed yet; if we compare at
+session *end* the teardown noise dominates. The sweet spot is mid-scene: the player
+has been pressing dialogue buttons for ~10 seconds but the game has not started
+freeing scene objects. At tick 20 of the 500 ms poll loop we call `FindIncreased`
+against the original snapshot and log results. Teardown bytes are still 0x00 at this
+point; the counter has incremented by however many lines the player pressed. This
+gives us a clean signal window.
+
+### The tick counter design
+
+`_sessionTick` is an `int` field reset to 0 each time a new session is detected. It
+increments once per poll tick (500 ms). At tick 20 (≈10 s) the mid-session comparison
+runs automatically. This mirrors the "two-pass snapshot" mental model from Chapter 28:
+
+```
+t=0   : TakeSnapshot()         — baseline, all bytes at rest
+t=10s : FindIncreased(max=50)  — lines pressed, no teardown noise
+t=end : FindIncreased(max=50)  — may still be useful if session didn't clean up
+```
+
+If the counter appears in the t=10s window we have our address. If not, it's outside
+0x10000–0x20000000 and we need to extend the scan ceiling.

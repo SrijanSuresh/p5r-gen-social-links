@@ -150,6 +150,7 @@ public class Mod : IModV1
     private readonly PointerFollowScanner _ptrFollower    = new();
     private readonly LineCounterMonitor   _lineMonitor    = new();
     private readonly HeapCounterScanner   _heapScanner    = new();
+    private int _sessionTick;
 
     private void StartPollLoop()
     {
@@ -172,16 +173,16 @@ public class Mod : IModV1
                     _modLog!.Info(
                         $"[LineCounter] Session end: 0x{P5ROffsets.CMM_LINE_COUNTER_ADDR:X} = {finalCount}");
 
-                    var hits = _heapScanner.FindIncreased();
+                    var hits = _heapScanner.FindIncreased(minDelta: 1, maxDelta: 50, maxResults: 50);
                     if (hits.Count > 0)
                     {
-                        _modLog!.Info($"[HeapScan] {hits.Count} byte(s) increased in low heap — top candidates:");
+                        _modLog!.Info($"[HeapScan] Session-end: {hits.Count} byte(s) increased ≤50 — top candidates:");
                         foreach (string h in hits)
                             _modLog!.Info($"[HeapScan]   {h}");
                     }
                     else
                     {
-                        _modLog!.Info("[HeapScan] No increases found — counter may be outside 0x10000-0x20000000.");
+                        _modLog!.Info("[HeapScan] Session-end: no increases ≤50 — counter outside 0x10000-0x20000000 or not yet moved.");
                     }
                     _heapScanner.Clear();
 
@@ -197,7 +198,8 @@ public class Mod : IModV1
 
             if (session != lastSession)
             {
-                lastSession = session;
+                lastSession   = session;
+                _sessionTick  = 0;
                 _diffScanner.Reset();
                 _ptrFollower.Reset();
                 _lineMonitor.Activate();
@@ -238,6 +240,18 @@ public class Mod : IModV1
                     _modLog!.Info($"[P5RGenSocialLinks] Line advanced (counter={lineIndex}) — dispatching LLM.");
                     _bridge!.DispatchAsync(lineSnap, ContextBuilder.Build(lineSnap), lineIndex);
                 }
+            }
+
+            // Mid-session HeapScan comparison: ~10 s in, before game teardown noise.
+            _sessionTick++;
+            if (_sessionTick == 20)
+            {
+                _modLog!.Info("[HeapScan] Mid-session (10s) — scanning for small increments:");
+                var midHits = _heapScanner.FindIncreased(minDelta: 1, maxDelta: 50, maxResults: 50);
+                if (midHits.Count > 0)
+                    foreach (string h in midHits) _modLog!.Info($"[HeapScan]   {h}");
+                else
+                    _modLog!.Info("[HeapScan]   No increases ≤50 found — counter may be above 0x20000000.");
             }
 
             // Struct diff — passive discovery of per-line changing fields.
