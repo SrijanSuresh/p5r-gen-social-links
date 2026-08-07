@@ -1,6 +1,7 @@
 ﻿"""Builds character-faithful prompts for LLM inference."""
 
 from .arcana import Confidant, get_confidant
+from .tier import tier_note as _tier_note
 
 
 SYSTEM_TEMPLATE = """\
@@ -17,16 +18,6 @@ Rules:
 - Match the emotional closeness appropriate for rank {rank}/10.
 - Do NOT repeat the player's words verbatim; respond naturally.
 """
-
-
-def _tier_note(rank: int) -> str:
-    if rank <= 2:
-        return "You have just met. Keep tone polite but reserved; do not use pet names."
-    if rank <= 5:
-        return "Acquaintances warming up. Casual, friendly; some shared history implied."
-    if rank <= 8:
-        return "Close friends. Comfortable banter, genuine emotional investment."
-    return "Deepest bond. Speak with trust, vulnerability, and warmth."
 
 
 def build_prompt(
