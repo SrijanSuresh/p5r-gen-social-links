@@ -56,3 +56,35 @@ async def test_stats_track_requests_and_drops() -> None:
 async def test_avg_latency_none_before_first_completion() -> None:
     queue = InferenceQueue()
     assert queue.avg_latency_ms is None
+
+
+@pytest.mark.asyncio
+async def test_clear_stats_resets_all_counters() -> None:
+    queue = InferenceQueue()
+
+    async def instant_task() -> str:
+        return "ok"
+
+    await queue.run_if_idle(instant_task)
+    assert queue.total_completions == 1
+
+    queue.clear_stats()
+    assert queue.total_requests == 0
+    assert queue.total_drops == 0
+    assert queue.total_completions == 0
+    assert queue.avg_latency_ms is None
+
+
+@pytest.mark.asyncio
+async def test_clear_stats_then_normal_tracking_resumes() -> None:
+    """Counters should increment normally after a clear."""
+    queue = InferenceQueue()
+
+    async def instant_task() -> str:
+        return "ok"
+
+    await queue.run_if_idle(instant_task)
+    queue.clear_stats()
+    await queue.run_if_idle(instant_task)
+    assert queue.total_requests == 1
+    assert queue.total_completions == 1
