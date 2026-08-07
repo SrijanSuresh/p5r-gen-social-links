@@ -1690,3 +1690,77 @@ verbose mode by editing the JSON (plus a mod reload) without recompiling.
 This is the "printf debugging for memory" approach — cheap, zero-overhead when off,
 and completely visible in the Reloaded-II console without attaching a debugger.
 
+---
+
+## Chapter 20 — Text Buffer Write-Back: Injecting Generated Dialogue
+
+### The Gap Between Logging and Injection
+
+Right now `DialogueBridge.DispatchAsync()` calls the LLM, gets a response, and *logs*
+it. The actual game text is untouched — Ryuji still delivers his scripted line.
+Write-back means overwriting the game's in-memory dialogue string before the renderer
+reads it, so the LLM response appears on screen.
+
+### Two Approaches
+
+**Approach A — Direct Buffer Overwrite**
+P5R stores dialogue text as a UTF-8 (or Shift-JIS) C-string in the social link session
+struct or a nearby heap allocation. If we find the exact byte offset, we can
+`Marshal.Copy()` our generated text into the buffer before the renderer reads it.
+
+Risk: The buffer has a fixed capacity (usually 256-512 bytes). If our LLM text is
+longer, we overflow adjacent fields and corrupt the struct. Solution: `clean_response()`
+already enforces a 200-char maximum and sentence-boundary truncation, so we stay well
+under any sane buffer size.
+
+**Approach B — Pointer Swap**
+Some engines store a `wchar_t*` pointer field that points to the display string.
+If we allocate our own heap string (`Marshal.AllocHGlobal`), write the LLM text
+into it, and then overwrite the pointer field, the renderer follows the new pointer
+and shows our text. The allocation must stay live for the frame duration, so we
+keep it in a field and free the *previous* allocation before overwriting.
+
+P5R most likely uses Approach A (fixed buffer) based on how other Atlus engine games
+store dialogue, but Ghidra analysis of the text-display function is required to confirm.
+
+### The Offset Discovery Plan
+
+1. Run `struct_diff_enabled: true` during a hang-out.
+2. Look for a `[StructDiff]` line where the offset changes *precisely when dialogue
+   text changes on screen* (not when you press a button, but when new text appears).
+3. Dump 64 bytes around that offset with `SocialLinkReader.HexDump()`.
+4. Match the hex bytes to ASCII/UTF-8 text from the current dialogue line.
+5. That confirmed offset is `DIALOGUE_TEXT_OFFSET` in `P5ROffsets.cs`.
+
+### Write-Back Safety
+
+Before writing:
+1. `MemoryGuard.IsReadable(ptr + offset, expectedLength)` — confirm the buffer exists.
+2. Write exactly `Math.Min(text.Length, maxBufferSize - 1)` bytes.
+3. Null-terminate at position `bytesWritten`.
+4. Restore the original text on session end in case the game re-reads from the buffer.
+
+The write happens on the thread pool (inside `Task.Run`), which means it races with
+the game's main thread. This is inherently racy — the game could read the buffer
+*during* our write. A future improvement is to use a semaphore tied to the render
+frame boundary, but for a non-commercial mod the race window is small (~microseconds).
+
+### Current Status
+
+`DialogueBridge.DispatchAsync()` has a `// TODO: dialogue write-back` comment where
+the write will go. Once `DIALOGUE_TEXT_OFFSET` is confirmed via StructDiff,
+the implementation is:
+
+```csharp
+unsafe void WriteDialogue(nuint sessionPtr, string text)
+{
+    byte[] bytes = System.Text.Encoding.UTF8.GetBytes(text + "\0");
+    nuint target = sessionPtr + P5ROffsets.DIALOGUE_TEXT_OFFSET;
+    if (!MemoryGuard.IsReadable(target, bytes.Length)) return;
+    fixed (byte* src = bytes)
+        Buffer.MemoryCopy(src, (void*)target, bytes.Length, bytes.Length);
+}
+```
+
+This is intentionally left as a placeholder until offset discovery is complete.
+
