@@ -15,7 +15,16 @@ public class Mod : IModV1
 {
     private ILoggerV2?        _logger;
     private LLMClient?        _llmClient;
+    private DialogueBridge?   _bridge;
     private SocialLinkReader? _reader;
+
+    // Adapts Reloaded's ILoggerV2 to DialogueBridge's internal ILogger contract.
+    private sealed class LoggerAdapter : DialogueBridge.ILogger
+    {
+        private readonly ILoggerV2 _inner;
+        internal LoggerAdapter(ILoggerV2 inner) => _inner = inner;
+        public void WriteLine(string msg) => _inner.WriteLine(msg);
+    }
 
     // Polling (fallback while hook is placeholder)
     private PeriodicTimer?          _timer;
@@ -37,6 +46,7 @@ public class Mod : IModV1
         _logger.WriteLine($"[P5RGenSocialLinks] Base: 0x{moduleBase:X}");
 
         _reader = new SocialLinkReader(moduleBase);
+        _bridge = new DialogueBridge(_llmClient!, new LoggerAdapter(_logger!));
 
         TryActivateHook();
         StartPollLoop();
@@ -71,14 +81,17 @@ public class Mod : IModV1
         // Run original first so session fields are initialised before we read them
         _conversationHook!.OriginalFunction(sessionPtr);
 
-        SocialLinkSnapshot? snap = _reader!.TryReadSnapshot();
+        _logger?.WriteLine($"[P5RGenSocialLinks] sessionPtr=0x{sessionPtr:X}");
+        _logger?.WriteLine($"[P5RGenSocialLinks] HexDump:{SocialLinkReader.HexDump(sessionPtr)}");
+
+        SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(sessionPtr);
         if (snap is null)
             return;
 
         _logger?.WriteLine(
             $"[P5RGenSocialLinks] Hook: Confidant={snap.ConfidantId} Rank={snap.RankLevel}");
 
-        // TODO Micro-step 5: dispatch async LLM request and inject result
+        _bridge!.DispatchAsync(snap, ContextBuilder.ReadAndBuild(snap));
     }
 
     // ── Poll loop (fallback) ───────────────────────────────────────────────
