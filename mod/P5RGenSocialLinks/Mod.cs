@@ -14,6 +14,7 @@ namespace P5RGenSocialLinks;
 public class Mod : IModV1
 {
     private ILoggerV2?        _logger;
+    private ModLogger?        _modLog;
     private LLMClient?        _llmClient;
     private DialogueBridge?   _bridge;
     private SocialLinkReader? _reader;
@@ -49,8 +50,9 @@ public class Mod : IModV1
         // Load user-editable runtime config from GenDialogue.json next to the DLL.
         string modDir = System.IO.Path.GetDirectoryName(
             System.Reflection.Assembly.GetExecutingAssembly().Location) ?? ".";
-        _cfg = GenConfig.Load(modDir);
-        _logger.WriteLine($"[P5RGenSocialLinks] Config: throttle={_cfg.ThrottleSeconds}s timeout={_cfg.TimeoutSeconds}s url={_cfg.ServerUrl}");
+        _cfg    = GenConfig.Load(modDir);
+        _modLog = new ModLogger(_logger, _cfg.LogLevel);
+        _modLog.Always($"[P5RGenSocialLinks] Config: throttle={_cfg.ThrottleSeconds}s timeout={_cfg.TimeoutSeconds}s url={_cfg.ServerUrl} logLevel={_cfg.LogLevel}");
 
         _llmClient = new LLMClient(_cfg.ServerUrl);
 
@@ -164,7 +166,7 @@ public class Mod : IModV1
                 {
                     _diffScanner.Reset();
                     _bridge!.ResetSession();
-                    _logger!.WriteLine("[P5RGenSocialLinks] Hang-out ended — session cleared.");
+                    _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
                 }
                 lastSession = 0;
                 continue;
@@ -178,7 +180,7 @@ public class Mod : IModV1
                 SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
                 if (snap is null) continue;
 
-                _logger!.WriteLine(
+                _modLog!.Info(
                     $"[P5RGenSocialLinks] Hang-out: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber} (0x{session:X})");
 
                 if (!_hookActive)
@@ -192,7 +194,7 @@ public class Mod : IModV1
             {
                 string? diff = _diffScanner.Diff(session);
                 if (diff is not null)
-                    _logger!.WriteLine($"[P5RGenSocialLinks] {diff}");
+                    _modLog!.Info($"[P5RGenSocialLinks] {diff}");
             }
         }
     }

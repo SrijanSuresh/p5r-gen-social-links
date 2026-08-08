@@ -34,6 +34,13 @@ internal sealed class GenConfig
     [JsonPropertyName("verbose_chain")]
     public bool VerboseChain { get; init; } = false;
 
+    /// <summary>
+    /// Minimum severity of messages written to the Reloaded-II console.
+    /// "info" = all messages; "warn" = LLM errors/timeouts only; "off" = silence.
+    /// </summary>
+    [JsonPropertyName("log_level")]
+    public string LogLevel { get; init; } = "info";
+
     private static readonly JsonSerializerOptions _opts = new() { ReadCommentHandling = JsonCommentHandling.Skip };
 
     internal static GenConfig Load(string modDirectory)

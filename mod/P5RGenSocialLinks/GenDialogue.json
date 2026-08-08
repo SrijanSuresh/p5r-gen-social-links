@@ -23,5 +23,8 @@
   // Log every pointer chain step with address + dereferenced value.
   // Enable when TryResolve() fails and you need to find the broken link.
   // Leave false in normal play — fires every 500ms poll tick.
-  "verbose_chain": false
+  "verbose_chain": false,
+
+  // Log verbosity: "info" (all messages), "warn" (errors/timeouts only), "off" (silent).
+  "log_level": "info"
 }
