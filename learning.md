@@ -3115,3 +3115,126 @@ struct for complex scenes (gym, festival) appears to be 3 KB+ based on the maxim
 observed (0x0C4C = 3148). The BF script pointer could easily be at offset +0x300 or +0x400.
 Expanding to 1024 bytes (128 slots, offsets through +0x3F8) costs one extra VirtualQuery call
 and gives us more surface area to find the script pointer.
+
+---
+
+## Chapter 41 — Three Bugs That Hid the BF Script Pointer (And How We Fixed All Three)
+
+### Background: what we confirmed with CE
+
+CE memory viewer confirmed the BF script at runtime:
+
+- BF buffer base: `0x4178E79D48`
+- Opcode byte `0x05` (dialogue) at `+0x20` offset: `0x4178E79D68`
+- First dialogue byte `'g'` of "gym over in Shibuya": `0x4178E79D69`
+- PC at the moment that line fired: `0x0020`
+- Therefore bfBase = opcodeAddr − PC = `0x4178E79D68 − 0x0020 = 0x4178E79D48` ✓
+
+Despite this confirmed address, our C# scanner logged zero `[BFBuffer] CAND` entries.
+Three overlapping bugs were hiding the buffer.
+
+---
+
+### Bug 1: `CountPoolStrings` breaks on the first bad segment — and BF files start with null bytes
+
+The BF file format begins with a **32-byte binary header** before the first instruction:
+
+```
+0x4178E79D48:  00 00 00 00 00 02 00 00 00 00 5D 08 00 00 5D 73
+0x4178E79D58:  00 00 00 A8 F2 05 FF FF 00 00 00 00 00 00 00 00
+0x4178E79D68:  05 67 79 6D 20 6F 76 65 72 ...   ← first instruction
+```
+
+The very first byte at `+0x00` is `0x00` (null). `CountPoolStrings` reads:
+
+```csharp
+// scan until null
+if (b == 0) { strEnd = i; break; }
+// after loop:
+if (printable < MinPrintableChars) break; // ← hits this, printable=0
+```
+
+Because the first "string" is zero-length with zero printable chars, the function
+hits `break` immediately and returns `count = 0`. Every pointer to the BF buffer
+fails the `count >= MinPoolStrings` check.
+
+**The fix:** change all three `break` exits in `CountPoolStrings` to `continue` with
+position advancement. A bad/empty segment is skipped; only the good ones are counted.
+This mirrors what `CountNullTermStrings` in `Mod.cs` already does correctly.
+
+```csharp
+// OLD:
+if (printable < MinPrintableChars) break;
+// NEW:
+if (printable < MinPrintableChars) { pos = (strEnd >= 0 ? strEnd + 1 : pos + 1); continue; }
+```
+
+With the fix, the scanner skips past the 32-byte header, reaches the first null-terminated
+dialogue string "gym over in Shibuya\0", and counts it.
+
+---
+
+### Bug 2: `minRun = 20` threshold is one character too high
+
+The second gatekeeper in `TryFindBfBuffer` is:
+
+```csharp
+if (maxRun < minRun) continue;   // minRun = 20
+```
+
+"gym over in Shibuya" = **19 printable characters** — one short of the cutoff.
+The BF script is discarded before `CountNullTermStrings` is even called.
+
+Other strings in the same scene ("C'mon, I'll show you the way", "Here we are...")
+might be longer, but those appear deeper in the BF file. Our `probeScan = 512` covers
+only the first 512 bytes. The first 32 bytes are the header; the first instruction
+occupies bytes 32–~70; subsequent instructions are at 70–512. Even if there is a 20+
+char string further in, **the maxRun filter must survive the header region** to ever
+reach those strings.
+
+**The fix:** lower `minRun` to **12**. This still excludes pure-binary objects (which
+rarely have 12 consecutive printable bytes) while passing any English dialogue sentence.
+Also expand `probeScan` from 512 → 2048 so more of the BF file is covered.
+
+---
+
+### Bug 3: Session struct scan range too narrow
+
+The session struct scan range was 512 bytes in `StructDiffScanner` and 1024 bytes in
+`TryFindBfBuffer`. Both C++ game engines (Unreal-adjacent, AtlasEngine) store the BF
+interpreter as a **separate object** reached through a pointer chain:
+
+```
+session struct  +0x?? → BFInterpreter object  +0x?? → BF script buffer
+```
+
+The interpreter pointer within the session struct can be at ANY offset; there is no
+reason to assume it lands in the first 128 pointer slots (1024 bytes). Real game session
+structs are hundreds to thousands of bytes. We expand the scan to **4096 bytes** (512
+pointer slots), which covers sessions up to ~4 KB without a noticeable performance hit
+(the VirtualQuery + memcpy cost per tick is negligible at a 200ms interval).
+
+---
+
+### Why Phase 3 (bidirectional heap scan) cannot help here
+
+Phase 3 scans ±128 MB / ±32 MB around the session struct address. But:
+
+- session: `0x420F6B77C0`
+- BF buffer: `0x4178E79D48`
+- gap: `0x420F6B77C0 − 0x4178E79D48 ≈ 2.57 GB`
+
+The buffer is **2.57 GB below** the session struct — far outside the scan window.
+Phase 3 must remain as a hook-based safety net (fires only once per session start,
+not every poll tick). The only path to the BF buffer from our code is through the
+pointer chain in the session struct (Phase 1) or through intermediate objects (Phase 2).
+
+---
+
+### Summary: the three fixes together
+
+| Bug | Symptom | Fix |
+|-----|---------|-----|
+| `CountPoolStrings` breaks on null header | BF buffer scores 0 strings | Skip bad segments (`continue`) instead of `break` |
+| `minRun = 20` too high | BF buffer discarded before string counting | Lower to 12; expand `probeScan` to 2048 |
+| Session scan too narrow (512–1024 B) | Interpreter pointer at offset > 1024 | Expand to 4096 B in both scanner and diff tracker |

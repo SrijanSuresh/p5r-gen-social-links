@@ -210,9 +210,16 @@ public class Mod : IModV1
     private unsafe void TryFindBfBuffer(nuint session)
     {
         if (_bfBufferBase != 0) return;   // already cached
-        const int sessionScan = 1024;   // extended: BF ptr may be past +0x200
-        const int probeScan   = 512;
-        const int minRun      = 20;
+        // BF interpreter pointer may be at any offset in the session struct.
+        // 4096 bytes = 512 pointer slots; cheap at 200ms poll interval.
+        const int sessionScan = 4096;
+        // 2048-byte probe: BF files start with a 32-byte binary header before
+        // the first dialogue instruction — need more window to accumulate strings.
+        const int probeScan   = 2048;
+        // 12-char threshold: "gym over in Shibuya" = 19 chars, but the header
+        // region can suppress long runs. 12 passes any English sentence and still
+        // excludes pure-binary objects that rarely have 12 consecutive printable bytes.
+        const int minRun      = 12;
 
         if (!Memory.MemoryGuard.IsReadable(session, sessionScan)) return;
         byte* sp = (byte*)session;

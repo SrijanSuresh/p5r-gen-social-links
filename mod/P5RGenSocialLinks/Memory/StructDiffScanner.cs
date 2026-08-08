@@ -10,7 +10,9 @@ namespace P5RGenSocialLinks.Memory;
 /// </summary>
 internal sealed unsafe class StructDiffScanner
 {
-    private const int ScanBytes = 512;
+    // Expanded to 4096 so SnapshotHeapPointers() can catch transient BF script
+    // pointers that appear at session struct offsets beyond the old 512-byte window.
+    private const int ScanBytes = 4096;
 
     private readonly byte[] _previous = new byte[ScanBytes];
     private bool _hasPrevious;

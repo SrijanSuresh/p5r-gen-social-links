@@ -31,9 +31,9 @@ internal static class DialogueTextPoolFinder
     private const int MinPoolStringsPhase3 = 8;  // Phase 3 (heap scan) — higher bar to avoid false positives
     private const int MinPrintableChars   = 3;   // printable bytes required per string
     private const int MaxStrLen           = 400;
-    private const int ProbeBytes          = 16384; // bytes to probe per candidate
-    private const int SessionScanBytes    = 512;   // bytes of session struct to walk
-    private const int Depth2ScanBytes     = 256;   // bytes of each Phase-1 target to walk
+    private const int ProbeBytes          = 32768; // bytes to probe per candidate (extended to cover BF scripts with long headers)
+    private const int SessionScanBytes    = 4096;  // bytes of session struct to walk (extended: BF interpreter ptr may be deep)
+    private const int Depth2ScanBytes     = 1024;  // bytes of each Phase-1 target to walk (extended for depth-2 interpreter objects)
 
     [DllImport("kernel32.dll")]
     private static extern nuint VirtualQuery(
@@ -214,6 +214,9 @@ internal static class DialogueTextPoolFinder
         int   pos   = 0;
         int   count = 0;
 
+        // Skip bad segments rather than breaking: BF files start with a binary
+        // header (null bytes + control codes) before any dialogue strings. A hard
+        // break on the first bad segment would return count=0 for valid BF scripts.
         while (pos < maxBytes - MinPrintableChars)
         {
             int printable = 0;
@@ -229,9 +232,14 @@ internal static class DialogueTextPoolFinder
                 if (b >= 0x20 && b <= 0x7E) printable++;
             }
 
-            if (strEnd < 0)                          break; // no null terminator
-            if (printable < MinPrintableChars)        break; // too few printable chars
-            if (total > 0 && printable * 2 < total)  break; // below 50 % printable
+            if (strEnd < 0) break; // no null terminator anywhere in window — stop
+
+            // Bad segment: skip it and continue scanning rather than aborting
+            if (printable < MinPrintableChars || (total > 0 && printable * 2 < total))
+            {
+                pos = strEnd + 1;
+                continue;
+            }
 
             count++;
             pos = strEnd + 1;
