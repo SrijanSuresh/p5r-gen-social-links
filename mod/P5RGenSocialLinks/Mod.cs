@@ -81,7 +81,10 @@ public class Mod : IModV1
         // Run original first so session fields are initialised before we read them
         _conversationHook!.OriginalFunction(sessionPtr);
 
-        SocialLinkSnapshot? snap = _reader!.TryReadSnapshot();
+        _logger?.WriteLine($"[P5RGenSocialLinks] sessionPtr=0x{sessionPtr:X}");
+        _logger?.WriteLine($"[P5RGenSocialLinks] HexDump:{SocialLinkReader.HexDump(sessionPtr)}");
+
+        SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(sessionPtr);
         if (snap is null)
             return;
 
