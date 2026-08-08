@@ -60,3 +60,22 @@ async def test_all_confidant_ids_in_roster_generate(client_with_mock: AsyncClien
         req = {**RYUJI_REQUEST, "confidant_id": cid}
         r = await client_with_mock.post("/generate", json=req)
         assert r.status_code == 200, f"Failed for confidant_id={cid}"
+
+
+@pytest.mark.asyncio
+async def test_generate_then_clear_stats_then_generate(client_with_mock: AsyncClient) -> None:
+    """Stats reset mid-session: second generate after clear should see total_completions=1."""
+    await client_with_mock.post("/generate", json=RYUJI_REQUEST)
+    await client_with_mock.post("/clear-stats")
+    await client_with_mock.post("/generate", json=RYUJI_REQUEST)
+    r = await client_with_mock.get("/stats")
+    assert r.json()["total_completions"] == 1
+
+
+@pytest.mark.asyncio
+async def test_model_info_after_generate(client_with_mock: AsyncClient) -> None:
+    """/model-info returns a valid mode after a generate call."""
+    await client_with_mock.post("/generate", json=RYUJI_REQUEST)
+    r = await client_with_mock.get("/model-info")
+    assert r.status_code == 200
+    assert r.json()["mode"] in ("mock", "real", "not_loaded")
