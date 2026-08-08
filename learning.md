@@ -2401,3 +2401,58 @@ t=end : FindIncreased(max=50)  — may still be useful if session didn't clean u
 
 If the counter appears in the t=10s window we have our address. If not, it's outside
 0x10000–0x20000000 and we need to extend the scan ceiling.
+
+---
+
+## Chapter 29 — High-Heap Scanning and Cumulative Baseline Diffs
+
+### Why all mid-session results were exactly +50
+
+The mid-session scan fired at tick 20 — exactly 10 real seconds (20 × 500 ms). The
+results all showed `+50`. The coincidence is deliberate: these bytes count elapsed game
+time in 200 ms units. 10 seconds ÷ 200 ms = 50 ticks. Every byte controlled by this
+timer incremented by exactly 50 between snapshot and comparison.
+
+The dialogue counter (one increment per F-press) would show a much smaller delta —
+typically +5 to +20 for a normal scene. But since ALL 50 result slots were occupied by
+the +50 timer bytes, the actual counter (if present in the low heap) was cut off.
+
+### Why the low-heap scan had no counter at all
+
+The session struct is at `0x424BD57FC0` — roughly 265 GB into the process address
+space. The PtrFollow sub-object target is at `0x41E67C9240` — about 174 MB lower.
+Both are way above our scan ceiling of `0x20000000` (512 MB). The counter object was
+never in our scan window in the first place. Low-heap (< 512 MB) contains DLL images,
+CLR stubs, and CRI audio ring buffers — not the game's primary heap.
+
+### Fix 1 — Pivot-based high-heap scan
+
+Instead of a fixed `[0x10000, 0x20000000]` range, pass the live session struct address
+as a pivot and scan `[pivot - 256 MB, pivot + 256 MB]`. With the 64 MB total-bytes
+cap, we snapshot the first 64 MB of committed+RW pages in that 512 MB window, which
+are the pages closest to the session struct. The counter object, being allocated from
+the same heap arena, is very likely within 64 MB of the session struct.
+
+### Fix 2 — PtrFollow cumulative baseline
+
+The existing `PointerFollowScanner` diffs each sub-object tick-to-tick, showing
+which bytes flip between ticks. That's good for finding volatile pointers but misses a
+slowly incrementing counter (it only changes by +1 per press, which is often
+indistinguishable from noise in a single-tick diff).
+
+The fix: when a target is first captured, save its bytes as a *baseline*. Then at
+mid-session and session-end, `CumulativeDiff()` compares *current* bytes to the
+*baseline* — showing the total change since capture. A counter that went 0→15 over 15
+presses appears as `+0x18: 0→15 (+15)` even if each tick only produced `+0x18:14→15`.
+
+This turns PtrFollow from a one-tick diff tool into a session-scoped counter detector,
+targeting the exact sub-objects the session struct already pointed us to.
+
+### Why PtrFollow is better than a full heap scan for this
+
+PtrFollow scans only the three 256-byte windows at `session+0xE0`, `session+0xE8`, and
+`session+0xF0` — the pointers the game engine wrote into the session struct. Any
+sub-system that the session struct delegates to lives at one of those targets. The
+dialogue counter, being part of the dialogue sub-system, is almost certainly reachable
+from one of these pointers. Scanning 3 × 256 B = 768 B is far cleaner than scanning
+64 MB of heap noise.

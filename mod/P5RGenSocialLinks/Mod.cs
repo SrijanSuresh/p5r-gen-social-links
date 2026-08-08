@@ -186,6 +186,13 @@ public class Mod : IModV1
                     }
                     _heapScanner.Clear();
 
+                    _modLog!.Info("[PtrFollow] Session-end cumulative deltas from capture baseline:");
+                    var endCumul = _ptrFollower.CumulativeDiff();
+                    if (endCumul.Count > 0)
+                        foreach (string c in endCumul) _modLog!.Info($"[P5RGenSocialLinks]   {c}");
+                    else
+                        _modLog!.Info("[PtrFollow]   No cumulative increases in sub-objects.");
+
                     _diffScanner.Reset();
                     _ptrFollower.Reset();
                     _lineMonitor.Deactivate();
@@ -203,7 +210,7 @@ public class Mod : IModV1
                 _diffScanner.Reset();
                 _ptrFollower.Reset();
                 _lineMonitor.Activate();
-                _heapScanner.TakeSnapshot(msg => _modLog!.Info(msg));
+                _heapScanner.TakeSnapshot(session, msg => _modLog!.Info(msg));
                 LineCounterMonitor.Diagnose(msg => _modLog!.Info(msg));
 
                 SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
@@ -242,16 +249,25 @@ public class Mod : IModV1
                 }
             }
 
-            // Mid-session HeapScan comparison: ~10 s in, before game teardown noise.
+            // Mid-session checkpoint: ~20 s in (tick 40), after loading wipe finishes.
+            // HeapScan looks for small byte increments in high heap near session struct.
+            // PtrFollow cumulative diff reports totals since each sub-object was captured.
             _sessionTick++;
-            if (_sessionTick == 20)
+            if (_sessionTick == 40)
             {
-                _modLog!.Info("[HeapScan] Mid-session (10s) — scanning for small increments:");
-                var midHits = _heapScanner.FindIncreased(minDelta: 1, maxDelta: 50, maxResults: 50);
+                _modLog!.Info("[HeapScan] Mid-session (20s) — scanning high heap for small increments:");
+                var midHits = _heapScanner.FindIncreased(minDelta: 1, maxDelta: 15, maxResults: 50);
                 if (midHits.Count > 0)
                     foreach (string h in midHits) _modLog!.Info($"[HeapScan]   {h}");
                 else
-                    _modLog!.Info("[HeapScan]   No increases ≤50 found — counter may be above 0x20000000.");
+                    _modLog!.Info("[HeapScan]   No increases ≤15 — counter may be far from session struct.");
+
+                _modLog!.Info("[PtrFollow] Mid-session cumulative deltas from capture baseline:");
+                var midCumul = _ptrFollower.CumulativeDiff();
+                if (midCumul.Count > 0)
+                    foreach (string c in midCumul) _modLog!.Info($"[P5RGenSocialLinks]   {c}");
+                else
+                    _modLog!.Info("[PtrFollow]   No cumulative increases ≤100 in sub-objects.");
             }
 
             // Struct diff — passive discovery of per-line changing fields.

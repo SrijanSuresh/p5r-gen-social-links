@@ -26,16 +26,23 @@ internal sealed unsafe class PointerFollowScanner
 
     private readonly nuint[] _targets;
     private readonly byte[][] _prev;
+    private readonly byte[][] _baseline;
     private readonly bool[]   _hasSnapshot;
+    private readonly bool[]   _hasBaseline;
 
     internal PointerFollowScanner()
     {
         int n = PtrOffsets.Length;
         _targets     = new nuint[n];
         _prev        = new byte[n][];
+        _baseline    = new byte[n][];
         _hasSnapshot = new bool[n];
+        _hasBaseline = new bool[n];
         for (int i = 0; i < n; i++)
-            _prev[i] = new byte[SubScanBytes];
+        {
+            _prev[i]     = new byte[SubScanBytes];
+            _baseline[i] = new byte[SubScanBytes];
+        }
     }
 
     /// <summary>
@@ -86,8 +93,13 @@ internal sealed unsafe class PointerFollowScanner
 
         if (!_hasSnapshot[i])
         {
-            for (int j = 0; j < SubScanBytes; j++) _prev[i][j] = p[j];
+            for (int j = 0; j < SubScanBytes; j++)
+            {
+                _prev[i][j]     = p[j];
+                _baseline[i][j] = p[j];
+            }
             _hasSnapshot[i] = true;
+            _hasBaseline[i] = true;
             return;
         }
 
@@ -107,13 +119,50 @@ internal sealed unsafe class PointerFollowScanner
             results.Add(sb.ToString());
     }
 
-    /// <summary>Clears all targets and snapshots. Call when hang-out ends.</summary>
+    /// <summary>
+    /// Compares current sub-object bytes to the capture-time baseline.
+    /// Reports every byte that increased since the baseline was established.
+    /// Use at mid-session and session-end to detect slowly-incrementing counters.
+    /// </summary>
+    internal List<string> CumulativeDiff()
+    {
+        var results = new List<string>();
+        for (int i = 0; i < PtrOffsets.Length; i++)
+        {
+            nuint target = _targets[i];
+            if (target == 0 || !_hasBaseline[i]) continue;
+            if (!MemoryGuard.IsReadable(target, SubScanBytes)) continue;
+            CumulativeDiffOne(i, target, results);
+        }
+        return results;
+    }
+
+    private unsafe void CumulativeDiffOne(int i, nuint target, List<string> results)
+    {
+        byte* p = (byte*)target;
+        StringBuilder? sb = null;
+
+        for (int j = 0; j < SubScanBytes; j++)
+        {
+            int delta = (int)p[j] - (int)_baseline[i][j];
+            if (delta <= 0 || delta > 100) continue;  // only small positive increments
+
+            sb ??= new StringBuilder($"[PtrFollow cumul +0x{PtrOffsets[i]:X2}→0x{target:X}]");
+            sb.Append($" +0x{j:X2}:{_baseline[i][j]:X2}→{p[j]:X2}(+{delta})");
+        }
+
+        if (sb is not null)
+            results.Add(sb.ToString());
+    }
+
+    /// <summary>Clears all targets, snapshots, and baselines. Call when hang-out ends.</summary>
     internal void Reset()
     {
         for (int i = 0; i < PtrOffsets.Length; i++)
         {
             _targets[i]     = 0;
             _hasSnapshot[i] = false;
+            _hasBaseline[i] = false;
         }
     }
 }

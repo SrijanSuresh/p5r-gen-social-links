@@ -7,21 +7,21 @@ namespace P5RGenSocialLinks.Memory;
 /// <summary>
 /// Replaces the manual Cheat Engine workflow for finding the dialogue line counter.
 ///
-/// At hang-out start it snapshots every writable byte in the low-address heap
-/// (0x10000 – 0x20000000). When the hang-out ends it compares the live bytes
-/// to the snapshot and reports every address whose value increased. The counter
-/// object was at ~0x6FFC10 in the original CE session — a low-address global
-/// allocation. This scanner finds whatever address it lives at in the current session.
+/// At hang-out start it snapshots every writable byte near the session struct in the
+/// high heap (pivot ± 256 MB). When the hang-out ends it compares the live bytes
+/// to the snapshot and reports every address whose value increased by a small amount —
+/// consistent with a per-line dialogue counter.
 ///
 /// Once the counter address is confirmed (one or two sessions), hard-code it in
 /// P5ROffsets and remove this scanner.
 /// </summary>
 internal sealed unsafe class HeapCounterScanner
 {
-    private const nuint ScanLow          = 0x10000;
-    private const nuint ScanHigh         = 0x20000000;   // 512 MB ceiling
-    private const int   MaxBytesPerRegion = 16 * 1024 * 1024;  // 16 MB cap per region
-    private const int   MaxTotalBytes     = 64 * 1024 * 1024;  // 64 MB total snapshot cap
+    // ±256 MB around the session struct pivot — covers the primary game heap arena.
+    private const nuint ScanRadius       = 256 * 1024 * 1024;
+    private const nuint ScanFloor        = 0x10000;         // never go below user-mode start
+    private const int   MaxBytesPerRegion = 16 * 1024 * 1024;
+    private const int   MaxTotalBytes     = 64 * 1024 * 1024;
 
     [DllImport("kernel32.dll")]
     private static extern nint VirtualQuery(nuint address, out MBI mbi, nuint dwLength);
@@ -48,16 +48,18 @@ internal sealed unsafe class HeapCounterScanner
     private readonly List<(nuint Base, byte[] Data)> _regions = new();
 
     /// <summary>
-    /// Snapshots all writable pages in the low heap. Call at hang-out start.
-    /// Safe to call from the poll thread.
+    /// Snapshots all writable pages within ±256 MB of the session struct.
+    /// Call at hang-out start, passing the resolved session struct address.
     /// </summary>
-    internal void TakeSnapshot(Action<string> log)
+    internal void TakeSnapshot(nuint pivotAddr, Action<string> log)
     {
         _regions.Clear();
-        nuint addr      = ScanLow;
+        nuint scanStart = pivotAddr > ScanRadius ? pivotAddr - ScanRadius : ScanFloor;
+        nuint scanEnd   = pivotAddr + ScanRadius;
+        nuint addr      = scanStart < ScanFloor ? ScanFloor : scanStart;
         int   totalSnap = 0;
 
-        while (addr < ScanHigh && totalSnap < MaxTotalBytes)
+        while (addr < scanEnd && totalSnap < MaxTotalBytes)
         {
             if (VirtualQuery(addr, out MBI mbi, (nuint)Marshal.SizeOf<MBI>()) == 0) break;
 
@@ -71,8 +73,8 @@ internal sealed unsafe class HeapCounterScanner
 
             if (writable)
             {
-                nuint start     = mbi.BaseAddress > ScanLow  ? mbi.BaseAddress : ScanLow;
-                nuint end       = regionEnd        < ScanHigh ? regionEnd       : ScanHigh;
+                nuint start     = mbi.BaseAddress > scanStart ? mbi.BaseAddress : scanStart;
+                nuint end       = regionEnd        < scanEnd   ? regionEnd       : scanEnd;
                 nuint rawBytes  = end > start ? end - start : 0;
                 int   snapBytes = rawBytes > (nuint)MaxBytesPerRegion
                                   ? MaxBytesPerRegion
@@ -91,7 +93,7 @@ internal sealed unsafe class HeapCounterScanner
             addr = regionEnd;
         }
 
-        log($"[HeapScan] Snapshot done: {_regions.Count} regions, {totalSnap / 1024} KB");
+        log($"[HeapScan] Snapshot done: {_regions.Count} regions, {totalSnap / 1024} KB (pivot 0x{pivotAddr:X} ±256MB)");
     }
 
     /// <summary>
