@@ -13,9 +13,9 @@ def test_all_confidants_have_required_fields() -> None:
 
 
 def test_get_confidant_returns_correct_instance() -> None:
-    ann = get_confidant(2)
-    assert ann.name == "Ann Takamaki"
-    assert ann.arcana == "Lovers"
+    ryuji = get_confidant(8)
+    assert ryuji.name == "Ryuji Sakamoto"
+    assert ryuji.arcana == "Chariot"
 
 
 def test_get_confidant_raises_on_unknown_id() -> None:
