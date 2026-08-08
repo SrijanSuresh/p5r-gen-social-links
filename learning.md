@@ -1764,3 +1764,84 @@ unsafe void WriteDialogue(nuint sessionPtr, string text)
 
 This is intentionally left as a placeholder until offset discovery is complete.
 
+---
+
+## Chapter 21 — CI Pipeline: Keeping Both Halves Honest
+
+### Why Two-Language Projects Need CI
+
+Our project is split: a C# Reloaded-II mod (Windows only) and a Python FastAPI server
+(cross-platform). A bug in either half can break the whole system invisibly. Manual
+testing requires launching P5R + the server, which takes minutes and can't run
+unattended. CI closes this gap: every push to the branch triggers automated checks
+that surface regressions in seconds.
+
+### Our GitHub Actions Setup
+
+The `.github/workflows/ci.yml` workflow has two parallel jobs:
+
+```
+┌─────────────────┐     ┌──────────────────┐
+│  python-tests   │     │  dotnet-build    │
+│  ubuntu-latest  │     │  ubuntu-latest   │
+│                 │     │                  │
+│  pip install    │     │  dotnet restore  │
+│  pytest --all   │     │  dotnet build    │
+└─────────────────┘     └──────────────────┘
+         ↑ parallel — neither waits for the other
+```
+
+Both jobs run on `ubuntu-latest` (the cheapest free runner). The .NET build job
+doesn't run the mod in-game — it just confirms the C# compiles cleanly against
+the Reloaded-II NuGet packages.
+
+### Why pytest Instead of In-Game Tests
+
+The Python tests use `MOCK_LLM=1` (via the `client_with_mock` fixture) so they
+never attempt to load a real model. This makes them:
+- **Fast**: ~1s total, no GPU, no model download
+- **Deterministic**: mock responses are hardcoded
+- **Free**: run on GitHub's free tier Ubuntu runners
+
+Real inference tests (requiring a GPU + 4GB model file) are excluded from CI and
+run manually in the development environment before merging.
+
+### Test Coverage Pyramid
+
+```
+          [manual in-game]
+         real P5R + real GPU
+        ─────────────────────
+       [local GPU, no P5R needed]
+      real model, FastAPI endpoints
+     ─────────────────────────────
+    [CI — mock server, 86+ tests]
+   unit + integration + endpoint tests
+  ──────────────────────────────────────
+```
+
+The CI tier covers 86 tests across:
+- `test_queue.py`: InferenceQueue drop policy, stats, clear
+- `test_server.py`: health/ready/stats/model-info/generate endpoints
+- `test_generate_endpoint.py`: validation, session_id, 503 handling
+- `test_integration.py`: full mock round-trips for all 22 confidants
+- `test_prompt_context.py`: system prompt template correctness
+- `test_postprocess.py`: OOC removal, emoji, Japanese, truncation
+- `test_config.py`: ModelConfig validation bounds
+- `test_arcana.py`: roster completeness (22 confidants)
+- `test_mock_responses.py`: per-character canned lines
+- `test_prompt_builder.py`: build_prompt() fields and format
+- `test_tier.py`: rank-to-tier mapping, parametric all 10 ranks
+
+### The dotnet build Gate
+
+The C# build runs `dotnet build` without running any tests — we have no C# unit
+test project because the mod's core logic is tested indirectly through in-game
+observation. The build gate exists to catch:
+- Syntax errors from refactors
+- Missing using directives (exactly what we hit with `ILoggerV2` in `ModLogger.cs`)
+- NuGet package version mismatches after dependency updates
+
+Future improvement: a C# unit test project using `xUnit` that mocks `ILoggerV2` and
+`IReloadedHooks` to test `ModLogger`, `GenConfig`, and `DialogueBridge` in isolation.
+
