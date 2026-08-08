@@ -88,7 +88,7 @@ public class Mod : IModV1
         _logger?.WriteLine(
             $"[P5RGenSocialLinks] Hook: Confidant={snap.ConfidantId} Rank={snap.RankLevel}");
 
-        _bridge!.DispatchAsync(snap, $"Dialogue line {snap.DialogueIndex}");
+        _bridge!.DispatchAsync(snap, ContextBuilder.ReadAndBuild(snap));
     }
 
     // ── Poll loop (fallback) ───────────────────────────────────────────────
