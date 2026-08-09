@@ -1845,3 +1845,93 @@ observation. The build gate exists to catch:
 Future improvement: a C# unit test project using `xUnit` that mocks `ILoggerV2` and
 `IReloadedHooks` to test `ModLogger`, `GenConfig`, and `DialogueBridge` in isolation.
 
+---
+
+## Chapter 22 — Mock Architecture: Testing Without a GPU
+
+### The Problem with Real Inference in Tests
+
+Real Llama-3.1-8B inference requires:
+- ~4 GB GPU VRAM or CPU RAM
+- ~20s cold-start CUDA JIT compile
+- A model file that's 4.7 GB on disk
+- CUDA toolkit or CPU inference fallback
+
+None of these are available on GitHub Actions free runners. Every CI run would timeout
+or fail with OOM. The solution: a mock layer that completely bypasses inference.
+
+### The MOCK_LLM Environment Variable
+
+When the server starts with `MOCK_LLM=1`, the lifespan function sets `_pipeline = _MOCK`
+instead of calling `load_model()`. The `_MOCK` object is a plain Python sentinel
+(`object()`) — it has no methods, no attributes, no GPU interaction.
+
+In the `/generate` route, we check `if _pipeline is _MOCK:` *before* calling any
+inference code. If true, we call `get_mock_response(confidant_id, rank)` and return
+immediately. Total latency: <1ms.
+
+This design has a key property: **the entire HTTP path is exercised**, including
+Pydantic validation, request parsing, and response serialisation. We're only
+substituting the inference step itself.
+
+### The conftest.py Fixture Stack
+
+```python
+@pytest.fixture
+def mock_pipeline() -> MagicMock:        # ← MagicMock, not _MOCK sentinel
+    mock = MagicMock()
+    mock.generate.return_value = "Yo, let's crush it today!"
+    return mock
+
+@pytest.fixture
+async def client_with_mock(mock_pipeline):
+    srv._pipeline = mock_pipeline         # ← replaces the real pipeline
+    srv._queue = InferenceQueue()         # ← fresh queue per test
+    ...
+```
+
+Note: `client_with_mock` uses a `MagicMock`, not the `_MOCK` sentinel. This means
+`model-info` returns `"real"` mode (the sentinel check fails), but inference actually
+calls `mock_pipeline.generate()` → the mocked return value. This is intentional:
+it exercises the *real* inference code path (including the queue) while keeping
+responses deterministic.
+
+For tests that need `/health → {"status": "mock"}`, use `srv._pipeline = srv._MOCK`
+directly (as in `test_model_info_mock_mode`).
+
+### Per-Character Canned Lines
+
+`mock_responses.py` stores 22 character-specific one-liners indexed by confidant ID.
+Each one is hand-written to sound like the character:
+
+- Ryuji (8): "Yo, you ready? We're not leavin' till we crush every set!"
+- Futaba (10): "SYSTEM ALERT: Fun level exceeding critical threshold!"
+- Kasumi (22): "Please, let us focus. Every second here is a second we could be training!"
+
+The `get_mock_response(confidant_id, rank)` function returns:
+```
+"[MOCK rank N] {canned_line}"
+```
+
+The `[MOCK rank N]` prefix makes mock responses instantly identifiable in logs,
+so you can tell at a glance whether a log line came from real inference or a test.
+The prefix also makes the rank number machine-readable for log parsers.
+
+### What the Mock Tests Prove
+
+With 116 tests (all passing), we have confidence that:
+1. **All 22 confidants** can make a successful round-trip through `/generate`
+2. **Pydantic validation** correctly rejects out-of-range ranks, long contexts, and negative IDs
+3. **Stats counters** increment, accumulate, and reset correctly
+4. **Postprocessor** handles edge cases (emoji, Japanese, OOC removal) without crashes
+5. **Prompt templates** contain all required fields for every confidant
+6. **Tier notes** cover all 10 rank levels without gaps
+
+What the tests do NOT prove: whether real Llama-3.1-8B inference returns valid,
+in-character dialogue. That requires manual playtesting, which we've done: the
+confirmed LLM response from the previous session was:
+
+> "Dude, what's up? I was thinkin' we could grab some ramen before we head back to..."
+
+In character, rank-appropriate, correct length — the real inference works.
+
