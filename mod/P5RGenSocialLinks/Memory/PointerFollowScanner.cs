@@ -18,11 +18,14 @@ internal sealed unsafe class PointerFollowScanner
     // Offsets confirmed in Takemi Session 40 StructDiff: pointer-like values flashed here.
     private static readonly int[] PtrOffsets = { 0xE0, 0xE8, 0xF0 };
 
-    // User-mode address range on Windows x64.
-    private const nuint UserModeMin = 0x10000;
-    private static readonly nuint UserModeMax = unchecked((nuint)0x0000_7FFF_FFFF_FFFFul);
+    // User-mode heap range. DLLs load at 0x7FF8_0000_0000 and above; exclude them
+    // so DLL vtable pointers can't evict stable heap targets and reset baselines.
+    private const nuint UserModeMin  = 0x10000;
+    private static readonly nuint HeapAddressMax =
+        unchecked((nuint)0x0000_7F00_0000_0000ul);
 
-    private const int SubScanBytes = 256;
+    // 512 bytes covers sub-object headers (~200 B) + dialogue line counter region.
+    private const int SubScanBytes = 512;
 
     private readonly nuint[] _targets;
     private readonly byte[][] _prev;
@@ -59,8 +62,10 @@ internal sealed unsafe class PointerFollowScanner
 
             nuint candidate = *(nuint*)slot;
 
-            // Ignore garbage / non-heap values; keep any previously captured valid target.
-            if (candidate < UserModeMin || candidate > UserModeMax) continue;
+            // Ignore null, kernel-space, and DLL-image addresses.
+            // HeapAddressMax excludes the 0x7FF8... DLL range so vtable pointers
+            // can't overwrite a stable heap target and reset the cumulative baseline.
+            if (candidate < UserModeMin || candidate >= HeapAddressMax) continue;
             if (candidate == _targets[i]) continue;
 
             _targets[i]     = candidate;

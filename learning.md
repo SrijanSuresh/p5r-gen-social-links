@@ -2456,3 +2456,44 @@ sub-system that the session struct delegates to lives at one of those targets. T
 dialogue counter, being part of the dialogue sub-system, is almost certainly reachable
 from one of these pointers. Scanning 3 × 256 B = 768 B is far cleaner than scanning
 64 MB of heap noise.
+
+---
+
+## Chapter 30 — DLL Address Poisoning and Timer Array Filtering
+
+### How PtrFollow lost the stable target
+
+`PointerFollowScanner.Update()` accepts any user-mode address in the range
+`0x10000–0x7FFF_FFFF_FFFF`. That range includes DLL image sections (`0x7FF8...`).
+
+When the session struct's +0xF0 slot briefly holds a vtable pointer or code pointer
+from a DLL, Update() sees a valid user-mode candidate, overwrites the previous target
+(`0x41DBC05050`), and resets `_hasSnapshot` — which also resets `_hasBaseline`.
+The cumulative history is destroyed. At the mid-session check, no baseline exists.
+
+The fix is a tighter upper bound. Windows x64 loads DLLs at the *top* of user space
+(around `0x7FF80000_00000` and above). Game heap objects live in the `0x40...-0x43...`
+range — well below `0x7F00_0000_0000`. Adding a `HeapAddressMax = 0x7F00_0000_0000`
+ceiling keeps DLL pointers from evicting stable heap targets.
+
+### Why all HeapScan results form regular arrays
+
+Looking at mid-session addresses: `0x423FE55F9E`, `0x423FE55FA2`, `0x423FE55FA6`...
+each exactly 4 bytes apart. These are contiguous fields within a struct array — the
+game's animation or audio sub-system keeps many timer counters in a flat struct array,
+all ticking at the same rate (0.75 Hz in this session). All entries hit the same delta
+(+15 in 20 seconds) and dominate the result set.
+
+The dialogue counter is a *single* value, not an array member. Post-processing the
+scan results with a stride filter — marking any two hits within 48 bytes and aligned
+to a 4-byte stride as array co-members, then removing both — leaves only isolated
+addresses. An isolated byte that went up by some small delta matching the number of
+lines pressed is the counter.
+
+### The extended SubScanBytes
+
+PtrFollow scanned 256 bytes (offsets 0x00–0xFF) of each sub-object. If the sub-object
+header occupies ~200 bytes and the dialogue line index is at offset +0x100 or above,
+it was never diffed. Extending SubScanBytes to 512 (offsets 0x00–0x1FF) gives a full
+512-byte window into each pointed-to sub-object — covering the range where game-engine
+dialogue managers typically store line counters.

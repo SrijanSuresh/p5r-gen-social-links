@@ -117,7 +117,6 @@ internal sealed unsafe class HeapCounterScanner
             for (int pageStart = 0; pageStart < len; pageStart += 4096)
             {
                 nuint pageAddr = baseAddr + (nuint)pageStart;
-                // Re-check readability per page: pages may have been freed since snapshot.
                 if (!MemoryGuard.IsReadable(pageAddr, 1)) continue;
 
                 int pageEnd = pageStart + 4096 < len ? pageStart + 4096 : len;
@@ -130,12 +129,38 @@ internal sealed unsafe class HeapCounterScanner
             }
         }
 
+        // Remove timer arrays: pairs of hits within 48 bytes at 4-byte aligned stride
+        // are co-members of a game timer struct array and are filtered out.
+        // The dialogue counter is a single isolated byte, never part of such arrays.
+        var arrayMembers = new System.Collections.Generic.HashSet<nuint>();
+        for (int a = 0; a < hits.Count; a++)
+        {
+            for (int b = a + 1; b < hits.Count; b++)
+            {
+                ulong diff = hits[b].Addr > hits[a].Addr
+                             ? (ulong)(hits[b].Addr - hits[a].Addr)
+                             : (ulong)(hits[a].Addr - hits[b].Addr);
+                if (diff <= 48 && diff % 4 == 0)
+                {
+                    arrayMembers.Add(hits[a].Addr);
+                    arrayMembers.Add(hits[b].Addr);
+                }
+            }
+        }
+        int arrayCount = 0;
+        if (arrayMembers.Count > 0)
+        {
+            arrayCount = hits.RemoveAll(h => arrayMembers.Contains(h.Addr));
+        }
+
         hits.Sort((a, b) => b.Delta.CompareTo(a.Delta));
 
-        var lines = new List<string>(Math.Min(hits.Count, maxResults));
+        var lines = new List<string>(Math.Min(hits.Count, maxResults) + 1);
+        if (arrayCount > 0)
+            lines.Add($"(filtered {arrayCount} timer-array bytes; {hits.Count} isolated left)");
         foreach (var h in hits)
         {
-            if (lines.Count >= maxResults) break;
+            if (lines.Count >= maxResults + 1) break;
             lines.Add($"0x{h.Addr:X}  {h.Old} → {h.New}  (+{h.Delta})");
         }
         return lines;
