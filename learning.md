@@ -3341,3 +3341,81 @@ The CMM PC and the BF PC are different counters. CE confirmed the BF PC was also
 at `session+0x20` *during the specific BF scene loading event* we were watching —
 but in the steady-state gameplay, what we're reading is the CMM PC.
 
+---
+
+## Chapter 43 — Why the Memcpy Filter Caught Float Data and How Vowel Counting Fixes It
+
+### What we saw in the log
+
+```
+[MemcpyDialogue] src=0x41F0D1973F dst=0x41EE9D11A0 n=280 run=14:
+  "==>>*>L>n>>>>>>>?????;?DDD?L?UUU?]?fff?n?www??DD????UU???..."
+```
+
+Every single logged entry had:
+- count = 280, 288, 384 — multiples of 16 (SIMD alignment)
+- Patterns: `>>>`, `???`, `===`, `fff`, `www`, `DDD`, `UUU` repeating
+- Zero lowercase vowels (a, e, i, o, u)
+
+None of it was dialogue.
+
+### Why IEEE 754 floats look like printable ASCII
+
+A 32-bit float in P5R's vertex buffers commonly looks like:
+
+```
+  0.0f  → 00 00 00 00   (not printable)
+  0.5f  → 00 00 00 3F   → '?' = 0x3F is printable
+  1.0f  → 00 00 80 3F   → '?' printable
+  2.0f  → 00 00 00 40   → '@' printable
+  0.25f → 00 00 80 3E   → '>' printable
+  0.333f→ AA AA AA 3E   → '>' + 0xAA (non-printable)
+```
+
+The UPPER byte of small positive floats is always 0x3E–0x44, which maps exactly to
+`>?@ABCD` — all printable. A vertex buffer of N×(x,y,z) floats produces a dense run
+of printable `>`, `?`, `@`, `A`, `B`, `C`, `D` bytes. Our `maxRun ≥ 10` filter accepted
+these as "looks like text."
+
+Additionally, colour channels stored as float (0.0–1.0) produce the same 0x3F–0x40
+range, and UV coordinates produce `<`, `=`, `>`, `?` (0x3C–0x3F). This accounts for
+the repeated `fff` (0x66 = 'f' is the exponent byte for floats near 2²³) and `www`
+(0x77 = 'w').
+
+### Why English dialogue text is different
+
+English text like "It's a gym over in Shibuya":
+
+```
+I  t  '  s     a     g  y  m     o  v  e  r     i  n     S  h  i  b  u  y  a
+49 74 27 73 20 61 20 67 79 6D 20 6F 76 65 72 20 69 6E 20 53 68 69 62 75 79 61
+```
+
+- Has SPACES (0x20) scattered throughout (roughly every 4–6 bytes)
+- Has many LOWERCASE VOWELS: a=0x61, e=0x65, i=0x69, o=0x6F, u=0x75
+- "gym over in Shibuya" alone contains: a, o, e, i, i, u, a = **7 vowels**
+
+Float vertex data in the `>?@ABC` range (0x3E–0x44) contains NONE of: a, e, i, o, u.
+Colour/UV data in the `<=>?` range (0x3C–0x3F) also contains none.
+
+### The fix: require ≥ 3 lowercase vowels in the copied content
+
+```csharp
+int vowels = 0;
+for (nuint i = 0; i < count; i++)
+{
+    byte b = d[i];
+    if (b == 'a' || b == 'e' || b == 'i' || b == 'o' || b == 'u') vowels++;
+}
+if (vowels < 3) return;
+```
+
+This single check eliminates every false positive from the previous run (they all had
+0 vowels) while passing any real English dialogue sentence (minimum ~2–3 vowels even
+for the shortest lines).
+
+### Secondary fix: reduce max count from 512 to 150
+
+A P5R dialogue line is never 384 bytes of text. The largest lines observed are ~80
+characters. Setting max count to 150 eliminates the 280/288/384-byte vertex copies
+even before the vowel check runs.
