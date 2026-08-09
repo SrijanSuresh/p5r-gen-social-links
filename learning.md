@@ -1935,3 +1935,201 @@ confirmed LLM response from the previous session was:
 
 In character, rank-appropriate, correct length — the real inference works.
 
+---
+
+## Chapter 23 — Cheat Engine Recon: Script Pool, Line Counter, and the Pre-Load Problem
+
+### What We Found
+
+A live CE session against P5R during Ryuji's Scene 51 (gym hang-out) revealed:
+
+**1. The 16-bit game timer at +0x20/+0x21**
+The StructDiff output showed `+0x20` changing every 500ms poll tick by ~60 units,
+with `+0x21` catching the carry overflow. Together they form a continuously running
+16-bit little-endian clock — NOT a dialogue-line counter. The CMM session struct's
+first 64 bytes contain timing state, not line progression.
+
+**2. The dialogue line counter at 0x006FFC28**
+CE's "increased by 1" scan + "Find out what writes to this address" revealed:
+- Address `0x006FFC28` holds a byte that increments once per dialogue advance
+- The write instruction: `mov [rcx+18], eax` at `0x7FFA995C2928` (a system/middleware DLL)
+- This means the counter sits at offset `+0x18` inside a struct based at `0x006FFC10`
+- Writes stop when the CMM session ends — confirming it's Social Link specific
+
+**3. The pre-loaded script text pool**
+A CE string scan for on-screen dialogue found the text at `~0x41DE9104BA` — about
+1.6MB past the session struct. Crucially, scrolling around that address revealed
+multiple dialogue lines stored **contiguously**. The text doesn't change in-place
+when you advance a line; instead, the game moves a read-pointer forward through the pool.
+
+### The Pre-Load Problem
+
+This is the central challenge for write-back. In Unreal or Unity games, a "current
+dialogue" string variable gets overwritten on each line. In P5R's BF script system:
+
+```
+[Script Text Pool — loaded at hang-out start]
+  offset 0x000: "Yo, you ready? We're not leavin'...\0"
+  offset 0x030: "Man, I've been thinking about...\0"
+  offset 0x060: "Hey, you think we can actually...\0"
+  ...
+```
+
+A read-pointer (somewhere near `0x006FFC10`) advances through this pool. The game
+never "writes" a new string — it just reads further ahead.
+
+**Consequence for write-back**: we cannot replace text in real-time as each line
+appears. We must overwrite entries in the pool *before* the player reaches them —
+at hang-out start. This means:
+1. Detect hang-out (we already do this)
+2. Immediately generate 2-3 LLM lines for the opening exchange
+3. Find the text pool address and overwrite specific offsets
+4. Player sees our text when they advance
+
+### Why the Pool Address Isn't Fixed
+
+`0x41DE9104BA` is a heap allocation — it changes every game restart. To find it
+reliably we need a pointer chain from a stable root (a static global or the session
+struct). That pointer chain requires Ghidra: we trace from `0x006FFC10` (the counter
+struct) back through whatever holds a reference to it, until we hit a module-relative
+static offset we can hardcode.
+
+### Session Timing Constraint
+
+The CMM session struct deallocates *before* the hang-out scene fully ends — confirmed
+when the mod logged `Hang-out ended` while gym dialogue was still playing on screen.
+This means our write-back window is the **opening phase** of each hang-out, not the
+closing transition. All LLM writes must complete before the first rank-up animation.
+
+### What This Unlocks Right Now
+
+Even without the text pool pointer, we gained a per-line trigger: when `0x006FFC28`
+increments, a new dialogue line just appeared. Wiring this into the poll loop replaces
+our once-per-session dispatch with a true per-line dispatch — closer to the full vision.
+
+
+---
+
+## Ch25 — README as Architecture: How to Document a Multi-Process Systems Project
+
+Every README is simultaneously an introduction, a specification, and a social contract
+with future collaborators (including yourself three months from now). A project like
+this one has unusual documentation requirements because it spans two programming
+languages, two OS processes, a proprietary binary format (BF scripts), live memory
+addresses that change on restart, and a GPU-side inference pipeline — none of which
+fits into a standard "clone, npm install, run" template.
+
+### Two Audiences, One Document
+
+The first design decision is audience stratification. This project has two distinct
+reader types who need completely different information:
+
+1. **The technically curious non-programmer** — a P5R fan who understands what Social
+   Links are and why generative dialogue would be interesting, but has never compiled
+   C# or traced a pointer chain. They need a 3-sentence "what it does" that anchors
+   in something concrete (the actual Ryuji output), not a component diagram.
+
+2. **The systems engineer** — someone who wants to clone and run it, or who's looking
+   to contribute write-back support. They need: exact pointer chains, struct offsets
+   with provenance, what the two processes are and how they communicate, and what's
+   known vs. what's still speculation.
+
+The mistake most technical READMEs make is writing for only the second audience and
+burying the lede with component names that mean nothing before the "why" is established.
+The structure we chose: hook → what it does (plain English) → architecture → phases →
+technical details → setup. This lets both audiences exit at their depth of interest.
+
+### The Mermaid Diagram as a Strict Specification
+
+GitHub renders Mermaid natively in markdown, which means a `flowchart LR` block is
+the right choice for architecture documentation in 2024: no external CDN, no image
+to regenerate, and the source is version-controlled alongside the code it documents.
+
+The key discipline when drawing the diagram is **encoding what's unknown**:
+
+```
+bridge -.->|"write-back (Phase 3)"| writer
+writer -.-> pool -.-> renderer
+```
+
+The dashed edge (`-.->`) is Mermaid's syntax for a "dotted" connection, which we use
+to distinguish "not yet implemented" paths from confirmed data flows. This isn't a
+purely aesthetic choice — it forces the diagram to reflect the actual system state
+rather than an idealized future version. Any reader who tries to wire up write-back
+can immediately see where the gap is, rather than discovering it after cloning.
+
+The corresponding `style` declarations reinforce it:
+
+```
+style writer stroke-dasharray: 5 5
+style pool stroke-dasharray: 5 5
+```
+
+Using CSS inline styles on individual nodes lets us visually differentiate confirmed
+components (solid border) from in-progress ones (dashed border) without adding a
+separate legend.
+
+### Phase Narrative vs. Feature Inventory
+
+Most project READMEs list features as a flat inventory ("✓ supports 22 confidants").
+We chose a phase narrative instead, because this project is fundamentally about a
+research process — each phase required new reverse-engineering techniques:
+
+- Phase 1 needed Ghidra + hex dump to confirm struct offsets
+- Phase 2 needed benchmarking to discover that auto-gptq was the wrong backend
+- Phase 3 needs Cheat Engine + Ghidra to trace the text pool pointer chain
+
+The phase structure communicates *how the project was built*, not just *what it does*.
+For a learning-focused project this is the primary form of documentation: it encodes
+the intellectual journey, which is at least as valuable as the final artifact.
+
+### Memory Layout Tables and Provenance
+
+Every hex offset in the README carries its source of truth:
+
+```
++0x0B  byte    RankLevel       (rank before this session; Ryuji went 4→5) CONFIRMED
+```
+
+The `CONFIRMED` tag signals that this offset was validated against a live game session,
+not inferred from static analysis. Offsets without it should be tagged `INFERRED` or
+`UNVERIFIED`. This habit prevents the classic reverse-engineering documentation failure
+where a hex dump from a specific version is silently assumed to be universal — the
+offset may change between P5R patches.
+
+The pointer chain line:
+
+```
+Static pointer chain: [p5r.exe + 0x2A63EF0] → [+0x48] → session*
+```
+
+follows a convention: `module + static_offset → [dereference chain]`. The `[]` syntax
+for a dereference is borrowed from C — `[addr]` means "read the pointer stored at this
+address." This notation is compact enough to include inline and unambiguous to anyone
+who has done Windows RE work.
+
+### What Makes a README Honest
+
+The hardest discipline is accurately representing the project's current state, not the
+planned state. In this README:
+
+- Phase 3 says "write-back stub — needs `bufferPtr` from the pointer chain" — not
+  "write-back supported"
+- The Mermaid diagram has dashed edges to the renderer
+- The setup says "NVIDIA GPU with ≥8 GB VRAM" as a hard requirement, not an asterisk
+
+A README that overpromises is a form of technical debt: it creates a gap between
+expectation and reality that future contributors have to debug before they can start
+actual work. The setup instructions should describe exactly the state of the code at
+the time of writing — if write-back isn't done, the instructions don't include it.
+
+### The `learning.md` Reference
+
+Linking to `learning.md` from the README serves one specific purpose: it signals to
+readers who want to understand *why* decisions were made (why llama-cpp-python instead
+of auto-gptq? why a single-slot queue? what is the BF script format?) that there is a
+document for them. It keeps the README concise by not trying to explain everything, and
+it keeps `learning.md` motivated by giving it an audience.
+
+This is the standard pattern for research-oriented projects: the README is the contract,
+the journal is the reasoning.

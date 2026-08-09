@@ -145,7 +145,8 @@ public class Mod : IModV1
 
     // ── Poll loop (fallback + struct discovery) ───────────────────────────
 
-    private readonly StructDiffScanner _diffScanner = new();
+    private readonly StructDiffScanner   _diffScanner    = new();
+    private readonly LineCounterMonitor  _lineMonitor    = new();
 
     private void StartPollLoop()
     {
@@ -165,6 +166,7 @@ public class Mod : IModV1
                 if (lastSession != 0)
                 {
                     _diffScanner.Reset();
+                    _lineMonitor.Deactivate();
                     _bridge!.ResetSession();
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
                 }
@@ -176,6 +178,7 @@ public class Mod : IModV1
             {
                 lastSession = session;
                 _diffScanner.Reset();
+                _lineMonitor.Activate();
 
                 SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
                 if (snap is null) continue;
@@ -189,7 +192,18 @@ public class Mod : IModV1
                 continue;
             }
 
-            // Same session — diff the struct to find per-line changing fields.
+            // Per-line trigger: fire LLM when dialogue line counter advances.
+            if (_lineMonitor.HasAdvanced())
+            {
+                SocialLinkSnapshot? lineSnap = SocialLinkReader.TryReadFromPtr(session);
+                if (lineSnap is not null)
+                {
+                    _modLog!.Info($"[P5RGenSocialLinks] Line advanced (counter={_lineMonitor.CurrentValue()}) — dispatching LLM.");
+                    _bridge!.DispatchAsync(lineSnap, ContextBuilder.Build(lineSnap));
+                }
+            }
+
+            // Struct diff — passive discovery of per-line changing fields.
             if (_cfg.StructDiffEnabled)
             {
                 string? diff = _diffScanner.Diff(session);
