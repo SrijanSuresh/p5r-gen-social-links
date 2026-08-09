@@ -34,3 +34,28 @@ def test_all_known_confidants_have_mock_lines() -> None:
 
 def test_mock_lines_count_matches_roster() -> None:
     assert len(MOCK_LINES) == len(CONFIDANTS)
+
+
+def test_mock_response_format_has_prefix() -> None:
+    """Every mock response must start with [MOCK rank N] for easy identification in logs."""
+    for cid in CONFIDANTS:
+        for rank in (1, 5, 10):
+            result = get_mock_response(cid, rank)
+            assert result.startswith(f"[MOCK rank {rank}]"), (
+                f"Confidant {cid} rank {rank} response missing prefix: {result[:30]}"
+            )
+
+
+def test_mock_lines_all_non_empty() -> None:
+    """All 22 canned lines must have actual content."""
+    for cid, line in MOCK_LINES.items():
+        assert len(line.strip()) > 5, f"Mock line for confidant {cid} is too short"
+
+
+def test_mock_response_different_ranks_same_format() -> None:
+    """Rank number in prefix should vary; content should stay the same canned line."""
+    r5 = get_mock_response(8, 5)
+    r9 = get_mock_response(8, 9)
+    assert "[MOCK rank 5]" in r5
+    assert "[MOCK rank 9]" in r9
+    assert r5 != r9  # different rank numbers make them distinct
