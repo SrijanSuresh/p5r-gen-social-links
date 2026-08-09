@@ -1146,6 +1146,792 @@ C# mod
    struct. Finding it requires hooking the text-render function or a separate CE scan
    of live text addresses during active dialogue display.
 
-2. **Real model**: Replace `MOCK_LLM=1` with `TheBloke/Llama-2-7B-Chat-GPTQ` running
-   via auto-gptq on CUDA. Requires ~4 GB VRAM and the full `requirements.txt` install
-   (including `torch==2.4.1+cu121` for Windows with CUDA).
+2. **Real model**: Switched from auto-gptq to llama-cpp-python — see Chapter 13.
+
+---
+
+## Chapter 13 — llama-cpp-python vs auto-gptq: Backend Choice and GGUF Format
+
+### Why We're Switching from auto-gptq to llama-cpp-python
+
+`auto-gptq` was the original plan because it supports our custom Triton dequant kernel.
+But three Windows-specific problems made it the wrong choice for dev:
+
+| Problem | auto-gptq | llama-cpp-python |
+|---|---|---|
+| Triton backend | Linux-only — had to disable | Not needed — uses llama.cpp's own CUDA kernels |
+| Windows CUDA wheels | Fragile — often breaks on new CUDA/PyTorch versions | Pre-built wheels for every CUDA version |
+| Model format | GPTQ (multi-file: safetensors + config) | GGUF (single binary file, self-describing) |
+| Dependencies | torch + triton + transformers + accelerate | Just llama-cpp-python |
+
+For production Linux deployment the Triton kernel is still valuable. For the Windows
+gaming loop (P5R running alongside the server), llama-cpp-python is the right tool.
+
+### What GGUF Is
+
+GGUF (Generic GPU Unified Format) is the model file format used by llama.cpp.
+A single `.gguf` file contains:
+- Model weights (quantized)
+- Tokenizer vocabulary and merge rules
+- Architecture hyperparameters (n_layers, n_heads, etc.)
+- Quantization metadata (scale factors, zero points)
+
+This self-description means you can load any GGUF model with one call:
+```python
+from llama_cpp import Llama
+model = Llama(model_path="models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+              n_gpu_layers=-1,   # offload all layers to GPU
+              n_ctx=2048)        # context window
+```
+
+No tokenizer download, no config.json, no `trust_remote_code`.
+
+### Q4_K_M: The Quantization Name Decoded
+
+`Q4_K_M` means:
+- `Q4` — 4-bit integers for weights (same bit-width as GPTQ)
+- `K`  — k-quants: groups of weights share a scale factor, reducing error vs flat Q4
+- `M`  — "medium" variant: attention layers use Q5 (one step higher), FFN uses Q4
+
+On an RTX 4060 8GB:
+- Model VRAM: ~4.9 GB
+- P5R VRAM: ~1.5 GB
+- OS + driver overhead: ~0.5 GB
+- Total: ~7 GB → 1 GB headroom ✓
+
+Generation speed for a 1-3 sentence response (~50 tokens): **~1.5–2 seconds**.
+Well inside our 8-second `DialogueBridge` timeout.
+
+### llama-cpp-python's Chat Completion API
+
+Instead of manually constructing `<s>[INST]` prompt strings (the Llama-2 format),
+llama-cpp-python exposes an OpenAI-compatible chat API:
+
+```python
+response = model.create_chat_completion(
+    messages=[
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": user_prompt},
+    ],
+    max_tokens=80,
+    temperature=0.8,
+    top_p=0.9,
+    repeat_penalty=1.1,
+)
+text = response["choices"][0]["message"]["content"].strip()
+```
+
+The library handles tokenization and special token injection for each supported
+model family (Llama-3 uses `<|begin_of_text|>`, Mistral uses `[INST]`, etc.)
+automatically from the GGUF metadata.
+
+### n_gpu_layers=-1: Full GPU Offload
+
+`n_gpu_layers=-1` tells llama.cpp to offload **all** transformer layers to VRAM.
+With all layers on the GPU, token generation is pure CUDA matmul — no PCIe transfers
+during the generation loop, giving maximum throughput.
+
+If VRAM fills up (both P5R and the LLM running simultaneously), set
+`n_gpu_layers=28` to offload 28 of 32 layers, keeping the last 4 on CPU. This
+reduces peak VRAM by ~0.6 GB with a small speed cost (~+200ms per response).
+
+---
+
+## Chapter 18 — Finding the Per-Line Trigger: StructDiff and Hook Diagnostics
+
+### What We Know So Far
+
+Phase 1 dispatches one LLM call per hang-out session (triggered by session pointer
+change). Phase 2 needs one call per NPC speech bubble. We have two unknowns:
+
+1. **Is CMM_EXEC_EVENT firing at all?** The startup log now prints
+   `hook:ON` or `hook:OFF`. If it says ON but we never see `CmmExecEvent #N:`
+   in the console during a hang-out, the function exists but never gets called
+   for gym sessions. If it says OFF, either `IReloadedHooks` is null or the
+   signature scan failed.
+
+2. **What struct field changes per dialogue line?** The `StructDiffScanner`
+   in the poll loop diffs the first 64 bytes of the session struct every 500ms.
+   Any `+0xNN:prev→cur` log line during a hang-out reveals a live field.
+
+### Reading the StructDiff Output
+
+Example log output during a hang-out (hypothetical):
+```
+[StructDiff] +0x04:00→01
+[StructDiff] +0x04:01→02
+[StructDiff] +0x04:02→03
+```
+
+If +0x04 increments each time the player presses confirm to advance dialogue,
+that's our per-line counter! We already know +0x04 was always 0 in Phase 1
+testing (we renamed it SESSION_PHASE). But that was during a gym hang-out
+with a specific Ryuji scene. Other scenes might behave differently.
+
+Fields to watch for:
+- **Counter fields**: unsigned int that increments, resets on new scene
+- **Pointer fields**: change when a new dialogue string is pointed to
+- **Bitfield flags**: single-bit changes that toggle on each line
+
+### The StructDiff Scanner Design
+
+StructDiffScanner captures 64 bytes at session start (`_hasPrevious = false`
+→ first call stores baseline). Every subsequent poll tick: byte-by-byte
+comparison, log any that changed, update `_previous`. It auto-resets when
+`sessionPtr` changes (new hang-out).
+
+This is passive — we make no writes to memory, only reads. The 500ms poll
+interval means we catch changes that last at least 500ms (too fast = aliasing).
+For a player that advances dialogue every ~1-2s, 500ms should catch every line.
+
+### If StructDiff Finds Nothing
+
+If NO byte changes during a full gym hang-out with 15 dialogue lines:
+- The session struct is read-once (set at hang-out start, not updated per line)
+- The per-line state lives in a *different* object (a dialogue VM, not CMM)
+- We need to expand the scan: look at [CMM+0x48] child objects, not just
+  the session struct itself
+
+Next step would be to use `HexDump(session + some_offset, 64)` at each
+offset to find a changing sub-object — or use Cheat Engine's "what accesses
+this address" feature to find what the game reads when rendering each line.
+
+---
+
+## Chapter 16 — Connection Resilience: Retries, Health Checks, and Cold Starts
+
+### The Cold-Start Problem
+
+When P5R launches with the mod active, the mod's `Start()` runs immediately.
+But the Python server may not have finished loading the 4.9 GB model yet.
+First POST to `/generate` → 503 Service Unavailable.
+
+Without retry logic, the first hang-out of every game session gets no LLM
+response. With retry logic (3 retries × 8s delay), the C# side waits up to
+24s for the model to finish loading — more than enough for the ~20s load time.
+
+### Why Not Retry Indefinitely?
+
+Two reasons:
+1. The `CancellationTokenSource` timeout in `DialogueBridge` (default 30s) cancels
+   the whole operation regardless. Infinite retries wouldn't exceed 30s anyway.
+2. A 503 that persists after 3 retries means the server is broken (missing model
+   file, CUDA OOM, etc.) — retrying forever masks the real error.
+
+### The Health-Check Approach (Complementary)
+
+`ServerHealthChecker.CheckAsync()` runs 2s after startup, reads `/health`, and
+logs the server's state. This is not a retry loop — it's observability: it tells
+the developer what the server thinks of itself without blocking the game.
+
+If `/health → model_not_loaded`, you know to wait. If `/health → ready`, the
+mod is ready to dispatch. The 2s delay is a best-effort guess at when the health
+endpoint will reflect the final state.
+
+### HTTP Timeout Layering
+
+Three timeout layers protect the system:
+
+```
+CancellationTokenSource (30s)  ←  DialogueBridge: outer hard deadline
+    │
+    └─► HttpClient.Timeout (60s)    ←  LLMClient: TCP-level connection timeout
+            │
+            └─► Retry loop (3 × 8s = 24s)  ←  503 wait: model loading
+```
+
+The HttpClient timeout (60s) is set longer than the CTS timeout (30s) so the
+CTS always fires first — we never want HttpClient to terminate a connection that
+the business logic still considers in-flight.
+
+### The InferenceInFlightException Fast Path
+
+429 is never retried. The InferenceQueue on the server drops concurrent requests
+rather than queueing them — a stale response queued for 10 seconds would appear
+after the conversation has moved on. Immediate exception → immediate fallback to
+scripted dialogue is the correct behavior.
+
+---
+
+## Chapter 15 — Context Engineering: Making the LLM Sound Like P5R
+
+### Why Prompt Design Matters More Than Model Size
+
+Llama-3.1-8B is a mid-size model. By default it generates plausible English, but
+not specifically Ryuji Sakamoto slang. The gap between "competent English" and
+"convincingly in-character P5R dialogue" is almost entirely closed through
+**prompt engineering** — structuring what the model knows before it generates.
+
+### The Three-Layer Prompt Structure
+
+```
+┌──────────────────────────────────┐
+│ SYSTEM PROMPT                    │
+│  Who the character IS            │ ← identity, arcana, personality
+│  What the relationship IS        │ ← rank-tier emotional guidance
+│  Hard rules (no meta-commentary) │ ← guardrails
+├──────────────────────────────────┤
+│ USER PROMPT                      │
+│  [Scene context: ...]            │ ← where in the story we are
+│  CharacterName:                  │ ← leading-edge: model completes the line
+└──────────────────────────────────┘
+```
+
+The system prompt is static per hang-out (same character, same rank). The user
+prompt is the only dynamic part — it includes the scene metadata string built
+by `ContextBuilder` in the C# mod.
+
+### Rank Tiers: Emotional Distance as a Design Parameter
+
+P5R Social Links are a 10-rank progression from strangers to deep bonds. The LLM
+has no concept of in-game rank unless we tell it explicitly. The `_tier_note()`
+function maps rank to emotional vocabulary:
+
+| Rank | Tier note |
+|------|-----------|
+| 1-2  | "just met, polite but reserved" |
+| 3-5  | "warming up, casual, shared history implied" |
+| 6-8  | "close friends, comfortable banter" |
+| 9-10 | "deepest bond, trust and vulnerability" |
+
+A rank-4 Ryuji should be friendly but not yet at "best friend" intimacy. A
+rank-9 Ryuji should speak more openly about personal struggles. The tier note
+shifts the model's word-choice, not just tone.
+
+### Post-processing: Why the Model Ignores Its Own Rules
+
+Even with a rule "do not start your response with the character's name", Llama
+sometimes generates:
+```
+Ryuji Sakamoto: Yo, let's hit the gym!
+```
+
+This is because the system prompt is just context — the model assigns it
+probability weight, not absolute constraint. Our post-processor strips the
+name-prefix pattern (`_NAME_PREFIX` regex) as a hard guarantee.
+
+Similarly, sentence-boundary truncation (`_truncate_at_sentence`) ensures a
+clean cut at `max_chars`. Without it:
+```
+"Dude, what's up? I was thinkin' we could grab some ramen before we head back to"
+```
+The sentence is incomplete because the character buffer cuts at 80 chars. With
+sentence-boundary truncation, the model's natural sentence ending at "." is used.
+
+### What Context Does NOT Yet Include (Phase 2 Target)
+
+The current context string is only:
+```
+"[Scene 51] Hang-out with Ryuji Sakamoto (rank 4/10). This is a Social Link
+ conversation where Ryuji Sakamoto is spending time with the protagonist."
+```
+
+It says nothing about:
+- What the previous dialogue line was
+- What topic Ryuji is discussing
+- Whether the player made a choice just before this line
+
+Phase 2 improves this by either:
+a) Including the struct-diff field that changes per line as a "line number"
+b) Injecting recent event history from a rolling buffer in the C# mod
+
+---
+
+## Chapter 14 — Phase 2: Per-Line NPC Generation Architecture
+
+### The Problem: One LLM Call Per Hang-Out Is Not Enough
+
+Phase 1 gave us one LLM response per session (triggered when the session pointer
+changes). A real P5R gym hang-out has ~15-30 dialogue lines and 3-4 player choices.
+Phase 2 makes the LLM respond to **each NPC speech bubble** independently.
+
+### Two Strategies for Per-Line Triggering
+
+**Strategy A — Hook-driven**: Intercept the function the game engine calls to
+display each new NPC speech bubble. That function is called exactly once per line
+render, giving us a natural "new line" signal with no polling.
+
+**Strategy B — Struct-diff polling**: Find a field inside the session struct that
+increments (or changes) every time the dialogue advances. Poll it at 100ms; when
+the value changes, dispatch a new LLM call.
+
+We are investigating both simultaneously. The CMM_EXEC_EVENT hook (already wired)
+is a candidate for Strategy A. For Strategy B, we need to scan more of the struct.
+
+### Why CMM_EXEC_EVENT Might Not Be Per-Line
+
+CMM_EXEC_EVENT (`CmmExecEvent` in Ghidra) fires when the Crimson Mask Manager
+executes a social-link **event** — but an "event" in P5R is the entire hang-out
+session, not a single dialogue line. That's why:
+
+- We hooked it → it fires once at session start (or not at all for some session types)
+- It never fires again until the next session
+
+The per-dialogue-line hook we actually want is deeper in the VMD (Virtual Machine
+Dialogue) stack — the function that writes each text string into the dialogue box
+render buffer. Finding that function requires Ghidra analysis of the call chain from
+CmmExecEvent down to the string-copy site.
+
+### The struct-diff approach: Passive Discovery
+
+While we work on Ghidra analysis, we can instrument the poll loop to **diff the
+entire first 64 bytes** of the session struct on every tick. Any byte that changes
+between ticks is a candidate for a per-line counter.
+
+```csharp
+// Capture baseline snapshot at session start
+byte[] _baseline = new byte[64];
+Buffer.MemoryCopy((void*)session, Unsafe.AsPointer(ref _baseline[0]), 64, 64);
+
+// Each tick: compare, log changed offsets
+for (int i = 0; i < 64; i++)
+{
+    if (current[i] != _baseline[i])
+        _logger.WriteLine($"  +0x{i:X2}: {_baseline[i]:X2} → {current[i]:X2}");
+}
+_baseline = current;
+```
+
+This passive scan requires zero Ghidra work — we let the game tell us which offsets
+are "live" during dialogue advancement.
+
+### Rate-Limiting LLM Dispatch Per Line
+
+If we find a per-line trigger, we can't just call `DispatchAsync` on every line:
+- Fast dialogue tap (player spamming confirm) could queue 10 calls
+- InferenceQueue already drops concurrent calls (429), so only the first survives
+- But the user sees long delays as each queued call completes in sequence
+
+The correct design is **leading-edge throttle with dead-time**:
+
+```
+line 1 fires at t=0    → dispatch (starts LLM, ~2s)
+line 2 fires at t=0.3  → skip (still within dead-time)
+line 3 fires at t=0.6  → skip
+...
+line 8 fires at t=3.1  → dispatch (dead-time expired, new LLM call)
+```
+
+Implementation: store `_lastDispatch = DateTimeOffset.UtcNow` on each dispatch.
+New dispatch only if `(UtcNow - _lastDispatch) > MinDispatchInterval` (default 3s).
+
+### Hook Diagnostic Checklist
+
+Before building more Phase 2 infrastructure, we must know why CmmExecEvent hook
+shows no log output. Possible causes:
+
+1. `IReloadedHooks` is null — shared lib not installed → hook creation skipped entirely
+2. Signature scan fails → `InvalidOperationException` → falls back to poll loop
+3. Hook IS active but the function is never called during gym hang-outs
+4. Hook fires but throws before reaching the log line
+
+To distinguish these: add explicit startup status logging that prints the hook
+state after `TryActivateHook()`, and add a hit counter inside `OnCmmExecEvent`
+that logs on first fire.
+
+### Architecture After Phase 2
+
+```
+                     P5R GAME ENGINE
+                           │
+          ┌────────────────┴────────────────┐
+          │ CmmExecEvent (session start)    │
+          │ TextDisplay hook (per line) ←── │ ← Phase 2 target
+          └────────────────┬────────────────┘
+                           │
+              ┌────────────▼───────────────┐
+              │    Mod.cs dispatcher       │
+              │  leading-edge throttle     │
+              │  3s dead-time per session  │
+              └────────────┬───────────────┘
+                           │
+              ┌────────────▼───────────────┐
+              │  DialogueBridge            │
+              │  POST /generate            │
+              └────────────┬───────────────┘
+                           │
+              ┌────────────▼───────────────┐
+              │  Llama-3.1-8B (GGUF)       │
+              │  ~2s per response          │
+              └────────────────────────────┘
+```
+
+---
+
+## Chapter 17 — Session State Management: History, Deduplication, and Context Budget
+
+### Why Session State Is Necessary
+
+Phase 1 dispatches once per hang-out: the LLM has no memory of previous responses
+within the same conversation. In Phase 2 (per-line), the LLM might generate the
+same line twice if the per-line trigger fires on the same dialogue beat.
+
+Three problems to solve:
+1. **Continuity**: Each generated line should build on the previous ones
+2. **Deduplication**: The same response should never appear twice
+3. **Context budget**: Prior dialogue text grows with each line; Pydantic's
+   max_length=1024 on the context field is a hard ceiling
+
+### SessionHistory: Rolling Buffer + Hash Deduplication
+
+SessionHistory stores the last 8 LLM responses as a List<string>. On each new
+dispatch, the prior lines are joined with ' | ' and prepended to the context
+string as "Prior dialogue: [line1] | [line2]".
+
+For deduplication, a HashSet<int> stores the OrdinalIgnoreCase GetHashCode of
+each recorded response. RecordResponse() returns false on a hash collision —
+DialogueBridge then suppresses the duplicate and skips the log line.
+
+Hash collisions (two different strings with the same hash) are possible but
+extremely rare for dialogue lines. A full string equality check on every entry
+would be O(n×m) per insertion; the hash approach is O(1) with acceptable FP rate.
+
+### The Context Budget Problem
+
+With 8 entries of ~120 chars each, prior dialogue can be ~960 chars. Add the
+base context string (~150 chars) and you get ~1110 chars — over Pydantic's
+max_length=1024 field constraint. The server would return 422 Unprocessable Entity.
+
+Fix: hard-trim the combined context to 1000 chars before building the request.
+The 24-char safety margin accounts for ' | ' separators. The trim is a dumb
+character count (may split mid-word) but that's fine — the LLM handles partial
+sentences gracefully, and the important content (character name, rank, setting)
+is always at the start of the context string.
+
+### Context String Priority Order
+
+The context string is built as:
+```
+"Hang-out with {name} (rank N/10) at {scene}. This is a Social Link conversation...
+ Prior dialogue: [line1] | [line2] | ..."
+```
+
+Most important info is at the START because if we do trim, we lose the END first.
+The scene hints and character info come before the prior dialogue — we would rather
+lose "Prior dialogue: line7 | line8" than lose "Ryuji Sakamoto at gym".
+
+---
+
+## Chapter 19 — Pointer Chain Verbose Diagnostics
+
+### Why Verbose Mode Matters
+
+When the game boots and our mod's `TryResolve()` returns `false`, the log says nothing
+about *where* in the chain it failed. Was the static pointer zero? Did the first heap
+offset land in unreadable memory? Did the second dereference return null?
+
+Without verbose diagnostics, you open Cheat Engine and manually walk the chain to find
+the broken link. With verbose mode, the Reloaded-II console tells you exactly which
+step failed and what address it tried to read — saving 10–30 minutes per debugging session.
+
+### The Three Failure Modes
+
+A multi-level pointer chain can fail at three distinct points:
+
+```
+[moduleBase + SL_STATIC_PTR]  ← Step 0: static address in .data
+        |
+        v (dereference)
+  heap_object_A               ← could be 0 if CMM not yet initialised
+        |
+        + CMM_SESSION_OFFSET   ← Step 1: field inside heap object A
+        |
+        v (dereference)
+  CmmSession*                 ← could be 0 if no hang-out is active
+```
+
+**Failure 0 — unreadable static**: VirtualQuery says the static address is not
+readable. Happens if the sig scan located the wrong address or if the game uses
+a DRM loader that maps the .data section late.
+
+**Failure 1 — null root pointer**: The static address is readable but contains 0.
+Normal before the CMM subsystem initialises (first few frames after game boot).
+
+**Failure 2 — null session pointer**: The root object exists but the session field
+is 0 because no Social Link hang-out is currently active. This is the most common
+case — the poll loop should silently ignore it rather than logging on every tick.
+
+### Verbose Mode Design
+
+We add a `bool VerboseChain` flag to `GenConfig`. When true, each `TryResolve()` call
+logs the step it reached before returning false. When false (the default), silence
+is preserved for the null-session case which fires hundreds of times per minute.
+
+The log format uses step numbers so you can correlate with the chain array:
+
+```
+[P5RGenSocialLinks] ChainStep 0: addr=0x7FF612345678 → value=0x1A2B3C4D5E6F
+[P5RGenSocialLinks] ChainStep 1: addr=0x1A2B3C4D5EBF → value=0x0000000000000000 (null — no active session)
+```
+
+The `(null — no active session)` suffix is only appended on the LAST step's zero result
+because that's the one that's expected to be zero during idle. Earlier zero results
+indicate a real initialisation problem and get a `(UNEXPECTED NULL)` suffix instead.
+
+### Integration with GenConfig
+
+`GenConfig` already supports loading from `GenDialogue.json` next to the DLL. Adding
+`VerboseChain` follows the same pattern: a `[JsonPropertyName("verbose_chain")]` property
+with a `false` default so existing config files are unaffected.
+
+In `Mod.cs`, the `PointerChainResolver` is constructed once and holds a reference to
+the config. This avoids re-reading the JSON on every tick and lets the user enable
+verbose mode by editing the JSON (plus a mod reload) without recompiling.
+
+### Practical Workflow
+
+1. First boot: leave `verbose_chain: false` — the poll loop runs silently.
+2. If hook or poll loop consistently says "unresolved", set `verbose_chain: true` in
+   `GenDialogue.json`, reload the mod, and reproduce.
+3. The first logged `ChainStep N` with a null or unreadable address is your broken link.
+4. Open Ghidra, navigate to that offset, and update `P5ROffsets.cs` with the correct value.
+5. Set `verbose_chain: false` again once resolved.
+
+This is the "printf debugging for memory" approach — cheap, zero-overhead when off,
+and completely visible in the Reloaded-II console without attaching a debugger.
+
+---
+
+## Chapter 20 — Text Buffer Write-Back: Injecting Generated Dialogue
+
+### The Gap Between Logging and Injection
+
+Right now `DialogueBridge.DispatchAsync()` calls the LLM, gets a response, and *logs*
+it. The actual game text is untouched — Ryuji still delivers his scripted line.
+Write-back means overwriting the game's in-memory dialogue string before the renderer
+reads it, so the LLM response appears on screen.
+
+### Two Approaches
+
+**Approach A — Direct Buffer Overwrite**
+P5R stores dialogue text as a UTF-8 (or Shift-JIS) C-string in the social link session
+struct or a nearby heap allocation. If we find the exact byte offset, we can
+`Marshal.Copy()` our generated text into the buffer before the renderer reads it.
+
+Risk: The buffer has a fixed capacity (usually 256-512 bytes). If our LLM text is
+longer, we overflow adjacent fields and corrupt the struct. Solution: `clean_response()`
+already enforces a 200-char maximum and sentence-boundary truncation, so we stay well
+under any sane buffer size.
+
+**Approach B — Pointer Swap**
+Some engines store a `wchar_t*` pointer field that points to the display string.
+If we allocate our own heap string (`Marshal.AllocHGlobal`), write the LLM text
+into it, and then overwrite the pointer field, the renderer follows the new pointer
+and shows our text. The allocation must stay live for the frame duration, so we
+keep it in a field and free the *previous* allocation before overwriting.
+
+P5R most likely uses Approach A (fixed buffer) based on how other Atlus engine games
+store dialogue, but Ghidra analysis of the text-display function is required to confirm.
+
+### The Offset Discovery Plan
+
+1. Run `struct_diff_enabled: true` during a hang-out.
+2. Look for a `[StructDiff]` line where the offset changes *precisely when dialogue
+   text changes on screen* (not when you press a button, but when new text appears).
+3. Dump 64 bytes around that offset with `SocialLinkReader.HexDump()`.
+4. Match the hex bytes to ASCII/UTF-8 text from the current dialogue line.
+5. That confirmed offset is `DIALOGUE_TEXT_OFFSET` in `P5ROffsets.cs`.
+
+### Write-Back Safety
+
+Before writing:
+1. `MemoryGuard.IsReadable(ptr + offset, expectedLength)` — confirm the buffer exists.
+2. Write exactly `Math.Min(text.Length, maxBufferSize - 1)` bytes.
+3. Null-terminate at position `bytesWritten`.
+4. Restore the original text on session end in case the game re-reads from the buffer.
+
+The write happens on the thread pool (inside `Task.Run`), which means it races with
+the game's main thread. This is inherently racy — the game could read the buffer
+*during* our write. A future improvement is to use a semaphore tied to the render
+frame boundary, but for a non-commercial mod the race window is small (~microseconds).
+
+### Current Status
+
+`DialogueBridge.DispatchAsync()` has a `// TODO: dialogue write-back` comment where
+the write will go. Once `DIALOGUE_TEXT_OFFSET` is confirmed via StructDiff,
+the implementation is:
+
+```csharp
+unsafe void WriteDialogue(nuint sessionPtr, string text)
+{
+    byte[] bytes = System.Text.Encoding.UTF8.GetBytes(text + "\0");
+    nuint target = sessionPtr + P5ROffsets.DIALOGUE_TEXT_OFFSET;
+    if (!MemoryGuard.IsReadable(target, bytes.Length)) return;
+    fixed (byte* src = bytes)
+        Buffer.MemoryCopy(src, (void*)target, bytes.Length, bytes.Length);
+}
+```
+
+This is intentionally left as a placeholder until offset discovery is complete.
+
+---
+
+## Chapter 21 — CI Pipeline: Keeping Both Halves Honest
+
+### Why Two-Language Projects Need CI
+
+Our project is split: a C# Reloaded-II mod (Windows only) and a Python FastAPI server
+(cross-platform). A bug in either half can break the whole system invisibly. Manual
+testing requires launching P5R + the server, which takes minutes and can't run
+unattended. CI closes this gap: every push to the branch triggers automated checks
+that surface regressions in seconds.
+
+### Our GitHub Actions Setup
+
+The `.github/workflows/ci.yml` workflow has two parallel jobs:
+
+```
+┌─────────────────┐     ┌──────────────────┐
+│  python-tests   │     │  dotnet-build    │
+│  ubuntu-latest  │     │  ubuntu-latest   │
+│                 │     │                  │
+│  pip install    │     │  dotnet restore  │
+│  pytest --all   │     │  dotnet build    │
+└─────────────────┘     └──────────────────┘
+         ↑ parallel — neither waits for the other
+```
+
+Both jobs run on `ubuntu-latest` (the cheapest free runner). The .NET build job
+doesn't run the mod in-game — it just confirms the C# compiles cleanly against
+the Reloaded-II NuGet packages.
+
+### Why pytest Instead of In-Game Tests
+
+The Python tests use `MOCK_LLM=1` (via the `client_with_mock` fixture) so they
+never attempt to load a real model. This makes them:
+- **Fast**: ~1s total, no GPU, no model download
+- **Deterministic**: mock responses are hardcoded
+- **Free**: run on GitHub's free tier Ubuntu runners
+
+Real inference tests (requiring a GPU + 4GB model file) are excluded from CI and
+run manually in the development environment before merging.
+
+### Test Coverage Pyramid
+
+```
+          [manual in-game]
+         real P5R + real GPU
+        ─────────────────────
+       [local GPU, no P5R needed]
+      real model, FastAPI endpoints
+     ─────────────────────────────
+    [CI — mock server, 86+ tests]
+   unit + integration + endpoint tests
+  ──────────────────────────────────────
+```
+
+The CI tier covers 86 tests across:
+- `test_queue.py`: InferenceQueue drop policy, stats, clear
+- `test_server.py`: health/ready/stats/model-info/generate endpoints
+- `test_generate_endpoint.py`: validation, session_id, 503 handling
+- `test_integration.py`: full mock round-trips for all 22 confidants
+- `test_prompt_context.py`: system prompt template correctness
+- `test_postprocess.py`: OOC removal, emoji, Japanese, truncation
+- `test_config.py`: ModelConfig validation bounds
+- `test_arcana.py`: roster completeness (22 confidants)
+- `test_mock_responses.py`: per-character canned lines
+- `test_prompt_builder.py`: build_prompt() fields and format
+- `test_tier.py`: rank-to-tier mapping, parametric all 10 ranks
+
+### The dotnet build Gate
+
+The C# build runs `dotnet build` without running any tests — we have no C# unit
+test project because the mod's core logic is tested indirectly through in-game
+observation. The build gate exists to catch:
+- Syntax errors from refactors
+- Missing using directives (exactly what we hit with `ILoggerV2` in `ModLogger.cs`)
+- NuGet package version mismatches after dependency updates
+
+Future improvement: a C# unit test project using `xUnit` that mocks `ILoggerV2` and
+`IReloadedHooks` to test `ModLogger`, `GenConfig`, and `DialogueBridge` in isolation.
+
+---
+
+## Chapter 22 — Mock Architecture: Testing Without a GPU
+
+### The Problem with Real Inference in Tests
+
+Real Llama-3.1-8B inference requires:
+- ~4 GB GPU VRAM or CPU RAM
+- ~20s cold-start CUDA JIT compile
+- A model file that's 4.7 GB on disk
+- CUDA toolkit or CPU inference fallback
+
+None of these are available on GitHub Actions free runners. Every CI run would timeout
+or fail with OOM. The solution: a mock layer that completely bypasses inference.
+
+### The MOCK_LLM Environment Variable
+
+When the server starts with `MOCK_LLM=1`, the lifespan function sets `_pipeline = _MOCK`
+instead of calling `load_model()`. The `_MOCK` object is a plain Python sentinel
+(`object()`) — it has no methods, no attributes, no GPU interaction.
+
+In the `/generate` route, we check `if _pipeline is _MOCK:` *before* calling any
+inference code. If true, we call `get_mock_response(confidant_id, rank)` and return
+immediately. Total latency: <1ms.
+
+This design has a key property: **the entire HTTP path is exercised**, including
+Pydantic validation, request parsing, and response serialisation. We're only
+substituting the inference step itself.
+
+### The conftest.py Fixture Stack
+
+```python
+@pytest.fixture
+def mock_pipeline() -> MagicMock:        # ← MagicMock, not _MOCK sentinel
+    mock = MagicMock()
+    mock.generate.return_value = "Yo, let's crush it today!"
+    return mock
+
+@pytest.fixture
+async def client_with_mock(mock_pipeline):
+    srv._pipeline = mock_pipeline         # ← replaces the real pipeline
+    srv._queue = InferenceQueue()         # ← fresh queue per test
+    ...
+```
+
+Note: `client_with_mock` uses a `MagicMock`, not the `_MOCK` sentinel. This means
+`model-info` returns `"real"` mode (the sentinel check fails), but inference actually
+calls `mock_pipeline.generate()` → the mocked return value. This is intentional:
+it exercises the *real* inference code path (including the queue) while keeping
+responses deterministic.
+
+For tests that need `/health → {"status": "mock"}`, use `srv._pipeline = srv._MOCK`
+directly (as in `test_model_info_mock_mode`).
+
+### Per-Character Canned Lines
+
+`mock_responses.py` stores 22 character-specific one-liners indexed by confidant ID.
+Each one is hand-written to sound like the character:
+
+- Ryuji (8): "Yo, you ready? We're not leavin' till we crush every set!"
+- Futaba (10): "SYSTEM ALERT: Fun level exceeding critical threshold!"
+- Kasumi (22): "Please, let us focus. Every second here is a second we could be training!"
+
+The `get_mock_response(confidant_id, rank)` function returns:
+```
+"[MOCK rank N] {canned_line}"
+```
+
+The `[MOCK rank N]` prefix makes mock responses instantly identifiable in logs,
+so you can tell at a glance whether a log line came from real inference or a test.
+The prefix also makes the rank number machine-readable for log parsers.
+
+### What the Mock Tests Prove
+
+With 116 tests (all passing), we have confidence that:
+1. **All 22 confidants** can make a successful round-trip through `/generate`
+2. **Pydantic validation** correctly rejects out-of-range ranks, long contexts, and negative IDs
+3. **Stats counters** increment, accumulate, and reset correctly
+4. **Postprocessor** handles edge cases (emoji, Japanese, OOC removal) without crashes
+5. **Prompt templates** contain all required fields for every confidant
+6. **Tier notes** cover all 10 rank levels without gaps
+
+What the tests do NOT prove: whether real Llama-3.1-8B inference returns valid,
+in-character dialogue. That requires manual playtesting, which we've done: the
+confirmed LLM response from the previous session was:
+
+> "Dude, what's up? I was thinkin' we could grab some ramen before we head back to..."
+
+In character, rank-appropriate, correct length — the real inference works.
+

@@ -14,6 +14,7 @@ namespace P5RGenSocialLinks;
 public class Mod : IModV1
 {
     private ILoggerV2?        _logger;
+    private ModLogger?        _modLog;
     private LLMClient?        _llmClient;
     private DialogueBridge?   _bridge;
     private SocialLinkReader? _reader;
@@ -35,20 +36,35 @@ public class Mod : IModV1
     // The native function reads from globals (no meaningful parameters).
     private IHook<CmmExecEventDelegate>? _conversationHook;
     private IReloadedHooks?              _hooks;
+    private int                          _cmmExecFireCount;
 
     [Function(CallingConventions.Microsoft)]
     public delegate nint CmmExecEventDelegate();
 
+    private GenConfig _cfg = new();
+
     public void Start(IModLoaderV1 loader)
     {
         _logger    = (ILoggerV2)loader.GetLogger();
-        _llmClient = new LLMClient();
+
+        // Load user-editable runtime config from GenDialogue.json next to the DLL.
+        string modDir = System.IO.Path.GetDirectoryName(
+            System.Reflection.Assembly.GetExecutingAssembly().Location) ?? ".";
+        _cfg    = GenConfig.Load(modDir);
+        _modLog = new ModLogger(_logger, _cfg.LogLevel);
+        _modLog.Always($"[P5RGenSocialLinks] Config: throttle={_cfg.ThrottleSeconds}s timeout={_cfg.TimeoutSeconds}s url={_cfg.ServerUrl} logLevel={_cfg.LogLevel}");
+
+        _llmClient = new LLMClient(_cfg.ServerUrl);
+
+        // Async health check — fires after a 2s delay to let the model finish loading.
+        ServerHealthChecker.CheckAsync(_cfg.ServerUrl, msg => _logger.WriteLine(msg));
 
         nuint moduleBase = (nuint)Process.GetCurrentProcess().MainModule!.BaseAddress;
         _logger.WriteLine($"[P5RGenSocialLinks] Base: 0x{moduleBase:X}");
 
-        _reader = new SocialLinkReader(moduleBase);
-        _bridge = new DialogueBridge(_llmClient!, new LoggerAdapter(_logger!));
+        _reader = new SocialLinkReader(moduleBase, _cfg.VerboseChain,
+            msg => _logger!.WriteLine(msg));
+        _bridge = new DialogueBridge(_llmClient!, new LoggerAdapter(_logger!), _cfg);
 
         // Hooks implementation provided by reloaded.sharedlib.hooks at runtime.
         loader.GetController<IReloadedHooks>()?.TryGetTarget(out _hooks);
@@ -56,32 +72,40 @@ public class Mod : IModV1
         TryActivateHook();
         StartPollLoop();
 
-        _logger.WriteLine("[P5RGenSocialLinks] Started.");
+        _logger.WriteLine($"[P5RGenSocialLinks] Started — hook:{(_hookActive ? "ON" : "OFF")} poll:ON");
     }
+
+    // Tracks whether the hook wired successfully — logged on Start() completion.
+    private bool _hookActive;
 
     private void TryActivateHook()
     {
+        _logger!.WriteLine("[P5RGenSocialLinks] TryActivateHook: begin.");
+        _logger!.WriteLine($"[P5RGenSocialLinks] IReloadedHooks available: {_hooks is not null}");
+
         try
         {
             using var scanner = new FunctionScanner();
             nuint funcAddr = scanner.FindOrThrow(Signatures.CmmExecEvent);
-            _logger!.WriteLine($"[P5RGenSocialLinks] CmmExecEvent hook target: 0x{funcAddr:X}");
+            _logger!.WriteLine($"[P5RGenSocialLinks] CmmExecEvent sig scan OK: 0x{funcAddr:X}");
 
             if (_hooks is null)
             {
-                _logger!.WriteLine("[P5RGenSocialLinks] IReloadedHooks not available — is reloaded.sharedlib.hooks installed?");
+                _logger!.WriteLine("[P5RGenSocialLinks] Hook skipped — IReloadedHooks null (install reloaded.sharedlib.hooks).");
                 return;
             }
+
             _conversationHook = _hooks
                 .CreateHook<CmmExecEventDelegate>(OnCmmExecEvent, (long)funcAddr)
                 .Activate();
 
-            _logger.WriteLine("[P5RGenSocialLinks] CmmExecEvent hook active.");
+            _hookActive = true;
+            _logger.WriteLine("[P5RGenSocialLinks] CmmExecEvent hook ACTIVE.");
         }
         catch (InvalidOperationException ex)
         {
-            _logger!.WriteLine($"[P5RGenSocialLinks] Hook skipped: {ex.Message}");
-            _logger.WriteLine("[P5RGenSocialLinks] Falling back to poll loop.");
+            _logger!.WriteLine($"[P5RGenSocialLinks] Sig scan FAILED: {ex.Message}");
+            _logger.WriteLine("[P5RGenSocialLinks] Falling back to poll loop only.");
         }
     }
 
@@ -90,22 +114,26 @@ public class Mod : IModV1
         // Run original first — it populates the session sub-object we are about to read.
         nint result = _conversationHook!.OriginalFunction();
 
+        int fireCount = System.Threading.Interlocked.Increment(ref _cmmExecFireCount);
+
         try
         {
             if (!_reader!.TryResolve(out nuint session))
             {
-                _logger?.WriteLine("[P5RGenSocialLinks] CmmExecEvent: session chain unresolved.");
+                _logger?.WriteLine($"[P5RGenSocialLinks] CmmExecEvent #{fireCount}: session chain unresolved.");
                 return result;
             }
 
-            _logger?.WriteLine($"[P5RGenSocialLinks] CmmExecEvent session=0x{session:X}");
+            _logger?.WriteLine($"[P5RGenSocialLinks] CmmExecEvent #{fireCount} session=0x{session:X}");
 
             SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
             if (snap is null) return result;
 
             _logger?.WriteLine(
-                $"[P5RGenSocialLinks] CmmExec: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber}");
-            _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap));
+                $"[P5RGenSocialLinks] CmmExec #{fireCount}: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber}");
+            bool dispatched = _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap));
+            if (!dispatched)
+                _logger?.WriteLine($"[P5RGenSocialLinks] CmmExec #{fireCount}: throttled (< 3s since last dispatch).");
         }
         catch (Exception ex)
         {
@@ -115,12 +143,14 @@ public class Mod : IModV1
         return result;
     }
 
-    // ── Poll loop (fallback) ───────────────────────────────────────────────
+    // ── Poll loop (fallback + struct discovery) ───────────────────────────
+
+    private readonly StructDiffScanner _diffScanner = new();
 
     private void StartPollLoop()
     {
         _cts      = new CancellationTokenSource();
-        _timer    = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
+        _timer    = new PeriodicTimer(TimeSpan.FromMilliseconds(_cfg.PollIntervalMs));
         _pollTask = Task.Run(() => PollLoopAsync(_cts.Token));
     }
 
@@ -130,16 +160,42 @@ public class Mod : IModV1
 
         while (await _timer!.WaitForNextTickAsync(ct))
         {
-            if (!_reader!.TryResolve(out nuint session)) { lastSession = 0; continue; }
-            if (session == lastSession) continue;
-            lastSession = session;
+            if (!_reader!.TryResolve(out nuint session))
+            {
+                if (lastSession != 0)
+                {
+                    _diffScanner.Reset();
+                    _bridge!.ResetSession();
+                    _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
+                }
+                lastSession = 0;
+                continue;
+            }
 
-            SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
-            if (snap is null) continue;
+            if (session != lastSession)
+            {
+                lastSession = session;
+                _diffScanner.Reset();
 
-            _logger!.WriteLine(
-                $"[P5RGenSocialLinks] Hang-out: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber} (0x{session:X})");
-            _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap));
+                SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
+                if (snap is null) continue;
+
+                _modLog!.Info(
+                    $"[P5RGenSocialLinks] Hang-out: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber} (0x{session:X})");
+
+                if (!_hookActive)
+                    _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap));
+
+                continue;
+            }
+
+            // Same session — diff the struct to find per-line changing fields.
+            if (_cfg.StructDiffEnabled)
+            {
+                string? diff = _diffScanner.Diff(session);
+                if (diff is not null)
+                    _modLog!.Info($"[P5RGenSocialLinks] {diff}");
+            }
         }
     }
 
@@ -149,6 +205,7 @@ public class Mod : IModV1
     {
         _cts.Cancel();
         _conversationHook?.Disable();
+        _diffScanner.Reset();
         _logger?.WriteLine("[P5RGenSocialLinks] Suspended.");
     }
 
@@ -166,6 +223,7 @@ public class Mod : IModV1
         _timer?.Dispose();
         _llmClient?.Dispose();
         _conversationHook?.Disable();
+        _diffScanner.Reset();
         _logger?.WriteLine("[P5RGenSocialLinks] Unloaded.");
     }
 

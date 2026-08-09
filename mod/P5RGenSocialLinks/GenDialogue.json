@@ -1,0 +1,30 @@
+{
+  // P5R Generative Social Links — runtime configuration
+  // Edit this file to tune inference behaviour without recompiling.
+
+  // URL of the Python inference server
+  "server_url": "http://127.0.0.1:8765",
+
+  // Minimum seconds between consecutive LLM calls in one hang-out session.
+  // Lower = more frequent generation; must be > LLM latency (~2s on RTX 4060).
+  "throttle_seconds": 3.0,
+
+  // Seconds before an in-flight LLM request is abandoned.
+  // First call after model load needs ~15s (CUDA JIT warmup); subsequent ~2s.
+  "timeout_seconds": 30.0,
+
+  // How often (ms) the session-change poll loop runs.
+  "poll_interval_ms": 500,
+
+  // Whether to log struct field diffs during hang-out (for offset discovery).
+  // Set to false once per-line trigger offsets are confirmed.
+  "struct_diff_enabled": true,
+
+  // Log every pointer chain step with address + dereferenced value.
+  // Enable when TryResolve() fails and you need to find the broken link.
+  // Leave false in normal play — fires every 500ms poll tick.
+  "verbose_chain": false,
+
+  // Log verbosity: "info" (all messages), "warn" (errors/timeouts only), "off" (silent).
+  "log_level": "info"
+}

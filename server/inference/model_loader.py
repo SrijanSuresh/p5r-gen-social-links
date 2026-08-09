@@ -1,37 +1,47 @@
-"""Loads a GPTQ 4-bit quantized causal LM and its tokenizer."""
+"""Loads a GGUF model via llama-cpp-python with full GPU offload."""
 
 from __future__ import annotations
-from typing import TYPE_CHECKING
 
-from transformers import AutoTokenizer, GenerationConfig  # type: ignore[import-untyped]
+import logging
+import os
+from pathlib import Path
 
 from .config import ModelConfig
 
-if TYPE_CHECKING:
-    from auto_gptq import AutoGPTQForCausalLM  # type: ignore[import-untyped]
+log = logging.getLogger(__name__)
 
 
-def load_model(cfg: ModelConfig) -> tuple["AutoGPTQForCausalLM", "AutoTokenizer"]:
+def load_model(cfg: ModelConfig) -> "llama_cpp.Llama":  # type: ignore[name-defined]
     """
-    Load a GPTQ-quantized model from HuggingFace Hub.
+    Load a GGUF quantized model from a local file path.
 
     Requires:
-        - CUDA-capable GPU with enough VRAM (4-bit Llama-7B needs ~4 GB)
-        - auto-gptq installed: pip install auto-gptq
+        - llama-cpp-python installed with CUDA support:
+            pip install llama-cpp-python \\
+              --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu122
+        - The GGUF file at cfg.model_path (relative to server/ directory).
+          Download with:
+            huggingface-cli download bartowski/Meta-Llama-3.1-8B-Instruct-GGUF \\
+              --include "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" \\
+              --local-dir server/models
     """
-    from auto_gptq import AutoGPTQForCausalLM  # noqa: PLC0415
+    from llama_cpp import Llama  # noqa: PLC0415
 
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_id, use_fast=True)
+    # Resolve path relative to this file's parent (server/)
+    model_path = Path(__file__).parent.parent / cfg.model_path
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"GGUF model not found at {model_path}. "
+            "Run: huggingface-cli download bartowski/Meta-Llama-3.1-8B-Instruct-GGUF "
+            "--include 'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf' --local-dir server/models"
+        )
 
-    model = AutoGPTQForCausalLM.from_quantized(
-        cfg.model_id,
-        revision=cfg.revision,
-        use_safetensors=True,
-        trust_remote_code=False,
-        device=cfg.device,
-        use_triton=cfg.use_triton,   # False on Windows; True only on Linux with triton installed
-        inject_fused_attention=True,
-        inject_fused_mlp=True,
+    log.info("Loading %s (n_gpu_layers=%s)…", model_path.name, cfg.n_gpu_layers)
+    model = Llama(
+        model_path=str(model_path),
+        n_gpu_layers=cfg.n_gpu_layers,   # -1 = all layers on GPU
+        n_ctx=cfg.n_ctx,
+        verbose=False,                    # suppress llama.cpp token-by-token logs
     )
-    model.eval()
-    return model, tokenizer
+    log.info("Model loaded.")
+    return model

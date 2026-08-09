@@ -13,50 +13,78 @@ namespace P5RGenSocialLinks;
 /// </summary>
 internal sealed class DialogueBridge
 {
-    private readonly LLMClient _llm;
-    private readonly ILogger   _log;
+    private readonly LLMClient     _llm;
+    private readonly ILogger       _log;
+    private readonly TimeSpan      _timeout;
+    private readonly TimeSpan      _minInterval;
+    private readonly SessionHistory _history = new();
 
-    // Hard timeout: if the LLM takes longer than this, we fall back to the
-    // scripted dialogue that is already in the buffer.
-    private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(8);
+    private DateTimeOffset _lastDispatch = DateTimeOffset.MinValue;
 
     internal interface ILogger
     {
         void WriteLine(string message);
     }
 
-    internal DialogueBridge(LLMClient llm, ILogger log)
+    internal DialogueBridge(LLMClient llm, ILogger log, GenConfig? cfg = null)
     {
-        _llm = llm;
-        _log = log;
+        _llm         = llm;
+        _log         = log;
+        _timeout     = TimeSpan.FromSeconds(cfg?.TimeoutSeconds  ?? 30.0);
+        _minInterval = TimeSpan.FromSeconds(cfg?.ThrottleSeconds ?? 3.0);
     }
 
     /// <summary>
-    /// Fires-and-forgets an LLM request. On success, overwrites the game buffer.
+    /// Fires-and-forgets an LLM request with leading-edge throttling.
+    /// Returns false immediately if called within MinDispatchInterval of the last dispatch.
+    /// On success, logs the generated response (write-back pending offset discovery).
     /// On timeout or error, the original scripted dialogue remains untouched.
     /// </summary>
-    internal void DispatchAsync(SocialLinkSnapshot snap, string contextText)
+    internal bool DispatchAsync(SocialLinkSnapshot snap, string contextText)
     {
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        if (now - _lastDispatch < _minInterval)
+            return false;
+
+        _lastDispatch = now;
+
+        // Include prior LLM lines this session as context for continuity.
+        // Trim to MaxContextChars so we never exceed Pydantic's max_length=1024.
+        const int MaxContextChars = 1000;
+        string priorCtx = _history.BuildPriorContext(snap.SessionBase);
+        string combined = string.IsNullOrEmpty(priorCtx)
+            ? contextText
+            : $"{contextText} {priorCtx}";
+        string fullCtx = combined.Length > MaxContextChars
+            ? combined[..MaxContextChars]
+            : combined;
+
         _ = Task.Run(async () =>
         {
-            using var cts = new CancellationTokenSource(Timeout);
+            using var cts = new CancellationTokenSource(_timeout);
             try
             {
                 var request = new GenerateRequest
                 {
                     ConfidantId   = snap.ConfidantId,
                     Rank          = snap.RankLevel,
-                    Context       = contextText,
-                    CharacterName = $"Confidant #{snap.ConfidantId}",
+                    Context       = fullCtx,
+                    CharacterName = ConfidantNames.Resolve(snap.ConfidantId),
                 };
 
                 string text = await _llm.GenerateAsync(request, cts.Token);
 
                 if (!string.IsNullOrWhiteSpace(text))
                 {
+                    bool isNew = _history.RecordResponse(snap.SessionBase, text);
+                    if (!isNew)
+                    {
+                        _log.WriteLine("[P5RGenSocialLinks] LLM: duplicate response suppressed.");
+                        return;
+                    }
                     // TODO: dialogue write-back requires locating the text buffer offset.
                     // For now, log the generated response so we can verify E2E flow.
-                    _log.WriteLine($"[P5RGenSocialLinks] LLM: \"{text[..Math.Min(text.Length, 80)]}\"");
+                    _log.WriteLine($"[P5RGenSocialLinks] LLM: \"{text[..Math.Min(text.Length, 120)]}\"");
                 }
             }
             catch (InferenceInFlightException)
@@ -65,12 +93,25 @@ internal sealed class DialogueBridge
             }
             catch (OperationCanceledException)
             {
-                _log.WriteLine("[P5RGenSocialLinks] LLM timeout â€” keeping scripted dialogue.");
+                _log.WriteLine("[P5RGenSocialLinks] LLM timeout — keeping scripted dialogue.");
             }
             catch (Exception ex) when (ex is not OutOfMemoryException)
             {
                 _log.WriteLine($"[P5RGenSocialLinks] LLM error: {ex.Message}");
             }
         });
+
+        return true;
+    }
+
+    /// <summary>
+    /// Clears session history and resets the dispatch throttle.
+    /// Call when the hang-out ends (session pointer drops to 0) to ensure the next
+    /// hang-out starts with a clean slate and no throttle carry-over.
+    /// </summary>
+    internal void ResetSession()
+    {
+        _history.Reset();
+        _lastDispatch = DateTimeOffset.MinValue;
     }
 }

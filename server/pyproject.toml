@@ -1,0 +1,28 @@
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["."]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "ANN", # flake8-annotations (type hints)
+]
+ignore = [
+    "ANN101",  # missing type annotation for 'self'
+    "ANN102",  # missing type annotation for 'cls'
+    "ANN401",  # dynamically typed Any — used in dict[str, object] returns
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["inference", "social_link"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+ignore_missing_imports = true
