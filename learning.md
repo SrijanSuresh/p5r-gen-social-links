@@ -3238,3 +3238,106 @@ pointer chain in the session struct (Phase 1) or through intermediate objects (P
 | `CountPoolStrings` breaks on null header | BF buffer scores 0 strings | Skip bad segments (`continue`) instead of `break` |
 | `minRun = 20` too high | BF buffer discarded before string counting | Lower to 12; expand `probeScan` to 2048 |
 | Session scan too narrow (512–1024 B) | Interpreter pointer at offset > 1024 | Expand to 4096 B in both scanner and diff tracker |
+
+---
+
+## Chapter 42 — CMM Event Script vs. BF Dialogue Buffer; Why the Memcpy Hook Is the Real Path
+
+### What the expanded scanner found (and why it is NOT dialogue)
+
+After the three-bug fix, `TryFindBfBuffer` found four candidates:
+
+```
+CAND sess+0x330 → 0x4244BC59B0  strings=11  preview: "]C fZDBc]~]}...]Ryuji]HO@\DBRyuji Sakamoto]"
+CAND sess+0x600 → 0x4244BC5A10  strings=11  preview: same buffer, +0x60 offset
+CAND sess+0xA60 → 0x4244B0D9F0  strings=10  preview: "&BiB4-,KC``f Bb..."
+CAND sess+0xCE0 → 0x41DB8E9A90  strings=9   preview: "MODEL/CHARACTER/3001/FIELD/BF3001_200.GAP"
+```
+
+The SELECTED buffer (`sess+0x330 → 0x4244BC59B0`) contained:
+
+- The character name "Ryuji Sakamoto" and "Chariot" (arcana) as isolated strings
+- A repeating `]` (0x5D) byte as what appears to be a control code
+- "DB", "HO", "HOZ" patterns — CMM instruction mnemonics
+- ZERO complete English dialogue sentences
+
+If this were the BF dialogue buffer, we would expect to see "It's a gym over in Shibuya", "Yo let's go", etc. Instead we see encoded identifiers and arcana labels.
+
+The buffer at `sess+0xCE0 → 0x41DB8E9A90` contains the literal file path
+`MODEL/CHARACTER/3001/FIELD/BF3001_200.GAP`. That is the **asset descriptor** —
+a metadata structure that tells the CMM *where* to load the BF script from disk.
+It is not the script itself.
+
+### The two-layer architecture of P5R dialogue
+
+P5R uses a two-layer scripting system:
+
+```
+Layer 1 — CMM event graph (what we found at 0x4244BC59B0):
+  ┌─────────────────────────────────────────────────────┐
+  │  Social link state machine: rank checks, flags,     │
+  │  branching, character identifiers, arcana labels    │
+  │  Format: proprietary Atlus CMM opcodes + 0x5D tags  │
+  └─────────────────────────────────────────────────────┘
+         │
+         ▼ loads from file path in descriptor
+Layer 2 — BF dialogue buffer (what CE confirmed at 0x4178E79D48):
+  ┌─────────────────────────────────────────────────────┐
+  │  Raw BF script: 32-byte header, then instructions   │
+  │  Opcode 0x05 + null-terminated English text         │
+  │  "gym over in Shibuya\0", "Yo let's go\0", etc.     │
+  └─────────────────────────────────────────────────────┘
+```
+
+The CMM event graph orchestrates which scenes play. When it reaches a dialogue
+node, it triggers the BF interpreter to execute a LINE from the BF dialogue buffer.
+The BF dialogue buffer is loaded from `BF3001_200.GAP` on demand, into a heap
+region ≈2.57 GB below the session struct — unreachable by proximity-based scanning.
+
+### What the memcpy hook at 0x5A8570 intercepts
+
+When the BF interpreter reaches a `0x05` (dialogue) instruction, it:
+1. Reads the null-terminated string from the BF script buffer
+2. Calls the inner copy function at `p5r.exe+0x5A8570` (REP MOVSB) to transfer
+   the text to a freshly-allocated render buffer
+3. The renderer reads the text from the render buffer and writes it to the dialogue box
+
+The memcpy hook is already wired and active — it was just doing nothing:
+
+```csharp
+private unsafe void OnGameMemcpy(nuint dst, nuint src, nuint count)
+{
+    // Diagnostic logging disabled — ...
+    _memcpyHook!.OriginalFunction(dst, src, count);
+}
+```
+
+**This hook IS the correct interception point.** We need to:
+1. Filter calls where `dst >= HeapLow` (destination in game heap, not CLR)
+2. Filter calls where the copied content contains ≥10 consecutive printable ASCII bytes
+3. Log `src`, `dst`, `count`, and the copied text preview
+
+The `dst` of such a call IS the render buffer the game reads to display dialogue.
+To replace the text, we write our LLM output into `dst` before returning.
+
+### Why not write back to the BF script buffer directly?
+
+Writing to the BF script buffer (if we found it) would be fragile:
+- The buffer is the DECODED static script; modifying it changes ALL future occurrences
+  of the same string (any repeat line or scene reuse)
+- The render buffer at `dst` is per-line: allocated fresh, filled, rendered, freed —
+  no aliasing problems, no stale state
+
+The memcpy hook write-back approach is per-line, stateless, and safe.
+
+### What the PC advance pattern means in the CMM layer
+
+The PC at session+0x20 is the **CMM program counter**, not the BF script PC.
+It advances through the CMM event graph nodes:
+- PC=0x0033: CMM node 0x33 (possibly a "start dialogue" node)
+- PC=0x006D, 0x00A9, ...: subsequent CMM nodes (conditionals, flag sets, etc.)
+
+The CMM PC and the BF PC are different counters. CE confirmed the BF PC was also
+at `session+0x20` *during the specific BF scene loading event* we were watching —
+but in the steady-state gameplay, what we're reading is the CMM PC.
+

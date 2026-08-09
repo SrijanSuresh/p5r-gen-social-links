@@ -109,12 +109,36 @@ public class Mod : IModV1
         _logger!.WriteLine($"[P5RGenSocialLinks] Memcpy inner hook ACTIVE at 0x{addr:X}");
     }
 
+    // Minimum consecutive printable bytes to treat a memcpy as a dialogue copy candidate.
+    private const int MemcpyMinRun = 10;
+
     private unsafe void OnGameMemcpy(nuint dst, nuint src, nuint count)
     {
-        // Diagnostic logging disabled — memcpy hook served its purpose (confirmed the
-        // BF script is loaded once before session detection, not per-line).
-        // [BFLine] probe via ProbeBfLine() is the active diagnostic path now.
         _memcpyHook!.OriginalFunction(dst, src, count);
+
+        // Filter: both ends in game heap, count in dialogue-line range (10–512 bytes).
+        if (dst < HeapLow || src < HeapLow) return;
+        if (count < MemcpyMinRun || count > 512) return;
+
+        // Filter: the copied bytes must contain ≥10 consecutive printable ASCII chars.
+        // This eliminates binary asset copies while catching dialogue text transfers.
+        byte* d = (byte*)dst;
+        if (!Memory.MemoryGuard.IsReadable(dst, (int)count)) return;
+
+        int maxRun = 0, run = 0;
+        for (nuint i = 0; i < count; i++)
+        {
+            if (d[i] >= 0x20 && d[i] <= 0x7E) { if (++run > maxRun) maxRun = run; }
+            else run = 0;
+        }
+        if (maxRun < MemcpyMinRun) return;
+
+        var text = new System.Text.StringBuilder(128);
+        for (nuint i = 0; i < count && text.Length < 128; i++)
+            if (d[i] >= 0x20 && d[i] <= 0x7E) text.Append((char)d[i]);
+
+        _modLog!.Info(
+            $"[MemcpyDialogue] src=0x{src:X} dst=0x{dst:X} n={count} run={maxRun}: \"{text}\"");
     }
 
     private void TryActivateHook()
