@@ -39,3 +39,34 @@ def test_p5r_exclusive_maruki() -> None:
 def test_full_confidant_count() -> None:
     # 20 base confidants + 2 P5R exclusives (Kasumi=22, Maruki=23) = 22 total
     assert len(CONFIDANTS) == 22
+
+
+def test_protagonist_joker_is_not_in_roster() -> None:
+    """Joker (the protagonist) is not a confidant — the roster is NPCs only."""
+    for c in CONFIDANTS.values():
+        assert "Joker" not in c.name
+        assert "Akira" not in c.name
+        assert "Ren Amamiya" not in c.name
+
+
+def test_confidant_ids_are_positive_ints() -> None:
+    for cid in CONFIDANTS:
+        assert isinstance(cid, int)
+        assert cid > 0
+
+
+def test_arcana_strings_are_title_case() -> None:
+    """Arcana names should be properly capitalised for display in the LLM prompt."""
+    for cid, c in CONFIDANTS.items():
+        assert c.arcana[0].isupper(), f"Arcana '{c.arcana}' for confidant {cid} not title-case"
+
+
+def test_personality_blurbs_end_with_period_or_not_empty() -> None:
+    """Blurbs should be non-empty; we don't enforce period but they must have content."""
+    for cid, c in CONFIDANTS.items():
+        assert len(c.personality_blurb.strip()) > 10, f"Blurb too short for confidant {cid}"
+
+
+def test_all_confidant_names_unique() -> None:
+    names = [c.name for c in CONFIDANTS.values()]
+    assert len(names) == len(set(names)), "Duplicate confidant names found"
