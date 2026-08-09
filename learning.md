@@ -820,3 +820,332 @@ internal const string BeginConversation =
 ```
 with the bytes you found. Run `dotnet build` and then `TryActivateHook()` will find
 the real function on the next P5R launch.
+
+---
+
+## Chapter 9 — Pointer Indirection: Chasing the Dialogue Buffer
+
+### The Problem: Inline String vs. Pointer-to-String
+
+A C struct field `char* dialogueBuffer` and a C struct field `char dialogueText[256]`
+look identical when you only know the field's **offset** — both appear at `+0x10` in
+the struct. But they are fundamentally different in memory:
+
+```
+Inline (char[256]):
+  sessionBase + 0x10 → A B C D E F ...   ← the text itself starts here
+
+Pointer-to-string (char*):
+  sessionBase + 0x10 → 60 66 F2 41 00 00 00 00   ← an 8-byte pointer value
+                             ↓
+             0x41F2E46660 → 43 00 79 00 6F 00 ...  ← "C\0y\0o\0..." (UTF-16LE)
+```
+
+The P5R session struct stores a **pointer** at `+0x10`, not inline text. Reading bytes
+directly from `sessionBase + 0x10` gives you the raw address bits of the dialogue
+string, which looks like garbage when decoded as characters.
+
+### Why P5R Uses Pointer Indirection
+
+P5R's dialogue strings live in a separate heap allocation managed by the CMM/flowscript
+system. The session struct only holds a reference (pointer) to that allocation because:
+
+1. **The text varies in length** — a fixed inline buffer wastes space for short lines
+   and can't hold long ones.
+2. **Strings are shared** — the same scripted line text may be referenced from multiple
+   events. A pointer lets both events point to the same allocation.
+3. **Hot-swap without struct resize** — P5R's streaming system can replace a string
+   in-place by updating the pointer, keeping the session struct's size constant.
+
+### The Double-Dereference Pattern
+
+Reading a `char*` field from a game struct always requires two unsafe reads:
+
+```csharp
+// Step 1: read the pointer stored at struct+offset → nuint
+nuint ptrFieldAddr = sessionBase + P5ROffsets.DIALOGUE_BUFFER;  // where the ptr lives
+if (!MemoryGuard.IsReadable(ptrFieldAddr, sizeof(nuint))) return null;
+nuint strAddr = *(nuint*)ptrFieldAddr;                           // the pointer value
+
+// Step 2: validate the pointed-to address, then read the string
+if (!MemoryGuard.IsReadable(strAddr, 2)) return null;
+char* chars = (char*)strAddr;
+// walk null-terminated UTF-16LE ...
+```
+
+Skipping the first `IsReadable` check crashes with `AccessViolationException` if the
+session struct is partially initialized. Skipping the second crashes if the string
+pointer points at unmapped memory (e.g. freed heap block).
+
+### UTF-16LE: Two Bytes Per Character
+
+P5R stores all in-game text as **UTF-16 Little Endian**. In this encoding every
+ASCII character occupies two bytes with a zero byte appended:
+
+```
+'C' = 0x43 0x00
+'y' = 0x79 0x00
+'o' = 0x6F 0x00
+'\0' (null terminator) = 0x00 0x00
+```
+
+So `ptr[len] != '\0'` (where `char* ptr`) checks the first of the two null bytes.
+C# `char` is already 2 bytes (UTF-16), so iterating `char*` naturally steps by 2
+bytes and aligns with the game's encoding.
+
+### Discovery Loop: Chasing the Pointer Live
+
+Until we confirm `+0x10` is the right field, the poll loop logs the raw 8 bytes at
+`+0x10` as a hex address, then attempts to follow it. In the Reloaded console you
+should see:
+
+```
+[P5RGenSocialLinks] Poll: session=0x41F2E4F090
+[P5RGenSocialLinks] +0x10 ptr=0x41F2E46660
+[P5RGenSocialLinks] +0x10 content (UTF-16): "Yo, what's up man..."
+```
+
+If `+0x10 ptr` is `0x0000000000000000` or unreadable, `+0x10` is not the dialogue
+pointer and we need to scan further offsets with Cheat Engine or Ghidra.
+
+---
+
+## Chapter 10 — Intra-Session Change Detection and Dialogue Pointer Scanning
+
+### Why Session-Change Gating Is Wrong Here
+
+The original poll loop logged only when `session != lastSession` — i.e., when a
+completely new conversation started. That fires once (at session creation) and then
+goes silent for the entire conversation.
+
+The problem: the dialogue buffer pointer and the dialogue-index field both CHANGE
+**within** the same session, every time the player advances to a new line. If we only
+log on session change, we will always see the cold, partially-initialized struct and
+miss every mid-conversation state.
+
+**Fix**: track three separate "last seen" values:
+
+```
+lastSession      → triggers full struct hex-dump (expensive, only on new conversation)
+lastDialoguePtr  → triggers follow + decode (fires per-line during conversation)
+lastDialogueIdx  → fires on every line advance even if ptr hasn't changed
+```
+
+### Scanning Multiple Ptr Candidates
+
+When `+0x10` is null at session init, the dialogue ptr might live at a later offset.
+The hex dump revealed `+0x18 = 0x70BAA0B8` (non-null) and everything else null/data.
+A systematic scan deferences every 8-byte-aligned word in the first 0x80 bytes of the
+struct and asks: "is this address readable and does it contain any non-zero chars?"
+
+```csharp
+for (nuint off = 0x10; off <= 0x70; off += 8)
+{
+    nuint candidate = *(nuint*)(sessionBase + off);
+    if (candidate == 0) continue;
+    if (!MemoryGuard.IsReadable(candidate, 2)) continue;
+    char* chars = (char*)candidate;
+    if (chars[0] != '\0')
+        _logger.WriteLine($"  ptr at +0x{off:X2} → 0x{candidate:X} = '{chars[0]}{chars[1]}...'");
+}
+```
+
+Running this every time `dialogueIdx` ticks up shows which offset "wakes up" as
+dialogue begins — that is the real dialogue buffer pointer.
+
+### Why DIALOGUE_INDEX Is Useful Even Without the Buffer
+
+Even if we never find the text buffer, `dialogueIndex` (int32 at `+0x04`) increments
+every time the player taps the text-advance button. Combined with the known
+`confidantId` and `rankLevel`, it uniquely identifies which scripted line is playing.
+
+P5R's flowscripts (`.flow` files) contain every dialogue line indexed by scene number
+and line offset. ShrineFox's Atlus Script Tools can decompile them. Once extracted,
+we can build a lookup table:
+
+```python
+{ (confidant_id, rank, dialogue_index): "scripted line text" }
+```
+
+The mod sends `(confidantId, rank, dialogueIndex)` to the server. The server looks up
+the scripted line to use as **context** for the LLM, then generates an alternative.
+This approach completely bypasses the dialogue buffer problem — we never need to read
+live game memory for the text at all.
+
+The tradeoff: the lookup database requires a one-time offline extraction step, and it
+only works for scenes that are in the flowscripts (not runtime-generated text).
+
+---
+
+## Chapter 11 — Pivoting from Live-Text Reading to Metadata-Driven Context
+
+### Why Pointer Scanning Failed
+
+The ptr scan at session init revealed no pointer to readable text:
+
+```
++0x18 → 0x70D15418  [0008 0402]  ← binary data (backspace + device-control bytes)
++0x28 → 0x420A560000 [000B 000A]  ← LF + VT control bytes (likely a script binary header)
++0x30 → 0x420A56F7D8 [DE40 7D5E]  ← first char is a lone low-surrogate (invalid UTF-16)
++0x48 → 0x420BAC39F0 [0000 0000]  ← self-referential pointer, all zeros
+```
+
+This is expected. The CMM session struct is a **controller object**: it tracks *which*
+conversation is happening, not *what text* is being displayed. The dialogue text is
+managed by a completely separate subsystem — P5R's flowscript/VMD engine — with its
+own allocator and display pipeline. There is no direct pointer from the session struct
+to the text buffer.
+
+Finding that text pointer would require either:
+1. Hooking the text-render function (requires more Ghidra analysis)
+2. Scanning process memory for the live text string during display
+
+Both are feasible but complex. We don't need to do either.
+
+### The Three Fields We Already Have Are Enough
+
+```
+ConfidantId   (int32 +0x00) = 8          → "Ryuji Sakamoto"
+RankLevel     (byte  +0x0B) = 4          → rank 4 Social Link
+SceneNumber   (int16 +0x0C) = 0x33 = 51  → specific hang-out event script
+DialogueIndex (int32 +0x04) = 0, 1, 2…  → line within that scene
+```
+
+These four values **uniquely identify every scripted line** in P5R. The game's
+flowscript database (`.flow` files extracted with ShrineFox's Atlus Script Tools)
+is indexed by exactly this tuple. We can:
+
+- Phase 1 (current): Send the tuple to the LLM with no text context — the LLM
+  knows Ryuji's character and generates believable rank-4 dialogue from that alone.
+
+- Phase 2 (later): Build a `(confidantId, sceneNumber, lineIndex) → text` lookup
+  from extracted scripts, pass the scripted line as user-prompt context.
+
+Phase 1 gives us a working E2E pipeline immediately. Phase 2 improves prompt quality
+without changing the architecture.
+
+### Why the LLM Can Generate Without the Scripted Text
+
+The system prompt already injects full character context:
+```
+"You are Ryuji Sakamoto from Persona 5 Royal. Your arcana is Chariot.
+ Character notes: Loud, loyal, hot-headed best friend; talks in street slang.
+ Match the emotional tone appropriate for Social Link rank 4/10."
+```
+
+P5R Social Link conversations at rank 4 follow a known emotional arc (Ryuji is working
+through his track team trauma). An LLM trained on internet text has extensive P5R
+fan-fiction, wiki content, and dialogue transcripts in its training data. The rank +
+character identity is sufficient to generate plausible, in-character lines.
+
+### JSON Serialization: PascalCase vs snake_case
+
+C# `System.Text.Json` serializes property names **as-is** (PascalCase by default):
+```json
+{"ConfidantId": 8, "Rank": 4, "Context": "...", "CharacterName": "Ryuji"}
+```
+
+Python Pydantic (v2) expects field names as declared — snake_case:
+```python
+confidant_id: int   # Pydantic sees the JSON key "ConfidantId" and finds no match
+```
+
+This causes a **422 Unprocessable Entity** silently: Pydantic rejects the request and
+the mod logs "LLM error: 422". Fix on the C# side using `JsonNamingPolicy.SnakeCaseLower`
+(available in .NET 8):
+
+```csharp
+private static readonly JsonSerializerOptions _jsonOpts = new()
+{
+    PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+};
+string json = JsonSerializer.Serialize(request, _jsonOpts);
+```
+
+This converts `ConfidantId → confidant_id`, `CharacterName → character_name` at the
+call site, without changing the C# class definition.
+
+### Triton on Windows
+
+`triton` (the NVIDIA Triton GPU compiler) only supports **Linux**. On Windows it either
+fails to install or crashes at import time. The auto-gptq `use_triton=True` flag
+switches the matmul backend to Triton — on Windows this must be `False` so auto-gptq
+falls back to its built-in CUDA or ExLlama kernels.
+
+Our custom Triton kernel (`dequant_matmul.py`) is still valid and runs in WSL2 or a
+Linux deployment. For the Windows dev loop, we use `use_triton=False`.
+
+### Mock Mode for Dev/E2E Testing
+
+Loading a 4-bit Llama-7B model takes ~30 seconds and requires 4 GB VRAM. During
+development we want instant E2E tests. A `MOCK_LLM=1` env-var makes the server skip
+model loading and return a canned Ryuji response:
+
+```python
+if os.getenv("MOCK_LLM"):
+    _pipeline = _MOCK_SENTINEL   # truthy sentinel
+```
+
+```python
+@app.post("/generate")
+async def generate(req: GenerateRequest) -> GenerateResponse:
+    if _pipeline is _MOCK_SENTINEL:
+        return GenerateResponse(text=f"[MOCK] Yo, Confidant #{req.confidant_id} rank {req.rank}. Let's roll!")
+```
+
+This lets us run `MOCK_LLM=1 python main.py` and verify the full HTTP round-trip
+(C# POST → Pydantic parse → JSON response → C# log) without any GPU or model download.
+
+The `context` field sent to the server can be:
+```
+"[Scene 51] Social Link hang-out — Confidant #8, rank 4"
+```
+
+This tells the LLM: a scene-51 hang-out, early in Ryuji's friendship arc.
+That's enough to produce good output.
+
+---
+
+## Chapter 12 — First End-to-End Round-Trip (Milestone)
+
+**Date**: 2026-08-08
+
+The full pipeline executed successfully for the first time:
+
+```
+P5R game (Ryuji gym hang-out, rank 4)
+  ↓  CMM session detected by poll loop
+C# mod → SocialLinkSnapshot(ConfidantId=8, RankLevel=4, SceneNumber=51)
+  ↓  ContextBuilder.Build()
+  ↓  "[Scene 51] Social Link hang-out — Confidant #8, rank 4"
+  ↓  DialogueBridge.DispatchAsync()
+  ↓  LLMClient.GenerateAsync() → POST http://localhost:8765/generate
+  ↓  {"confidant_id":8,"rank":4,"context":"[Scene 51]...","character_name":"Ryuji Sakamoto"}
+Python FastAPI server (MOCK_LLM=1)
+  ↓  200 OK
+  ↓  {"text":"[MOCK] Ryuji Sakamoto (rank 4): Yo, let's do this! ..."}
+C# mod
+  ↓  [P5RGenSocialLinks] LLM: "[MOCK] Ryuji Sakamoto (rank 4): Yo, let's do this!..."
+```
+
+### What Was Confirmed
+
+- `JsonNamingPolicy.SnakeCaseLower` correctly converted `ConfidantId → confidant_id`
+  so Pydantic could parse the request without a 422 error.
+- WSL2 `localhost` routes to the Windows host — the C# mod on the Windows P5R process
+  can reach a FastAPI server running inside WSL2 on the same port.
+- The background `Task.Run` in `DialogueBridge.DispatchAsync` returns from the hook
+  immediately, then completes the HTTP call without blocking the game thread.
+- One LLM dispatch fires per new Social Link hang-out (session pointer change), which
+  is the correct Phase 1 granularity.
+
+### What Remains
+
+1. **Dialogue write-back**: The generated text is logged but not injected into the game.
+   The dialogue text buffer is managed by P5R's flowscript engine, not the CMM session
+   struct. Finding it requires hooking the text-render function or a separate CE scan
+   of live text addresses during active dialogue display.
+
+2. **Real model**: Replace `MOCK_LLM=1` with `TheBloke/Llama-2-7B-Chat-GPTQ` running
+   via auto-gptq on CUDA. Requires ~4 GB VRAM and the full `requirements.txt` install
+   (including `torch==2.4.1+cu121` for Windows with CUDA).

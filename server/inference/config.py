@@ -12,5 +12,7 @@ class ModelConfig:
     temperature: float = 0.8
     top_p: float = 0.9
     repetition_penalty: float = 1.1
-    # Dialogue must fit in P5R''s buffer — keep well under 256 chars
+    # Dialogue must fit in P5R's buffer — keep well under 256 chars
     max_response_chars: int = 200
+    # Triton backend only works on Linux; set False for Windows dev loop.
+    use_triton: bool = False

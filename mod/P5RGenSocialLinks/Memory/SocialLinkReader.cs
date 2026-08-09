@@ -13,6 +13,8 @@ internal sealed class SocialLinkReader
         _resolver = new PointerChainResolver(moduleBase);
     }
 
+    internal bool TryResolve(out nuint session) => _resolver.TryResolve(out session);
+
     /// <summary>
     /// Reads a snapshot directly from a pointer received via the hook argument.
     /// Bypasses the pointer chain entirely — use this inside OnConversationInit
@@ -20,13 +22,15 @@ internal sealed class SocialLinkReader
     /// </summary>
     internal static unsafe SocialLinkSnapshot? TryReadFromPtr(nuint sessionPtr)
     {
-        if (sessionPtr == 0) return null;
+        if (!MemoryGuard.IsReadable(sessionPtr, 0x10)) return null;
 
-        int confidantId   = *(int*)(sessionPtr + (nuint)P5ROffsets.CONFIDANT_ID);
-        int rankLevel     = *(int*)(sessionPtr + (nuint)P5ROffsets.RANK_LEVEL);
-        int dialogueIndex = *(int*)(sessionPtr + (nuint)P5ROffsets.DIALOGUE_INDEX);
+        int confidantId  = *(int*)   (sessionPtr + P5ROffsets.CONFIDANT_ID);
+        int rankLevel    = *(byte*)  (sessionPtr + P5ROffsets.RANK_LEVEL);
+        int sceneNumber  = *(short*) (sessionPtr + P5ROffsets.SCENE_NUMBER);
 
-        return new SocialLinkSnapshot(confidantId, rankLevel, dialogueIndex, sessionPtr);
+        if (confidantId <= 0 || confidantId > 50) return null;
+
+        return new SocialLinkSnapshot(confidantId, rankLevel, sceneNumber, sessionPtr);
     }
 
     /// <summary>
@@ -35,6 +39,9 @@ internal sealed class SocialLinkReader
     /// </summary>
     internal static unsafe string HexDump(nuint ptr, int bytes = 128)
     {
+        if (!MemoryGuard.IsReadable(ptr, bytes))
+            return $" [unreadable @ 0x{ptr:X}]";
+
         var sb = new System.Text.StringBuilder();
         byte* p = (byte*)ptr;
         for (int i = 0; i < bytes; i++)
@@ -53,18 +60,14 @@ internal sealed class SocialLinkReader
         if (!_resolver.TryResolve(out nuint sessionBase))
             return null;
 
-        int confidantId   = *(int*)(sessionBase + (nuint)P5ROffsets.CONFIDANT_ID);
-        int rankLevel     = *(int*)(sessionBase + (nuint)P5ROffsets.RANK_LEVEL);
-        int dialogueIndex = *(int*)(sessionBase + (nuint)P5ROffsets.DIALOGUE_INDEX);
-
-        return new SocialLinkSnapshot(confidantId, rankLevel, dialogueIndex, sessionBase);
+        return TryReadFromPtr(sessionBase);
     }
 }
 
-/// <summary>Immutable snapshot of one Social Link conversation moment.</summary>
+/// <summary>Immutable snapshot of one Social Link hang-out session.</summary>
 internal sealed record SocialLinkSnapshot(
     int   ConfidantId,
     int   RankLevel,
-    int   DialogueIndex,
+    int   SceneNumber,
     nuint SessionBase
 );

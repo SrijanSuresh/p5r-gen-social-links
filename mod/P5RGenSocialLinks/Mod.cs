@@ -2,9 +2,9 @@ using System;
 using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
-using Reloaded.Hooks;
 using Reloaded.Hooks.Definitions;
 using Reloaded.Hooks.Definitions.X64;
+using Reloaded.Mod.Interfaces;
 using Reloaded.Mod.Interfaces.Internal;
 using P5RGenSocialLinks.Memory;
 using P5RGenSocialLinks.Server;
@@ -31,11 +31,13 @@ public class Mod : IModV1
     private Task?                   _pollTask;
     private CancellationTokenSource _cts = new();
 
-    // Conversation-init detour
-    private IHook<ConversationInitDelegate>? _conversationHook;
+    // CMM_EXEC_EVENT detour — fires when a Social Link community event executes.
+    // The native function reads from globals (no meaningful parameters).
+    private IHook<CmmExecEventDelegate>? _conversationHook;
+    private IReloadedHooks?              _hooks;
 
     [Function(CallingConventions.Microsoft)]
-    public delegate void ConversationInitDelegate(nuint sessionPtr);
+    public delegate nint CmmExecEventDelegate();
 
     public void Start(IModLoaderV1 loader)
     {
@@ -48,6 +50,9 @@ public class Mod : IModV1
         _reader = new SocialLinkReader(moduleBase);
         _bridge = new DialogueBridge(_llmClient!, new LoggerAdapter(_logger!));
 
+        // Hooks implementation provided by reloaded.sharedlib.hooks at runtime.
+        loader.GetController<IReloadedHooks>()?.TryGetTarget(out _hooks);
+
         TryActivateHook();
         StartPollLoop();
 
@@ -59,39 +64,55 @@ public class Mod : IModV1
         try
         {
             using var scanner = new FunctionScanner();
-            nuint funcAddr = scanner.FindOrThrow(Signatures.BeginConversation);
-            _logger!.WriteLine($"[P5RGenSocialLinks] Hook target: 0x{funcAddr:X}");
+            nuint funcAddr = scanner.FindOrThrow(Signatures.CmmExecEvent);
+            _logger!.WriteLine($"[P5RGenSocialLinks] CmmExecEvent hook target: 0x{funcAddr:X}");
 
-            var hooks = ReloadedHooks.Instance;
-            _conversationHook = hooks
-                .CreateHook<ConversationInitDelegate>(OnConversationInit, (long)funcAddr)
+            if (_hooks is null)
+            {
+                _logger!.WriteLine("[P5RGenSocialLinks] IReloadedHooks not available — is reloaded.sharedlib.hooks installed?");
+                return;
+            }
+            _conversationHook = _hooks
+                .CreateHook<CmmExecEventDelegate>(OnCmmExecEvent, (long)funcAddr)
                 .Activate();
 
-            _logger.WriteLine("[P5RGenSocialLinks] Conversation hook active.");
+            _logger.WriteLine("[P5RGenSocialLinks] CmmExecEvent hook active.");
         }
         catch (InvalidOperationException ex)
         {
-            _logger!.WriteLine($"[P5RGenSocialLinks] Hook skipped (sig not found): {ex.Message}");
+            _logger!.WriteLine($"[P5RGenSocialLinks] Hook skipped: {ex.Message}");
             _logger.WriteLine("[P5RGenSocialLinks] Falling back to poll loop.");
         }
     }
 
-    private void OnConversationInit(nuint sessionPtr)
+    private nint OnCmmExecEvent()
     {
-        // Run original first so session fields are initialised before we read them
-        _conversationHook!.OriginalFunction(sessionPtr);
+        // Run original first — it populates the session sub-object we are about to read.
+        nint result = _conversationHook!.OriginalFunction();
 
-        _logger?.WriteLine($"[P5RGenSocialLinks] sessionPtr=0x{sessionPtr:X}");
-        _logger?.WriteLine($"[P5RGenSocialLinks] HexDump:{SocialLinkReader.HexDump(sessionPtr)}");
+        try
+        {
+            if (!_reader!.TryResolve(out nuint session))
+            {
+                _logger?.WriteLine("[P5RGenSocialLinks] CmmExecEvent: session chain unresolved.");
+                return result;
+            }
 
-        SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(sessionPtr);
-        if (snap is null)
-            return;
+            _logger?.WriteLine($"[P5RGenSocialLinks] CmmExecEvent session=0x{session:X}");
 
-        _logger?.WriteLine(
-            $"[P5RGenSocialLinks] Hook: Confidant={snap.ConfidantId} Rank={snap.RankLevel}");
+            SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
+            if (snap is null) return result;
 
-        _bridge!.DispatchAsync(snap, ContextBuilder.ReadAndBuild(snap));
+            _logger?.WriteLine(
+                $"[P5RGenSocialLinks] CmmExec: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber}");
+            _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap));
+        }
+        catch (Exception ex)
+        {
+            _logger?.WriteLine($"[P5RGenSocialLinks] OnCmmExecEvent error: {ex.Message}");
+        }
+
+        return result;
     }
 
     // ── Poll loop (fallback) ───────────────────────────────────────────────
@@ -99,19 +120,26 @@ public class Mod : IModV1
     private void StartPollLoop()
     {
         _cts      = new CancellationTokenSource();
-        _timer    = new PeriodicTimer(TimeSpan.FromMilliseconds(250));
+        _timer    = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
         _pollTask = Task.Run(() => PollLoopAsync(_cts.Token));
     }
 
     private async Task PollLoopAsync(CancellationToken ct)
     {
+        nuint lastSession = 0;
+
         while (await _timer!.WaitForNextTickAsync(ct))
         {
-            if (_conversationHook is not null) break;  // hook is live, stop polling
-            SocialLinkSnapshot? snap = _reader!.TryReadSnapshot();
-            if (snap is not null)
-                _logger!.WriteLine(
-                    $"[P5RGenSocialLinks] Poll: Confidant={snap.ConfidantId}");
+            if (!_reader!.TryResolve(out nuint session)) { lastSession = 0; continue; }
+            if (session == lastSession) continue;
+            lastSession = session;
+
+            SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
+            if (snap is null) continue;
+
+            _logger!.WriteLine(
+                $"[P5RGenSocialLinks] Hang-out: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber} (0x{session:X})");
+            _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap));
         }
     }
 

@@ -12,9 +12,9 @@ internal sealed class PointerChainResolver
 {
     private readonly nuint _moduleBase;
 
-    // Pointer chain: [moduleBase + SL_STATIC_PTR] -> +0x18 -> +0x08 -> SocialLinkSession*
-    // These offsets are PLACEHOLDERS — verify with Cheat Engine + Ghidra against your build.
-    private static readonly int[] Chain = { 0x18, 0x08 };
+    // Chain: [moduleBase + SL_STATIC_PTR] -> +0x48 -> CmmSession*
+    // Derived from CMM_EXEC_EVENT: MOV RAX,[CMM_global]; MOV RCX,[RAX+0x48]
+    private static readonly int[] Chain = { P5ROffsets.CMM_SESSION_OFFSET };
 
     internal PointerChainResolver(nuint moduleBase)
     {
@@ -29,18 +29,19 @@ internal sealed class PointerChainResolver
     {
         result = 0;
 
-        // Step 1: read the root static pointer (module-relative, always a valid .data address)
+        // Step 1: read the root static pointer (module-relative)
         nuint address = _moduleBase + (nuint)P5ROffsets.SL_STATIC_PTR;
+        if (!MemoryGuard.IsReadable(address, sizeof(nuint))) return false;
         nuint current = *(nuint*)address;
-        if (current == 0)
-            return false;
+        if (current == 0) return false;
 
-        // Step 2: walk each heap-level offset, null-guarding before every dereference
+        // Step 2: walk each heap-level offset, VirtualQuery-guarding before every dereference
         foreach (int offset in Chain)
         {
-            current = *(nuint*)(current + (nuint)offset);
-            if (current == 0)
-                return false;
+            nuint next = current + (nuint)offset;
+            if (!MemoryGuard.IsReadable(next, sizeof(nuint))) return false;
+            current = *(nuint*)next;
+            if (current == 0) return false;
         }
 
         result = current;
