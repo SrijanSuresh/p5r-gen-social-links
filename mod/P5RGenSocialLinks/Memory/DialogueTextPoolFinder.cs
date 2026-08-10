@@ -27,12 +27,13 @@ internal static class DialogueTextPoolFinder
     private static readonly nuint HeapVaLow  = unchecked((nuint)0x0000_0001_0000_0000UL);
     private static readonly nuint HeapVaHigh = unchecked((nuint)0x0007_FFFF_FFFF_0000UL);
 
-    private const int MinPoolStrings    = 4;
-    private const int MinPrintableChars = 3;   // printable bytes required per string
-    private const int MaxStrLen         = 400;
-    private const int ProbeBytes        = 16384; // bytes to probe per candidate
-    private const int SessionScanBytes  = 512;   // bytes of session struct to walk
-    private const int Depth2ScanBytes   = 256;   // bytes of each Phase-1 target to walk
+    private const int MinPoolStrings      = 4;   // Phases 1 & 2 (targeted pointer follow)
+    private const int MinPoolStringsPhase3 = 8;  // Phase 3 (heap scan) — higher bar to avoid false positives
+    private const int MinPrintableChars   = 3;   // printable bytes required per string
+    private const int MaxStrLen           = 400;
+    private const int ProbeBytes          = 16384; // bytes to probe per candidate
+    private const int SessionScanBytes    = 512;   // bytes of session struct to walk
+    private const int Depth2ScanBytes     = 256;   // bytes of each Phase-1 target to walk
 
     [DllImport("kernel32.dll")]
     private static extern nuint VirtualQuery(
@@ -155,7 +156,7 @@ internal static class DialogueTextPoolFinder
             {
                 int probeLen = (int)Math.Min(mbi.RegionSize, (nuint)ProbeBytes);
                 int count = CountPoolStrings(mbi.BaseAddress, probeLen);
-                if (count >= MinPoolStrings)
+                if (count >= MinPoolStringsPhase3)
                 {
                     log?.Invoke(
                         $"[TextPoolFinder] Phase3: 0x{mbi.BaseAddress:X} ({count} strings, sz=0x{mbi.RegionSize:X}).");

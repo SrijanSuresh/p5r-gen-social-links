@@ -2631,3 +2631,57 @@ When all three phases fail, the mod logs a pointer map of the session struct:
 One session of log output will show us exactly which pointer leads to text. Once we have
 that offset, it becomes a constant in `GameMemory.cs` and the pointer traversal collapses
 to a single dereference.
+
+---
+
+## Ch33 — CMM Struct Population Timing and Poll-Retry Strategy
+
+### The timing gap
+
+`Find()` was called once at session-detection time — the exact moment the poll loop
+first saw a non-zero session pointer. At that moment, the CMM struct at the session
+address looks like this:
+
+```
++0x00: 0E 00 00 00 00 00 00 00  ← ConfidantId=14, SessionPhase=0
++0x08: 0E 00 02 03 28 00 00 00  ← CmmIdRepeat, EventType, RankLevel, SceneNumber
++0x10: 00 00 00 00 00 00 00 00  ← NOT YET POPULATED
++0x18: 00 00 00 00 00 00 00 00  ← NOT YET POPULATED
+```
+
+The internal CMM sub-object pointers (at +0x10+) are populated asynchronously by the
+BF interpreter during scene initialization — typically within one poll interval (≤1 s)
+of session detection.
+
+Evidence from the StructDiff log: when the first diff tick fired for Ryuji Scene 51,
+it showed massive changes including:
+
+```
++0x90:49→10 +0x91:0C→A1 +0x92:CE→3D +0x93:E5→12 +0x94:5C→42 ...
+```
+
+Reading those "to" bytes as a little-endian 64-bit int:
+`[10][A1][3D][12][42][00][00][00]` = `0x0000_0042_12_3D_A1_10` — a valid heap address.
+
+The struct IS full of pointers, they're just not there yet when `Find()` runs.
+
+### Poll-retry pattern
+
+The fix: track a retry counter per session, reset it on new-session and session-end,
+and retry `Find()` on every poll tick while `PoolBase == 0` and retries < 10.
+
+```
+Session detected → Find() attempt 0 (struct empty → nothing found)
+1 tick later    → Find() attempt 1 (struct populated → Phase1 finds pool!)
+```
+
+This costs one extra poll cycle (usually ≤1 s) to discover the pool, which is fine
+because the player almost never advances dialogue within the first second of a hang-out.
+
+### Phase 3 false-positive threshold
+
+The Phase 3 heap scan found `0x4210DC6000` with exactly 4 strings (threshold = 4)
+for Ryuji Scene 51. A real dialogue pool has 20–50 strings; 4 is incidental data.
+
+Fix: Phase 3 requires ≥8 strings (targeted Phase 1/2 keep 4). The heap scan must be
+much more confident before we write-back into an arbitrary memory region.

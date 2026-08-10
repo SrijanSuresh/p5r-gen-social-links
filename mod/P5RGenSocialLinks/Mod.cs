@@ -148,6 +148,7 @@ public class Mod : IModV1
     // ── Poll loop — session lifecycle + text pool discovery ───────────────
 
     private readonly StructDiffScanner _diffScanner = new();
+    private int _poolFindRetries;   // ticks since session start spent retrying Find()
 
     private void StartPollLoop()
     {
@@ -168,6 +169,7 @@ public class Mod : IModV1
                 {
                     _diffScanner.Reset();
                     _bridge!.ResetSession();
+                    _poolFindRetries = 0;
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
                 }
                 lastSession = 0;
@@ -178,6 +180,7 @@ public class Mod : IModV1
             {
                 lastSession = session;
                 _diffScanner.Reset();
+                _poolFindRetries = 0;
 
                 SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
                 if (snap is null) continue;
@@ -185,6 +188,7 @@ public class Mod : IModV1
                 _modLog!.Info(
                     $"[P5RGenSocialLinks] Hang-out: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber} (0x{session:X})");
 
+                // Attempt 0: probe at detection time (struct may not be populated yet).
                 nuint poolBase = DialogueTextPoolFinder.Find(session, msg => _modLog!.Info(msg));
                 _bridge!.SetPoolBase(poolBase);
 
@@ -193,6 +197,21 @@ public class Mod : IModV1
                     _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap), lineIndex: 0);
 
                 continue;
+            }
+
+            // Retry pool discovery on subsequent ticks — the CMM struct populates its internal
+            // heap pointers ~1 tick after session detection, so a one-shot probe at detection
+            // time consistently misses them. Retry up to 10 ticks (≤10 s at default interval).
+            if (_bridge!.PoolBase == 0 && _poolFindRetries < 10)
+            {
+                _poolFindRetries++;
+                _modLog!.Info($"[P5RGenSocialLinks] Pool retry #{_poolFindRetries} for 0x{lastSession:X}");
+                nuint pool = DialogueTextPoolFinder.Find(lastSession, msg => _modLog!.Info(msg));
+                if (pool != 0)
+                {
+                    _bridge!.SetPoolBase(pool);
+                    _modLog!.Info($"[P5RGenSocialLinks] Text pool found on poll retry #{_poolFindRetries}: 0x{pool:X}");
+                }
             }
 
             // Passive struct discovery — disabled by default, enable in GenDialogue.json.
