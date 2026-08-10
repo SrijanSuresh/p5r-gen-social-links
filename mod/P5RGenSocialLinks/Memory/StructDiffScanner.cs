@@ -10,7 +10,7 @@ namespace P5RGenSocialLinks.Memory;
 /// </summary>
 internal sealed unsafe class StructDiffScanner
 {
-    private const int ScanBytes = 64;
+    private const int ScanBytes = 512;
 
     private readonly byte[] _previous = new byte[ScanBytes];
     private bool _hasPrevious;

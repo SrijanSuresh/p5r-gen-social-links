@@ -13,13 +13,14 @@ namespace P5RGenSocialLinks;
 /// </summary>
 internal sealed class DialogueBridge
 {
-    private readonly LLMClient     _llm;
-    private readonly ILogger       _log;
-    private readonly TimeSpan      _timeout;
-    private readonly TimeSpan      _minInterval;
+    private readonly LLMClient      _llm;
+    private readonly ILogger        _log;
+    private readonly TimeSpan       _timeout;
+    private readonly TimeSpan       _minInterval;
     private readonly SessionHistory _history = new();
 
     private DateTimeOffset _lastDispatch = DateTimeOffset.MinValue;
+    private nuint          _poolBase;    // set once per hang-out by SetPoolBase()
 
     internal interface ILogger
     {
@@ -34,19 +35,35 @@ internal sealed class DialogueBridge
         _minInterval = TimeSpan.FromSeconds(cfg?.ThrottleSeconds ?? 3.0);
     }
 
+    /// <summary>Current text pool base; 0 means write-back is disabled for this session.</summary>
+    internal nuint PoolBase => _poolBase;
+
+    /// <summary>
+    /// Stores the text pool base address found at hang-out start.
+    /// The bridge will write LLM responses into pool slot (lineIndex + 1).
+    /// Pass 0 to disable write-back for this session.
+    /// </summary>
+    internal void SetPoolBase(nuint poolBase) => _poolBase = poolBase;
+
     /// <summary>
     /// Fires-and-forgets an LLM request with leading-edge throttling.
     /// Returns false immediately if called within MinDispatchInterval of the last dispatch.
-    /// On success, logs the generated response (write-back pending offset discovery).
+    /// On success, writes the response into text pool slot (lineIndex + 1) when a pool
+    /// base is available; falls back to console logging otherwise.
     /// On timeout or error, the original scripted dialogue remains untouched.
     /// </summary>
-    internal bool DispatchAsync(SocialLinkSnapshot snap, string contextText)
+    internal bool DispatchAsync(SocialLinkSnapshot snap, string contextText, int lineIndex = 0)
     {
         DateTimeOffset now = DateTimeOffset.UtcNow;
         if (now - _lastDispatch < _minInterval)
             return false;
 
         _lastDispatch = now;
+
+        // Capture mutable state before the async hop — lineIndex and poolBase must not be
+        // read from fields after awaiting, as they can change on the next poll tick.
+        nuint capturedPool      = _poolBase;
+        int   capturedLineIndex = lineIndex;
 
         // Include prior LLM lines this session as context for continuity.
         // Trim to MaxContextChars so we never exceed Pydantic's max_length=1024.
@@ -82,9 +99,19 @@ internal sealed class DialogueBridge
                         _log.WriteLine("[P5RGenSocialLinks] LLM: duplicate response suppressed.");
                         return;
                     }
-                    // TODO: dialogue write-back requires locating the text buffer offset.
-                    // For now, log the generated response so we can verify E2E flow.
+
                     _log.WriteLine($"[P5RGenSocialLinks] LLM: \"{text[..Math.Min(text.Length, 120)]}\"");
+
+                    // Write-back: overwrite the NEXT line (capturedLineIndex + 1) so it's
+                    // ready before the player presses confirm on the current line.
+                    if (capturedPool != 0)
+                    {
+                        int targetSlot = capturedLineIndex + 1;
+                        bool wrote = Memory.DialogueWriter.WriteAtLineIndex(capturedPool, targetSlot, text);
+                        _log.WriteLine(wrote
+                            ? $"[P5RGenSocialLinks] Write-back: wrote {text.Length} chars to pool slot {targetSlot}."
+                            : $"[P5RGenSocialLinks] Write-back: FAILED for slot {targetSlot} (pool=0x{capturedPool:X}).");
+                    }
                 }
             }
             catch (InferenceInFlightException)
@@ -113,5 +140,6 @@ internal sealed class DialogueBridge
     {
         _history.Reset();
         _lastDispatch = DateTimeOffset.MinValue;
+        _poolBase     = 0;
     }
 }

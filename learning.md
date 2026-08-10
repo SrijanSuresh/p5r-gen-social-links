@@ -2133,3 +2133,413 @@ it keeps `learning.md` motivated by giving it an audience.
 
 This is the standard pattern for research-oriented projects: the README is the contract,
 the journal is the reasoning.
+
+---
+
+## Ch26 — In-Process Heap Scanning and Dialogue Write-Back Architecture
+
+### Why We Don't Need Cheat Engine
+
+CE is a GUI front-end over the same Win32 API calls any process can make. Its "find
+what writes" is a VEH (vectored exception handler) memory-access watchpoint; its
+string scan is a walk over `VirtualQuery`-enumerated committed pages. Since our C#
+mod runs *inside* P5R's process (injected by Reloaded-II), we have identical access
+to that address space with no extra privileges required.
+
+The C# equivalents:
+- CE "scan all memory for string" → `VirtualQuery` loop + `memcmp` / string heuristic
+- CE "find what accesses address" → hardware breakpoint via `SetThreadContext` (not needed here)
+- CE "pointer scan" → walk a region for 8-byte values in the heap VA range
+
+### VirtualQuery and the Virtual Address Space Layout
+
+`VirtualQuery(address)` returns a `MEMORY_BASIC_INFORMATION` block describing the
+*region* containing `address` — its base, size, state, and protection flags.
+
+The three state values we care about:
+
+| State      | Meaning                              |
+|------------|--------------------------------------|
+| MEM_COMMIT | Pages are backed by RAM or page file |
+| MEM_RESERVE| Reserved, not accessible             |
+| MEM_FREE   | Not reserved — safe to skip          |
+
+Heap allocations are always `MEM_COMMIT` + `MEM_PRIVATE` (not mapped from a file).
+Code sections are `MEM_COMMIT` + `MEM_IMAGE`. This lets us filter heap regions from
+everything else.
+
+To walk the entire address space:
+```csharp
+nuint addr = 0;
+while (VirtualQuery(addr, out MBI mbi, ...) != 0)
+{
+    if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && readable)
+        Probe(mbi.BaseAddress, mbi.RegionSize);
+    addr = mbi.BaseAddress + mbi.RegionSize; // advance to next region
+}
+```
+
+### The Counter Struct Pivot
+
+Brute-force scanning the entire heap is slow and noisy. We have a better anchor:
+`0x006FFC10` — the base of the counter struct whose `+0x18` field is the line counter
+at `0x006FFC28`.
+
+The CE write instruction was `mov [rcx+18],eax`, so `rcx` held a pointer to the
+counter struct. That struct almost certainly also holds a pointer *to the text pool* —
+it's the object responsible for tracking position within the pool.
+
+Strategy: read 256 bytes from `0x006FFC10` and treat every aligned 8-byte word as a
+candidate pointer. Filter to the heap VA range (roughly `0x1_0000_0000` to
+`0x7FF_FFFF_0000` on Windows x64). For each candidate, probe the pointed-to address
+for the text pool pattern. This is typically 1–4 probes rather than hundreds.
+
+### Text Pool Heuristic
+
+A BF script text pool has a distinctive fingerprint:
+- Multiple consecutive null-terminated strings (5+ in a row)
+- Each string is printable ASCII, 10–300 chars long (dialogue, not binary data)
+- No binary junk between strings — just `\0` separators
+
+Distinguishing it from other string pools (debug log buffers, localization tables,
+path strings) relies on quantity: a dialogue scene has 20–50 lines, so a genuine pool
+has more consecutive valid strings than any incidental string region.
+
+### Write-Back Timing
+
+P5R pre-loads the entire scene's text into the pool at hang-out start. The pool
+persists until the session ends. Our write window is:
+
+```
+[Session struct appears] ←── our window ──→ [Player advances line 0]
+         ↑                                              ↑
+    CMM hook fires,                          Too late for line 0
+    pool scan runs,                          (already rendered)
+    LLM request fires
+```
+
+LLM response comes back in <2s. If the player takes >2s to press confirm on the
+first line (they always do — cutscene animations, reading time), we win the race.
+
+For subsequent lines: `LineCounterMonitor` fires when line N advances. We dispatch
+LLM immediately, response arrives in <2s, we write to line N+1. The player has to
+read line N+1 and press confirm, which is always more than 2s.
+
+The key insight: **write ahead, not to the current line**. By the time the LLM
+responds, line N is already displayed. We write to N+1 (the line the player hasn't
+seen yet).
+
+### Write Truncation
+
+Strings in the text pool are packed contiguously:
+```
+[str0]\0[str1]\0[str2]\0...
+```
+
+If we write more bytes than `strlen(strN)`, we corrupt `str(N+1)`. The rule: always
+`min(llm_text_length, original_string_length)`. Read the original length first by
+scanning for the next `\0` from the target offset, then truncate the LLM text to
+`original_length - 1` (leaving one byte for the null terminator).
+
+### Encoding
+
+P5R PC (English, Steam) stores dialogue as **UTF-8** (effectively ASCII for English
+text — all chars are < 0x80). The existing `DialogueWriter` stub assumed UTF-16LE
+(wide chars), which is wrong for this pool. The fix is straightforward:
+
+```csharp
+byte[] encoded = Encoding.UTF8.GetBytes(text);
+// Write bytes, not chars
+```
+
+For future Japanese locale support: Shift-JIS encoding, not UTF-16. But for now
+`UTF8.GetBytes` on pure English text gives identical output to ASCII.
+
+### The IsWritable Guard
+
+Write-back needs a writable page. `MemoryGuard.IsReadable` only checks readable
+protection flags. We need `IsWritable`, which additionally requires:
+- `PAGE_READWRITE` (0x04) — normal heap pages
+- `PAGE_EXECUTE_READWRITE` (0x40) — JIT-compiled or self-modifying code (rare here)
+- `PAGE_WRITECOPY` (0x08) — copy-on-write mapped sections
+
+Heap memory is always `PAGE_READWRITE`, so in practice this is just checking that
+flag. But we guard it properly to avoid an access violation if the protection ever
+changes (e.g., after a `VirtualProtect` call by the game's anti-tamper layer).
+
+---
+
+## Chapter 27: Following Pointer Chains to Nested Sub-Objects
+
+### Why the Counter Isn't at the Top Level
+
+We scanned 256 bytes of the session struct while the player fast-forwarded through
+dialogue with Shift+F — dozens of line-advance presses in a few seconds. Only the
+game clock at +0x20/+0x21 changed. This rules out any per-line counter in the first
+256 bytes of the session struct.
+
+So where is it? Game engines decompose large systems into nested objects. P5R's
+CommunityManager session is not a flat blob; it's a root object that holds **pointers
+to sub-objects** for each subsystem: dialogue display, voice playback, camera control,
+etc. The line counter almost certainly lives inside one of those sub-objects.
+
+### What We Saw at Hang-Out Start
+
+The StructDiff log showed bytes changing at session struct offsets **+0xE0, +0xE8,
++0xF0** at the moment the hang-out began — then staying constant for the rest of the
+session. That pattern is diagnostic: it's a set of pointers being written into the
+struct at initialization. Before the hang-out, those slots held 0 (or a prior
+hang-out's stale pointer). When CMM_EXEC_EVENT fires, the engine allocates sub-objects
+for this session and stores their addresses in those slots.
+
+### Pointer Following as a Scanning Strategy
+
+Instead of guessing the counter's offset in the session struct (where it doesn't
+exist), we follow the known pointers:
+
+```
+session_struct + 0xE0  →  dialogue_manager_A  (8-byte pointer)
+session_struct + 0xE8  →  dialogue_manager_B  (8-byte pointer)
+session_struct + 0xF0  →  dialogue_manager_C  (8-byte pointer)
+```
+
+For each of those addresses, we run the same StructDiff scan we ran on the session
+struct — polling every 500 ms, recording which bytes change. A byte that increments
+monotonically with each line advance is the counter.
+
+### Reading a Raw Pointer in Unsafe C#
+
+```csharp
+nuint ptrAddr = sessionPtr + 0xE0;           // address of the slot
+nuint target  = *(nuint*)ptrAddr;            // dereference: read the 8-byte pointer
+byte* subObj  = (byte*)target;               // cast to byte* to scan sub-object
+```
+
+This is identical to the two-level dereference our PointerChainResolver already does:
+`[module + SL_STATIC_PTR]` → `[result + CMM_SESSION_OFFSET]`. We're just adding a
+third level, but because the first two levels are stable (module-relative), and we
+call `MemoryGuard.IsReadable` before every dereference, it's safe.
+
+### The PointerFollowScanner Design
+
+`PointerFollowScanner` captures the three pointer values once at hang-out start
+(right after StructDiff.Reset), then on every poll tick it diffs the 256 bytes each
+pointer points to. Output is labelled with the source offset and target address so
+we can immediately identify which sub-object contains the counter:
+
+```
+[PtrFollow +0xE0 → 0x41DE91A000] +0x18:00→01  ← this is our counter
+```
+
+Once we see monotonically incrementing bytes, we have the offset. We then hard-code
+that as a new field in `P5ROffsets` — exactly like we did for `CMM_SESSION_OFFSET`
+after the Ghidra analysis.
+
+---
+
+## Chapter 28 — HeapScan Artefacts: 0xFF Fill Patterns and Mid-Session Comparison
+
+### What we observed
+
+After a full Takemi hang-out the HeapScan reported 30 candidates — all of them
+`0 → 255 (+255)`. The LineCounterMonitor fired with values 48, 144, 0, 112 — jumping
+around non-monotonically. Neither result is the dialogue line counter.
+
+### Why all deltas were exactly +255
+
+Windows game heaps commonly fill freed blocks with `0xDD` (MSVC debug heap) or
+`0xFE`/`0xFF` (release allocators and custom game allocators for use-after-free
+detection). At the moment we called `FindIncreased`, the game scene had already begun
+or completed teardown. Objects allocated during the scene were freed; their backing
+pages were flood-filled with `0xFF`. Our snapshot captured `0x00` (pages that existed
+but held unused/zeroed bytes at session start). By comparison time those same bytes
+held `0xFF`. Delta = 255, exact maximum — for every one of them.
+
+The real dialogue counter, if it incremented from 0 to N (where N = lines pressed ≈
+20–30), would show a delta of +20 to +30. But 30 slots × +255 entries dominated the
+sorted output and our 30-result cap hid anything smaller.
+
+### Why the LineCounterMonitor values made no sense
+
+`0x6FFC28` is ASLR-relocated heap memory that belongs to whichever object the
+allocator placed there in *this boot*. The CE session that identified this address ran
+in a different launch. The allocator placed the counter object at that address then;
+in subsequent boots a different object lives there. The values 48 (`0x30`), 144
+(`0x90`), 0, 112 (`0x70`) are bytes written by *that other object* — likely an audio
+channel state or animation frame byte — not by the dialogue counter. `HasAdvanced()`
+fires on any change; the byte at `0x6FFC28` changes because that other object updates,
+not because a dialogue line advanced.
+
+### The two-pronged fix
+
+**Fix 1 — Cap maxDelta at 50.** A dialogue scene with 20–30 button presses produces a
+counter increment of 20–30. No one presses 255 lines in a single hang-out. By passing
+`maxDelta: 50` we exclude every 0xFF teardown byte and surface only genuine small-step
+increments. If the counter *is* in our scan range (0x10000–0x20000000), it will appear
+in the filtered results after this change.
+
+**Fix 2 — Mid-session comparison at tick 20 (≈10 s).** The snapshot is taken at
+session start. If we compare too early nothing has changed yet; if we compare at
+session *end* the teardown noise dominates. The sweet spot is mid-scene: the player
+has been pressing dialogue buttons for ~10 seconds but the game has not started
+freeing scene objects. At tick 20 of the 500 ms poll loop we call `FindIncreased`
+against the original snapshot and log results. Teardown bytes are still 0x00 at this
+point; the counter has incremented by however many lines the player pressed. This
+gives us a clean signal window.
+
+### The tick counter design
+
+`_sessionTick` is an `int` field reset to 0 each time a new session is detected. It
+increments once per poll tick (500 ms). At tick 20 (≈10 s) the mid-session comparison
+runs automatically. This mirrors the "two-pass snapshot" mental model from Chapter 28:
+
+```
+t=0   : TakeSnapshot()         — baseline, all bytes at rest
+t=10s : FindIncreased(max=50)  — lines pressed, no teardown noise
+t=end : FindIncreased(max=50)  — may still be useful if session didn't clean up
+```
+
+If the counter appears in the t=10s window we have our address. If not, it's outside
+0x10000–0x20000000 and we need to extend the scan ceiling.
+
+---
+
+## Chapter 29 — High-Heap Scanning and Cumulative Baseline Diffs
+
+### Why all mid-session results were exactly +50
+
+The mid-session scan fired at tick 20 — exactly 10 real seconds (20 × 500 ms). The
+results all showed `+50`. The coincidence is deliberate: these bytes count elapsed game
+time in 200 ms units. 10 seconds ÷ 200 ms = 50 ticks. Every byte controlled by this
+timer incremented by exactly 50 between snapshot and comparison.
+
+The dialogue counter (one increment per F-press) would show a much smaller delta —
+typically +5 to +20 for a normal scene. But since ALL 50 result slots were occupied by
+the +50 timer bytes, the actual counter (if present in the low heap) was cut off.
+
+### Why the low-heap scan had no counter at all
+
+The session struct is at `0x424BD57FC0` — roughly 265 GB into the process address
+space. The PtrFollow sub-object target is at `0x41E67C9240` — about 174 MB lower.
+Both are way above our scan ceiling of `0x20000000` (512 MB). The counter object was
+never in our scan window in the first place. Low-heap (< 512 MB) contains DLL images,
+CLR stubs, and CRI audio ring buffers — not the game's primary heap.
+
+### Fix 1 — Pivot-based high-heap scan
+
+Instead of a fixed `[0x10000, 0x20000000]` range, pass the live session struct address
+as a pivot and scan `[pivot - 256 MB, pivot + 256 MB]`. With the 64 MB total-bytes
+cap, we snapshot the first 64 MB of committed+RW pages in that 512 MB window, which
+are the pages closest to the session struct. The counter object, being allocated from
+the same heap arena, is very likely within 64 MB of the session struct.
+
+### Fix 2 — PtrFollow cumulative baseline
+
+The existing `PointerFollowScanner` diffs each sub-object tick-to-tick, showing
+which bytes flip between ticks. That's good for finding volatile pointers but misses a
+slowly incrementing counter (it only changes by +1 per press, which is often
+indistinguishable from noise in a single-tick diff).
+
+The fix: when a target is first captured, save its bytes as a *baseline*. Then at
+mid-session and session-end, `CumulativeDiff()` compares *current* bytes to the
+*baseline* — showing the total change since capture. A counter that went 0→15 over 15
+presses appears as `+0x18: 0→15 (+15)` even if each tick only produced `+0x18:14→15`.
+
+This turns PtrFollow from a one-tick diff tool into a session-scoped counter detector,
+targeting the exact sub-objects the session struct already pointed us to.
+
+### Why PtrFollow is better than a full heap scan for this
+
+PtrFollow scans only the three 256-byte windows at `session+0xE0`, `session+0xE8`, and
+`session+0xF0` — the pointers the game engine wrote into the session struct. Any
+sub-system that the session struct delegates to lives at one of those targets. The
+dialogue counter, being part of the dialogue sub-system, is almost certainly reachable
+from one of these pointers. Scanning 3 × 256 B = 768 B is far cleaner than scanning
+64 MB of heap noise.
+
+---
+
+## Chapter 30 — DLL Address Poisoning and Timer Array Filtering
+
+### How PtrFollow lost the stable target
+
+`PointerFollowScanner.Update()` accepts any user-mode address in the range
+`0x10000–0x7FFF_FFFF_FFFF`. That range includes DLL image sections (`0x7FF8...`).
+
+When the session struct's +0xF0 slot briefly holds a vtable pointer or code pointer
+from a DLL, Update() sees a valid user-mode candidate, overwrites the previous target
+(`0x41DBC05050`), and resets `_hasSnapshot` — which also resets `_hasBaseline`.
+The cumulative history is destroyed. At the mid-session check, no baseline exists.
+
+The fix is a tighter upper bound. Windows x64 loads DLLs at the *top* of user space
+(around `0x7FF80000_00000` and above). Game heap objects live in the `0x40...-0x43...`
+range — well below `0x7F00_0000_0000`. Adding a `HeapAddressMax = 0x7F00_0000_0000`
+ceiling keeps DLL pointers from evicting stable heap targets.
+
+### Why all HeapScan results form regular arrays
+
+Looking at mid-session addresses: `0x423FE55F9E`, `0x423FE55FA2`, `0x423FE55FA6`...
+each exactly 4 bytes apart. These are contiguous fields within a struct array — the
+game's animation or audio sub-system keeps many timer counters in a flat struct array,
+all ticking at the same rate (0.75 Hz in this session). All entries hit the same delta
+(+15 in 20 seconds) and dominate the result set.
+
+The dialogue counter is a *single* value, not an array member. Post-processing the
+scan results with a stride filter — marking any two hits within 48 bytes and aligned
+to a 4-byte stride as array co-members, then removing both — leaves only isolated
+addresses. An isolated byte that went up by some small delta matching the number of
+lines pressed is the counter.
+
+### The extended SubScanBytes
+
+PtrFollow scanned 256 bytes (offsets 0x00–0xFF) of each sub-object. If the sub-object
+header occupies ~200 bytes and the dialogue line index is at offset +0x100 or above,
+it was never diffed. Extending SubScanBytes to 512 (offsets 0x00–0x1FF) gives a full
+512-byte window into each pointed-to sub-object — covering the range where game-engine
+dialogue managers typically store line counters.
+
+---
+
+## Chapter 31 — Recognizing Sunk Cost: Deleting the Scanner Triad
+
+### What we built vs. what we needed
+
+Three scanners were written over several sessions:
+
+| Scanner | Purpose | Verdict |
+|---|---|---|
+| `LineCounterMonitor` | Monitor a CE-discovered byte counter | Dead: 0x6FFC28 is a stale heap address that changes every boot |
+| `HeapCounterScanner` | Snapshot the game heap and find counter by delta | Dead: timer arrays dominated every result; counter obscured |
+| `PointerFollowScanner` | Follow session-struct pointers to sub-objects | Dead: DLL address poisoning kept resetting cumulative baselines |
+
+### Why they were unnecessary from the start
+
+`CmmExecEvent` already fires **once per dialogue line** — that is the per-line trigger.
+The hook is already wired, already dispatches to the LLM, and already throttles correctly.
+We spent several sessions trying to build a second per-line trigger via memory scanning
+when a working one existed in the codebase the whole time.
+
+This is the sunk-cost trap in game modding: once you commit to a memory-scan approach
+it is easy to keep patching it instead of stepping back and asking whether the goal is
+already met by another path.
+
+### What this means for the architecture
+
+The cleanup leaves a simpler `Mod.cs` poll loop:
+
+```
+tick: TryResolve session
+  → new session: dispatch one LLM call (hook fallback) + start StructDiff
+  → same session: StructDiff for passive discovery only
+  → session gone: reset
+```
+
+The hook path is the primary per-line trigger. The poll loop is purely for session
+lifecycle management and text-pool discovery (Phase 3).
+
+### The real Phase 3 blocker
+
+`TextPoolFinder.Find()` returns 0 every session. The LLM generates dialogue but
+cannot inject it because there is no confirmed write-back target. Fixing that —
+finding where the game stores the displayed dialogue string — is the only remaining
+work before Phase 3 is complete. It does not require the counter.

@@ -19,7 +19,6 @@ public class Mod : IModV1
     private DialogueBridge?   _bridge;
     private SocialLinkReader? _reader;
 
-    // Adapts Reloaded's ILoggerV2 to DialogueBridge's internal ILogger contract.
     private sealed class LoggerAdapter : DialogueBridge.ILogger
     {
         private readonly ILoggerV2 _inner;
@@ -27,13 +26,11 @@ public class Mod : IModV1
         public void WriteLine(string msg) => _inner.WriteLine(msg);
     }
 
-    // Polling (fallback while hook is placeholder)
     private PeriodicTimer?          _timer;
     private Task?                   _pollTask;
     private CancellationTokenSource _cts = new();
 
-    // CMM_EXEC_EVENT detour — fires when a Social Link community event executes.
-    // The native function reads from globals (no meaningful parameters).
+    // CmmExecEvent fires once per dialogue line — this is the primary per-line LLM trigger.
     private IHook<CmmExecEventDelegate>? _conversationHook;
     private IReloadedHooks?              _hooks;
     private int                          _cmmExecFireCount;
@@ -45,9 +42,8 @@ public class Mod : IModV1
 
     public void Start(IModLoaderV1 loader)
     {
-        _logger    = (ILoggerV2)loader.GetLogger();
+        _logger = (ILoggerV2)loader.GetLogger();
 
-        // Load user-editable runtime config from GenDialogue.json next to the DLL.
         string modDir = System.IO.Path.GetDirectoryName(
             System.Reflection.Assembly.GetExecutingAssembly().Location) ?? ".";
         _cfg    = GenConfig.Load(modDir);
@@ -55,8 +51,6 @@ public class Mod : IModV1
         _modLog.Always($"[P5RGenSocialLinks] Config: throttle={_cfg.ThrottleSeconds}s timeout={_cfg.TimeoutSeconds}s url={_cfg.ServerUrl} logLevel={_cfg.LogLevel}");
 
         _llmClient = new LLMClient(_cfg.ServerUrl);
-
-        // Async health check — fires after a 2s delay to let the model finish loading.
         ServerHealthChecker.CheckAsync(_cfg.ServerUrl, msg => _logger.WriteLine(msg));
 
         nuint moduleBase = (nuint)Process.GetCurrentProcess().MainModule!.BaseAddress;
@@ -66,7 +60,6 @@ public class Mod : IModV1
             msg => _logger!.WriteLine(msg));
         _bridge = new DialogueBridge(_llmClient!, new LoggerAdapter(_logger!), _cfg);
 
-        // Hooks implementation provided by reloaded.sharedlib.hooks at runtime.
         loader.GetController<IReloadedHooks>()?.TryGetTarget(out _hooks);
 
         TryActivateHook();
@@ -75,7 +68,6 @@ public class Mod : IModV1
         _logger.WriteLine($"[P5RGenSocialLinks] Started — hook:{(_hookActive ? "ON" : "OFF")} poll:ON");
     }
 
-    // Tracks whether the hook wired successfully — logged on Start() completion.
     private bool _hookActive;
 
     private void TryActivateHook()
@@ -91,7 +83,7 @@ public class Mod : IModV1
 
             if (_hooks is null)
             {
-                _logger!.WriteLine("[P5RGenSocialLinks] Hook skipped — IReloadedHooks null (install reloaded.sharedlib.hooks).");
+                _logger!.WriteLine("[P5RGenSocialLinks] Hook skipped — IReloadedHooks null.");
                 return;
             }
 
@@ -111,10 +103,8 @@ public class Mod : IModV1
 
     private nint OnCmmExecEvent()
     {
-        // Run original first — it populates the session sub-object we are about to read.
-        nint result = _conversationHook!.OriginalFunction();
-
-        int fireCount = System.Threading.Interlocked.Increment(ref _cmmExecFireCount);
+        nint result    = _conversationHook!.OriginalFunction();
+        int  fireCount = Interlocked.Increment(ref _cmmExecFireCount);
 
         try
         {
@@ -124,16 +114,15 @@ public class Mod : IModV1
                 return result;
             }
 
-            _logger?.WriteLine($"[P5RGenSocialLinks] CmmExecEvent #{fireCount} session=0x{session:X}");
-
             SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
             if (snap is null) return result;
 
-            _logger?.WriteLine(
+            _modLog!.Info(
                 $"[P5RGenSocialLinks] CmmExec #{fireCount}: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber}");
-            bool dispatched = _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap));
+
+            bool dispatched = _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap), lineIndex: fireCount);
             if (!dispatched)
-                _logger?.WriteLine($"[P5RGenSocialLinks] CmmExec #{fireCount}: throttled (< 3s since last dispatch).");
+                _modLog!.Info($"[P5RGenSocialLinks] CmmExec #{fireCount}: throttled.");
         }
         catch (Exception ex)
         {
@@ -143,10 +132,9 @@ public class Mod : IModV1
         return result;
     }
 
-    // ── Poll loop (fallback + struct discovery) ───────────────────────────
+    // ── Poll loop — session lifecycle + text pool discovery ───────────────
 
-    private readonly StructDiffScanner   _diffScanner    = new();
-    private readonly LineCounterMonitor  _lineMonitor    = new();
+    private readonly StructDiffScanner _diffScanner = new();
 
     private void StartPollLoop()
     {
@@ -166,7 +154,6 @@ public class Mod : IModV1
                 if (lastSession != 0)
                 {
                     _diffScanner.Reset();
-                    _lineMonitor.Deactivate();
                     _bridge!.ResetSession();
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
                 }
@@ -178,7 +165,6 @@ public class Mod : IModV1
             {
                 lastSession = session;
                 _diffScanner.Reset();
-                _lineMonitor.Activate();
 
                 SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
                 if (snap is null) continue;
@@ -186,24 +172,17 @@ public class Mod : IModV1
                 _modLog!.Info(
                     $"[P5RGenSocialLinks] Hang-out: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber} (0x{session:X})");
 
+                nuint poolBase = DialogueTextPoolFinder.Find(session, msg => _modLog!.Info(msg));
+                _bridge!.SetPoolBase(poolBase);
+
+                // Fallback dispatch if hook isn't active.
                 if (!_hookActive)
-                    _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap));
+                    _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap), lineIndex: 0);
 
                 continue;
             }
 
-            // Per-line trigger: fire LLM when dialogue line counter advances.
-            if (_lineMonitor.HasAdvanced())
-            {
-                SocialLinkSnapshot? lineSnap = SocialLinkReader.TryReadFromPtr(session);
-                if (lineSnap is not null)
-                {
-                    _modLog!.Info($"[P5RGenSocialLinks] Line advanced (counter={_lineMonitor.CurrentValue()}) — dispatching LLM.");
-                    _bridge!.DispatchAsync(lineSnap, ContextBuilder.Build(lineSnap));
-                }
-            }
-
-            // Struct diff — passive discovery of per-line changing fields.
+            // Passive struct discovery — disabled by default, enable in GenDialogue.json.
             if (_cfg.StructDiffEnabled)
             {
                 string? diff = _diffScanner.Diff(session);

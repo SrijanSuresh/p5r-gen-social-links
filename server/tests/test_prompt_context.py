@@ -9,7 +9,7 @@ from social_link.prompt_builder import build_prompt, _tier_note, SYSTEM_TEMPLATE
 
 RYUJI_ID  = 8
 MAKOTO_ID = 3
-KASUMI_ID = 22
+KASUMI_ID = 25  # provisional — verify by checking mod console during Kasumi hang-out
 
 
 def _system(confidant_id: int, rank: int, context: str = "gym scene") -> str:

@@ -50,7 +50,7 @@ app = FastAPI(title="P5R Generative Social Links", version="0.3.0", lifespan=lif
 
 
 class GenerateRequest(BaseModel):
-    confidant_id: int = Field(..., ge=0, le=25)
+    confidant_id: int = Field(..., ge=0, le=50)
     rank: int = Field(..., ge=1, le=10)
     context: str = Field(..., max_length=1024)
     character_name: str = Field(..., max_length=64)
