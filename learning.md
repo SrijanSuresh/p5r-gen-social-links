@@ -2543,3 +2543,91 @@ lifecycle management and text-pool discovery (Phase 3).
 cannot inject it because there is no confirmed write-back target. Fixing that —
 finding where the game stores the displayed dialogue string — is the only remaining
 work before Phase 3 is complete. It does not require the counter.
+
+---
+
+## Ch32 — Why TextPoolFinder Fails: Three Root Causes and the Fix
+
+### Root cause 1: Wrong anchor address
+
+`DialogueTextPoolFinder` Phase 1 searches for text by probing the counter struct at
+`0x006FFC10`. That address came from Cheat Engine: `mov [rcx+18],eax` — the write
+instruction for the line counter — put `rcx = 0x006FFC10` during one specific session.
+
+Two problems:
+
+1. **It is an absolute heap address.** It is not derived from `moduleBase` or the static
+   pointer chain. On the next game launch, ASLR places the heap at a completely different
+   base. `0x006FFC10` is now garbage or unmapped.
+
+2. **It is the wrong object anyway.** The counter struct tracks *position* within the
+   dialogue sequence. The *text* lives in the BF script text pool, which is managed by a
+   different subsystem. The counter struct may not hold a pointer to the text pool at all.
+
+The correct anchor is the **session struct** — the object we already own via the static
+pointer chain `[moduleBase + 0x2A63EF0] → [CMM + 0x48]`. `GameMemory.cs` confirms that
+offsets `+0x10` onwards are "internal CMM pointers." Those pointers are our starting
+point, not a CE-discovered absolute address.
+
+### Root cause 2: Fingerprint too strict
+
+The current text pool fingerprint requires every byte to be printable ASCII (0x20–0x7E).
+P5R's AtlusScript / FlowScript compiled format embeds control codes inside dialogue
+strings:
+
+```
+"Dude, what's up?\x01\x00\x00\x04I was thinkin'...\0"
+                  ^^^^-- escape code sequence
+```
+
+These control codes (bytes 0x01–0x1F) signal pause markers, line-break characters,
+speaker name injections, and color changes to the BF interpreter. They are *inside* the
+string — between printable characters — so the fingerprint check fails as soon as it sees
+`0x01` and abandons the entire string candidate.
+
+The fix: a string is "valid" if at least 50 % of its non-null bytes are printable
+(0x20–0x7E) and it contains at least 3 printable characters. Any byte below 0x20 is an
+escape code and is tolerated, not rejected.
+
+### Root cause 3: Find() called at session-detection time, not hook-fire time
+
+`Mod.cs` calls `DialogueTextPoolFinder.Find()` inside the poll loop when it first sees a
+new session pointer. At that moment, the BF interpreter may have just started loading the
+scene script — the text pool may not yet be decompressed into a heap allocation.
+
+`CmmExecEvent` fires **after** the BF interpreter has rendered the current line. By the
+time `lineIndex = 1`, the text pool is guaranteed to be in memory. The finder should
+be retried inside `OnCmmExecEvent` for the first 3–5 fires if `poolBase` is still 0.
+
+### The pointer-traversal pattern
+
+After anchoring to the session struct, the strategy is:
+
+```
+sessionBase
+ +0x10: ptr_A  →  probe ptr_A for pool fingerprint
+ +0x18: ptr_B  →  probe ptr_B for pool fingerprint
+ +0x20: ptr_C  →  scan first 256 bytes of ptr_C for sub-pointers → probe each
+ ...
+```
+
+This is bounded: the session struct is ~256 bytes → at most 30 candidate pointers
+(256/8). Each pointer is probed once (16 KB scan). Two-level traversal doubles the
+candidates but is still O(1) relative to session size.
+
+Compare this to the Phase 3 heap scan (±128 MB) which walks thousands of VirtualQuery
+regions. The pointer-traversal path is faster and more targeted.
+
+### Diagnostic dump
+
+When all three phases fail, the mod logs a pointer map of the session struct:
+
+```
+[TextPoolFinder] Diag: session=0x424... (+0x10)=0x51... HEAP printable=38%
+[TextPoolFinder] Diag: session=0x424... (+0x18)=0x52... HEAP printable=12%
+[TextPoolFinder] Diag: session=0x424... (+0x20)=0x53... HEAP printable=71% ← candidate?
+```
+
+One session of log output will show us exactly which pointer leads to text. Once we have
+that offset, it becomes a constant in `GameMemory.cs` and the pointer traversal collapses
+to a single dereference.
