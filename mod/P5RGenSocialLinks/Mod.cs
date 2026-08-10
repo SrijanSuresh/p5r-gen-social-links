@@ -60,6 +60,12 @@ public class Mod : IModV1
     private nuint  _bfBufferBase;
     private int    _bfBufferOff;   // session struct offset where we found it (for logging)
 
+    // Large-copy log: OnGameMemcpy records the dst of every heap-to-heap copy
+    // ≥ 500 bytes. TryFindBfBuffer probes these at session start to locate the
+    // BF script buffer, which is loaded in one bulk copy before session detection.
+    private readonly System.Collections.Generic.List<nuint> _largeCopyDsts = new();
+    private readonly object _largeCopyLock = new();
+
     private GenConfig _cfg = new();
 
     public void Start(IModLoaderV1 loader)
@@ -113,16 +119,26 @@ public class Mod : IModV1
     {
         _memcpyHook!.OriginalFunction(dst, src, count);
 
-        // Quick reject: both ends must be in game heap; size 10–150 bytes covers
-        // all realistic dialogue line lengths and excludes 280/384-byte vertex copies.
         if (dst < HeapLow || src < HeapLow) return;
+
+        // Record all large heap-to-heap copy destinations. The BF scene script is
+        // loaded in one bulk copy (several KB) before session detection. We store
+        // the dst here and probe it for BF content when the session is first seen.
+        if (count >= 500 && count <= 500_000)
+        {
+            lock (_largeCopyLock)
+            {
+                if (_largeCopyDsts.Count < 150)
+                    _largeCopyDsts.Add(dst);
+            }
+        }
+
+        // Small-copy vowel filter: IEEE 754 float data (>?@ABCfwD…) has zero
+        // lowercase vowels. English dialogue always has ≥3.
         if (count < 10 || count > 150) return;
         if (!Memory.MemoryGuard.IsReadable(dst, (int)count)) return;
 
         byte* d = (byte*)dst;
-
-        // Vowel filter: IEEE 754 float data in the printable range (>?@ABCfwD…)
-        // contains ZERO lowercase vowels. English dialogue always has ≥3.
         int vowels = 0;
         for (nuint i = 0; i < count; i++)
         {
@@ -229,9 +245,74 @@ public class Mod : IModV1
     /// ≥4 printable chars is selected as the BF script buffer — because a real BF dialogue
     /// script has many null-separated lines, while embedded metadata has one or two.
     /// </summary>
+    /// <summary>
+    /// Returns true if <paramref name="ptr"/> looks like a BF dialogue script:
+    /// has a long printable run AND at least 3 null-terminated strings that each
+    /// contain ≥ 2 lowercase vowels (English sentences, not mesh/texture IDs).
+    /// </summary>
+    private static unsafe bool ProbeForBfContent(nuint ptr)
+    {
+        const int probeSize = 2048;
+        if (!Memory.MemoryGuard.IsReadable(ptr, probeSize)) return false;
+        byte* b = (byte*)ptr;
+
+        int maxRun = 0, run = 0;
+        for (int i = 0; i < probeSize; i++)
+        {
+            if (b[i] >= 0x20 && b[i] <= 0x7E) { if (++run > maxRun) maxRun = run; }
+            else run = 0;
+        }
+        if (maxRun < 12) return false;
+
+        // Require ≥ 3 null-terminated strings with ≥ 2 vowels each.
+        // Mesh names ("mesh_920", "Ryuji_Hair") fail; English sentences pass.
+        int goodStrings = 0, pos = 0;
+        while (pos < probeSize)
+        {
+            int start = pos, printable = 0, vowels = 0;
+            while (pos < probeSize && b[pos] != 0)
+            {
+                byte c = b[pos++];
+                if (c >= 0x20 && c <= 0x7E) printable++;
+                if (c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u') vowels++;
+            }
+            int len = pos - start;
+            if (len >= 4 && printable >= 3 && vowels >= 2) goodStrings++;
+            if (goodStrings >= 3) return true;
+            if (pos < probeSize) pos++; // skip '\0'
+        }
+        return false;
+    }
+
     private unsafe void TryFindBfBuffer(nuint session)
     {
         if (_bfBufferBase != 0) return;   // already cached
+
+        // Phase 0: probe large-copy destinations recorded by OnGameMemcpy.
+        // The BF script is bulk-loaded (several KB) before session detection;
+        // scan in reverse so the most-recent copy is tested first.
+        nuint[] copySnapshot;
+        lock (_largeCopyLock) copySnapshot = _largeCopyDsts.ToArray();
+
+        for (int i = copySnapshot.Length - 1; i >= 0; i--)
+        {
+            nuint ptr = copySnapshot[i];
+            if (!ProbeForBfContent(ptr)) continue;
+
+            byte* b = (byte*)ptr;
+            int strings = CountNullTermStrings(b, 2048, minPrintable: 4);
+            var preview = new System.Text.StringBuilder(64);
+            for (int j = 0; j < 512 && preview.Length < 64; j++)
+                if (b[j] >= 0x20 && b[j] <= 0x7E) preview.Append((char)b[j]);
+
+            _bfBufferBase = ptr;
+            _bfBufferOff  = -1;
+            _modLog!.Info($"[BFBuffer] Phase0 copy-log 0x{ptr:X} strings={strings}: \"{preview}\"");
+            return;
+        }
+
+        // Phase 1: session-struct pointer scan (fallback — BF buffer is ~2 GB away
+        // from the session struct, so this rarely succeeds, but costs little).
         // BF interpreter pointer may be at any offset in the session struct.
         // 4096 bytes = 512 pointer slots; cheap at 200ms poll interval.
         const int sessionScan = 4096;
@@ -412,8 +493,9 @@ public class Mod : IModV1
                     _diffScanner.Reset();
                     _bridge!.ResetSession();
                     _lastBfPc     = 0;
-                    _bfBufferBase    = 0;
-                    _bfBufferOff     = 0;
+                    _bfBufferBase = 0;
+                    _bfBufferOff  = 0;
+                    lock (_largeCopyLock) _largeCopyDsts.Clear();
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
                 }
                 lastSession = 0;

@@ -3419,3 +3419,87 @@ for the shortest lines).
 A P5R dialogue line is never 384 bytes of text. The largest lines observed are ~80
 characters. Setting max count to 150 eliminates the 280/288/384-byte vertex copies
 even before the vowel check runs.
+
+---
+
+## Ch44 — BF Script Load Timing: Why count > 150 Was the Wrong Filter
+
+### The access type problem
+
+Cheat Engine's "find what accesses this address" captures any instruction that
+touches the watched address — read OR write. When CE watched `0x4178E79D48` (our
+confirmed BF dialogue buffer) and reported `mov rsi, r10` at `p5r.exe+0x5A857B`,
+it could mean two very different things:
+
+- **Case A (write access)**: R10 = source of data, RDI = `0x4178E79D48` = destination.
+  The game is LOADING the BF script into that buffer. `count` = size of entire BF
+  script (several KB — far larger than our 150-byte cap).
+- **Case B (read access)**: R10 = `0x4178E79D48` = source, RDI = some render buffer.
+  The game is reading one line's text OUT of the BF buffer per display tick.
+  `count` = string length (10–80 bytes — well inside our cap).
+
+Our hook fired ZERO times during dialogue display despite lines advancing. Case B
+would fire PER LINE — so zero fires proves Case B is wrong. The correct reading is
+**Case A**: the BF script is loaded in one bulk copy (or a small number of them)
+BEFORE dialogue starts, and our `count > 150` filter silently dropped every one.
+
+### Timeline of BF script loading
+
+```
+T=0    Player triggers hang-out
+T+5ms  P5R loads BF scene script from GAP archive:
+           FUN_1405A8570 called with r10=src, rcx=dst_bfBuffer, r8=script_size
+           ← our hook fires here, count >> 150, REJECTED by filter, dst never stored
+T+15ms Session struct pointer becomes valid → our poll loop detects session
+T+20ms TryFindBfBuffer() runs → no pointer path from session struct to bfBuffer
+```
+
+The 150-byte cap was designed for per-line interception (Case B), but the actual
+access is a one-shot bulk load (Case A). The buffer address we need is the `dst`
+of that bulk load — and we were throwing it away.
+
+### The large-copy-log approach
+
+Instead of filtering by content (vowels, printable runs), record the **destination
+address** of every large heap-to-heap copy. Then, when the session is detected,
+probe each recorded destination for BF content:
+
+```csharp
+// In OnGameMemcpy:
+if (count >= 500 && count <= 500_000)
+{
+    lock (_largeCopyLock)
+    {
+        if (_largeCopyDsts.Count < 150)
+            _largeCopyDsts.Add(dst);   // record dst; probe at session start
+    }
+}
+```
+
+At session start, `TryFindBfBuffer` scans `_largeCopyDsts` in reverse (most recent
+copy first) and runs a BF content probe on each:
+
+```
+BF fingerprint probe:
+  1. maxRun ≥ 12 contiguous printable bytes (rules out pure binary/compressed data)
+  2. ≥ 3 null-terminated strings of ≥ 4 chars with ≥ 2 vowels each
+     (rules out mesh IDs like "mesh_920", texture keys, vertex layout names)
+```
+
+Mesh names ("Ryuji_Hair", "field_gym") fail criterion 2 because they have too few
+vowels (0–1) per token. English dialogue ("gym over in Shibuya", "You've been
+training here, huh?") has 3–7 vowels per sentence — passes cleanly.
+
+### Clearing the log between hang-outs
+
+`_largeCopyDsts` is cleared when a hang-out ends so the next session starts with a
+fresh list. The new hang-out's BF script load fires AFTER the clear but BEFORE the
+poll loop detects the new session — by construction the list always contains the
+current session's BF script by the time `TryFindBfBuffer` runs.
+
+### Why the session struct scan still fails (and stays as a fallback)
+
+The confirmed BF buffer (`0x4178E79D48`) and the session struct are in different
+heap arenas — the session struct has NO reachable pointer to the BF buffer within
+any scan window. The copy-log approach bypasses this completely: it records the BF
+buffer address directly at the moment it's written, without needing a pointer chain.
