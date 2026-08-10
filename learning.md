@@ -2685,3 +2685,73 @@ for Ryuji Scene 51. A real dialogue pool has 20–50 strings; 4 is incidental da
 
 Fix: Phase 3 requires ≥8 strings (targeted Phase 1/2 keep 4). The heap scan must be
 much more confident before we write-back into an arbitrary memory region.
+
+---
+
+## Ch34 — CE Reveals: No Pool, Per-Line Allocations, and the Real Hook Address
+
+### What CE actually showed us
+
+After tracking the dialogue string "It's a gym over in Shibuya" (Ryuji Scene 51)
+at address `0x41DBE3B059`, the "Find what accesses this address" list contained:
+
+1. **Dozens of System.Text.Unicode.dll instructions** (different addresses, different bytes)
+   — These are all our own mod's Phase 3 backward heap scan. The JIT-compiled
+   `CountPoolStrings` byte loop generates many native instructions that appear in the
+   .NET BCL's JIT memory range. Our scanner was reading directly through the dialogue
+   text region without recognising it.
+
+2. **One p5r.exe instruction: `0x1405A857B - mov rsi,r10`**
+   — This is `p5r.exe + 0x5A857B`. The only genuine game-side access to the text buffer.
+   (`mov rsi,r10` is register-to-register, so CE may be showing the adjacent instruction
+   rather than the memory access itself. The real memory-touching instruction is within
+   a few bytes of `0x5A857B`.)
+
+### Key finding: no contiguous text pool
+
+As dialogue advanced through ~15 lines, four distinct text buffer addresses appeared:
+```
+0x41DBE3B059  ← "It's a gym over in Shibuya..."
+0x4178E70D99  ← next line
+0x41DCFCA895  ← next line
+0x4214A00069  ← next line
+```
+
+Each dialogue line is a **separate heap allocation**. The BF interpreter allocates a
+fresh buffer per displayed string. There is no contiguous pool of strings to pre-fill
+and no single `poolBase` address to anchor write-back to.
+
+This explains every Phase 3 failure: we required ≥8 consecutive strings in one region.
+That structure simply does not exist in P5R's dialogue system.
+
+### CmmExecEvent confirmed wrong
+
+CmmExecEvent fires **once at hang-out initialisation** — before the save file loads us
+into an ongoing scene. In all logs with dialogue advancing (choices selected, lines
+skipped), not a single `CmmExec #N:` line appeared. The hook is active but the function
+is never called again after scene setup. Using it as a per-line trigger was incorrect.
+
+### The real hook: p5r.exe + 0x5A857B
+
+The instruction at `0x1405A857B` is the only p5r.exe code that accessed the dialogue
+text buffer. To understand whether it fires once per line or every frame — and what
+register holds the text pointer — the function must be inspected in Ghidra.
+
+**Next step:** Open p5r.exe in Ghidra → navigate to `0x1405a857b` → identify the
+enclosing function. Once we know the function signature and calling frequency, we write
+an `IAsmHook` that captures the text buffer address and overwrites it with LLM output
+before the game renders the line.
+
+### Write-back strategy revision
+
+Old strategy (scrapped):
+- Find a contiguous text pool → pre-fill all slots at session start
+
+New strategy:
+- Hook the game function at p5r.exe+0x5A857B
+- At hook entry, one register = current line's text buffer address
+- Overwrite `[reg]` with LLM-generated text
+- Existing 3-second throttle prevents duplicate calls
+- No pool finder, no CmmExecEvent, no per-session scanning
+
+This is simpler than everything we built. One mid-function hook, one buffer overwrite.
