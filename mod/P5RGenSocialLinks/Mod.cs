@@ -19,7 +19,6 @@ public class Mod : IModV1
     private DialogueBridge?   _bridge;
     private SocialLinkReader? _reader;
 
-    // Adapts Reloaded's ILoggerV2 to DialogueBridge's internal ILogger contract.
     private sealed class LoggerAdapter : DialogueBridge.ILogger
     {
         private readonly ILoggerV2 _inner;
@@ -27,13 +26,11 @@ public class Mod : IModV1
         public void WriteLine(string msg) => _inner.WriteLine(msg);
     }
 
-    // Polling (fallback while hook is placeholder)
     private PeriodicTimer?          _timer;
     private Task?                   _pollTask;
     private CancellationTokenSource _cts = new();
 
-    // CMM_EXEC_EVENT detour — fires when a Social Link community event executes.
-    // The native function reads from globals (no meaningful parameters).
+    // CmmExecEvent fires once per dialogue line — this is the primary per-line LLM trigger.
     private IHook<CmmExecEventDelegate>? _conversationHook;
     private IReloadedHooks?              _hooks;
     private int                          _cmmExecFireCount;
@@ -45,9 +42,8 @@ public class Mod : IModV1
 
     public void Start(IModLoaderV1 loader)
     {
-        _logger    = (ILoggerV2)loader.GetLogger();
+        _logger = (ILoggerV2)loader.GetLogger();
 
-        // Load user-editable runtime config from GenDialogue.json next to the DLL.
         string modDir = System.IO.Path.GetDirectoryName(
             System.Reflection.Assembly.GetExecutingAssembly().Location) ?? ".";
         _cfg    = GenConfig.Load(modDir);
@@ -55,8 +51,6 @@ public class Mod : IModV1
         _modLog.Always($"[P5RGenSocialLinks] Config: throttle={_cfg.ThrottleSeconds}s timeout={_cfg.TimeoutSeconds}s url={_cfg.ServerUrl} logLevel={_cfg.LogLevel}");
 
         _llmClient = new LLMClient(_cfg.ServerUrl);
-
-        // Async health check — fires after a 2s delay to let the model finish loading.
         ServerHealthChecker.CheckAsync(_cfg.ServerUrl, msg => _logger.WriteLine(msg));
 
         nuint moduleBase = (nuint)Process.GetCurrentProcess().MainModule!.BaseAddress;
@@ -66,17 +60,14 @@ public class Mod : IModV1
             msg => _logger!.WriteLine(msg));
         _bridge = new DialogueBridge(_llmClient!, new LoggerAdapter(_logger!), _cfg);
 
-        // Hooks implementation provided by reloaded.sharedlib.hooks at runtime.
         loader.GetController<IReloadedHooks>()?.TryGetTarget(out _hooks);
 
         TryActivateHook();
         StartPollLoop();
-        ModuleProbe.LogWriteInstructionModule(msg => _logger.WriteLine(msg));
 
         _logger.WriteLine($"[P5RGenSocialLinks] Started — hook:{(_hookActive ? "ON" : "OFF")} poll:ON");
     }
 
-    // Tracks whether the hook wired successfully — logged on Start() completion.
     private bool _hookActive;
 
     private void TryActivateHook()
@@ -92,7 +83,7 @@ public class Mod : IModV1
 
             if (_hooks is null)
             {
-                _logger!.WriteLine("[P5RGenSocialLinks] Hook skipped — IReloadedHooks null (install reloaded.sharedlib.hooks).");
+                _logger!.WriteLine("[P5RGenSocialLinks] Hook skipped — IReloadedHooks null.");
                 return;
             }
 
@@ -112,10 +103,8 @@ public class Mod : IModV1
 
     private nint OnCmmExecEvent()
     {
-        // Run original first — it populates the session sub-object we are about to read.
-        nint result = _conversationHook!.OriginalFunction();
-
-        int fireCount = System.Threading.Interlocked.Increment(ref _cmmExecFireCount);
+        nint result    = _conversationHook!.OriginalFunction();
+        int  fireCount = Interlocked.Increment(ref _cmmExecFireCount);
 
         try
         {
@@ -125,16 +114,15 @@ public class Mod : IModV1
                 return result;
             }
 
-            _logger?.WriteLine($"[P5RGenSocialLinks] CmmExecEvent #{fireCount} session=0x{session:X}");
-
             SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
             if (snap is null) return result;
 
-            _logger?.WriteLine(
+            _modLog!.Info(
                 $"[P5RGenSocialLinks] CmmExec #{fireCount}: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber}");
-            bool dispatched = _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap));
+
+            bool dispatched = _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap), lineIndex: fireCount);
             if (!dispatched)
-                _logger?.WriteLine($"[P5RGenSocialLinks] CmmExec #{fireCount}: throttled (< 3s since last dispatch).");
+                _modLog!.Info($"[P5RGenSocialLinks] CmmExec #{fireCount}: throttled.");
         }
         catch (Exception ex)
         {
@@ -144,13 +132,9 @@ public class Mod : IModV1
         return result;
     }
 
-    // ── Poll loop (fallback + struct discovery) ───────────────────────────
+    // ── Poll loop — session lifecycle + text pool discovery ───────────────
 
-    private readonly StructDiffScanner    _diffScanner    = new();
-    private readonly PointerFollowScanner _ptrFollower    = new();
-    private readonly LineCounterMonitor   _lineMonitor    = new();
-    private readonly HeapCounterScanner   _heapScanner    = new();
-    private int _sessionTick;
+    private readonly StructDiffScanner _diffScanner = new();
 
     private void StartPollLoop()
     {
@@ -169,33 +153,7 @@ public class Mod : IModV1
             {
                 if (lastSession != 0)
                 {
-                    byte finalCount = _lineMonitor.CurrentValue();
-                    _modLog!.Info(
-                        $"[LineCounter] Session end: 0x{P5ROffsets.CMM_LINE_COUNTER_ADDR:X} = {finalCount}");
-
-                    var hits = _heapScanner.FindIncreased(minDelta: 1, maxDelta: 50, maxResults: 50);
-                    if (hits.Count > 0)
-                    {
-                        _modLog!.Info($"[HeapScan] Session-end: {hits.Count} byte(s) increased ≤50 — top candidates:");
-                        foreach (string h in hits)
-                            _modLog!.Info($"[HeapScan]   {h}");
-                    }
-                    else
-                    {
-                        _modLog!.Info("[HeapScan] Session-end: no increases ≤50 — counter outside 0x10000-0x20000000 or not yet moved.");
-                    }
-                    _heapScanner.Clear();
-
-                    _modLog!.Info("[PtrFollow] Session-end cumulative deltas from capture baseline:");
-                    var endCumul = _ptrFollower.CumulativeDiff();
-                    if (endCumul.Count > 0)
-                        foreach (string c in endCumul) _modLog!.Info($"[P5RGenSocialLinks]   {c}");
-                    else
-                        _modLog!.Info("[PtrFollow]   No cumulative increases in sub-objects.");
-
                     _diffScanner.Reset();
-                    _ptrFollower.Reset();
-                    _lineMonitor.Deactivate();
                     _bridge!.ResetSession();
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
                 }
@@ -205,13 +163,8 @@ public class Mod : IModV1
 
             if (session != lastSession)
             {
-                lastSession   = session;
-                _sessionTick  = 0;
+                lastSession = session;
                 _diffScanner.Reset();
-                _ptrFollower.Reset();
-                _lineMonitor.Activate();
-                _heapScanner.TakeSnapshot(session, msg => _modLog!.Info(msg));
-                LineCounterMonitor.Diagnose(msg => _modLog!.Info(msg));
 
                 SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
                 if (snap is null) continue;
@@ -219,68 +172,22 @@ public class Mod : IModV1
                 _modLog!.Info(
                     $"[P5RGenSocialLinks] Hang-out: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber} (0x{session:X})");
 
-                // Locate the text pool once per session; bridge uses it for write-back.
                 nuint poolBase = DialogueTextPoolFinder.Find(session, msg => _modLog!.Info(msg));
                 _bridge!.SetPoolBase(poolBase);
 
+                // Fallback dispatch if hook isn't active.
                 if (!_hookActive)
                     _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap), lineIndex: 0);
 
                 continue;
             }
 
-            // Per-line trigger: fire LLM when dialogue line counter advances.
-            if (_lineMonitor.HasAdvanced())
-            {
-                int lineIndex = (int)_lineMonitor.CurrentValue();
-                SocialLinkSnapshot? lineSnap = SocialLinkReader.TryReadFromPtr(session);
-                if (lineSnap is not null)
-                {
-                    // Retry pool scan on the first line advance if it missed at session start.
-                    // BF engine loads text lazily; pool is guaranteed in memory once a line renders.
-                    if (_bridge!.PoolBase == 0)
-                    {
-                        nuint retryPool = DialogueTextPoolFinder.Find(session, msg => _modLog!.Info(msg));
-                        _bridge!.SetPoolBase(retryPool);
-                    }
-
-                    _modLog!.Info($"[P5RGenSocialLinks] Line advanced (counter={lineIndex}) — dispatching LLM.");
-                    _bridge!.DispatchAsync(lineSnap, ContextBuilder.Build(lineSnap), lineIndex);
-                }
-            }
-
-            // Mid-session checkpoint: ~20 s in (tick 40), after loading wipe finishes.
-            // HeapScan looks for small byte increments in high heap near session struct.
-            // PtrFollow cumulative diff reports totals since each sub-object was captured.
-            _sessionTick++;
-            if (_sessionTick == 40)
-            {
-                _modLog!.Info("[HeapScan] Mid-session (20s) — scanning high heap for small increments:");
-                var midHits = _heapScanner.FindIncreased(minDelta: 1, maxDelta: 15, maxResults: 50);
-                if (midHits.Count > 0)
-                    foreach (string h in midHits) _modLog!.Info($"[HeapScan]   {h}");
-                else
-                    _modLog!.Info("[HeapScan]   No increases ≤15 — counter may be far from session struct.");
-
-                _modLog!.Info("[PtrFollow] Mid-session cumulative deltas from capture baseline:");
-                var midCumul = _ptrFollower.CumulativeDiff();
-                if (midCumul.Count > 0)
-                    foreach (string c in midCumul) _modLog!.Info($"[P5RGenSocialLinks]   {c}");
-                else
-                    _modLog!.Info("[PtrFollow]   No cumulative increases ≤100 in sub-objects.");
-            }
-
-            // Struct diff — passive discovery of per-line changing fields.
+            // Passive struct discovery — disabled by default, enable in GenDialogue.json.
             if (_cfg.StructDiffEnabled)
             {
-                _ptrFollower.Update(session, msg => _modLog!.Info($"[P5RGenSocialLinks] {msg}"));
-
                 string? diff = _diffScanner.Diff(session);
                 if (diff is not null)
                     _modLog!.Info($"[P5RGenSocialLinks] {diff}");
-
-                foreach (string ptrDiff in _ptrFollower.Diff())
-                    _modLog!.Info($"[P5RGenSocialLinks] {ptrDiff}");
             }
         }
     }

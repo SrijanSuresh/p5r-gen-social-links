@@ -2497,3 +2497,49 @@ header occupies ~200 bytes and the dialogue line index is at offset +0x100 or ab
 it was never diffed. Extending SubScanBytes to 512 (offsets 0x00–0x1FF) gives a full
 512-byte window into each pointed-to sub-object — covering the range where game-engine
 dialogue managers typically store line counters.
+
+---
+
+## Chapter 31 — Recognizing Sunk Cost: Deleting the Scanner Triad
+
+### What we built vs. what we needed
+
+Three scanners were written over several sessions:
+
+| Scanner | Purpose | Verdict |
+|---|---|---|
+| `LineCounterMonitor` | Monitor a CE-discovered byte counter | Dead: 0x6FFC28 is a stale heap address that changes every boot |
+| `HeapCounterScanner` | Snapshot the game heap and find counter by delta | Dead: timer arrays dominated every result; counter obscured |
+| `PointerFollowScanner` | Follow session-struct pointers to sub-objects | Dead: DLL address poisoning kept resetting cumulative baselines |
+
+### Why they were unnecessary from the start
+
+`CmmExecEvent` already fires **once per dialogue line** — that is the per-line trigger.
+The hook is already wired, already dispatches to the LLM, and already throttles correctly.
+We spent several sessions trying to build a second per-line trigger via memory scanning
+when a working one existed in the codebase the whole time.
+
+This is the sunk-cost trap in game modding: once you commit to a memory-scan approach
+it is easy to keep patching it instead of stepping back and asking whether the goal is
+already met by another path.
+
+### What this means for the architecture
+
+The cleanup leaves a simpler `Mod.cs` poll loop:
+
+```
+tick: TryResolve session
+  → new session: dispatch one LLM call (hook fallback) + start StructDiff
+  → same session: StructDiff for passive discovery only
+  → session gone: reset
+```
+
+The hook path is the primary per-line trigger. The poll loop is purely for session
+lifecycle management and text-pool discovery (Phase 3).
+
+### The real Phase 3 blocker
+
+`TextPoolFinder.Find()` returns 0 every session. The LLM generates dialogue but
+cannot inject it because there is no confirmed write-back target. Fixing that —
+finding where the game stores the displayed dialogue string — is the only remaining
+work before Phase 3 is complete. It does not require the counter.
