@@ -120,6 +120,19 @@ public class Mod : IModV1
             _modLog!.Info(
                 $"[P5RGenSocialLinks] CmmExec #{fireCount}: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber}");
 
+            // Retry text pool discovery on first few fires — the BF interpreter may not have
+            // decompressed the script into heap memory at raw session-detection time, but it
+            // is guaranteed to be loaded by the time CmmExecEvent fires for the first line.
+            if (_bridge!.PoolBase == 0 && fireCount <= 5)
+            {
+                nuint pool = Memory.DialogueTextPoolFinder.Find(session, msg => _modLog!.Info(msg));
+                if (pool != 0)
+                {
+                    _bridge!.SetPoolBase(pool);
+                    _modLog!.Info($"[P5RGenSocialLinks] Text pool found on fire #{fireCount}: 0x{pool:X}");
+                }
+            }
+
             bool dispatched = _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap), lineIndex: fireCount);
             if (!dispatched)
                 _modLog!.Info($"[P5RGenSocialLinks] CmmExec #{fireCount}: throttled.");

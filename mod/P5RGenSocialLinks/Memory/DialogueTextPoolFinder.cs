@@ -4,35 +4,35 @@ using System.Runtime.InteropServices;
 namespace P5RGenSocialLinks.Memory;
 
 /// <summary>
-/// Locates the BF script text pool in P5R's heap at runtime — no Cheat Engine required.
+/// Locates the BF script text pool in P5R's heap at runtime.
 ///
-/// Two-phase strategy:
-///   Phase 1 — Counter struct probe: reads 256 bytes from CMM_LINE_COUNTER_STRUCT_BASE
-///              and extracts 8-byte words in the heap VA range as pointer candidates.
-///              Each candidate is probed for the text pool fingerprint.
-///   Phase 2 — Bidirectional heap scan: walks VirtualQuery-enumerated committed private
-///              pages both forward and backward from the session struct address.
+/// Three-phase strategy anchored to the session struct (not the CE counter address):
+///   Phase 1 — One-level pointer traversal: reads 8-byte-aligned words from the session
+///              struct, filters to heap VA range, probes each for the pool fingerprint.
+///   Phase 2 — Two-level pointer traversal: for each heap pointer found in Phase 1,
+///              scans the first 256 bytes of its target for a second tier of heap
+///              pointers, probing each.
+///   Phase 3 — Bidirectional heap scan: VirtualQuery walk ±128 MB / ±32 MB from the
+///              session struct as a fallback when no pointer path leads to the pool.
 ///
-/// Text pool fingerprint: ≥5 consecutive null-terminated strings in either UTF-8/ASCII
-/// or UTF-16LE encoding, each 10–300 chars. Both encodings are probed because P5R PC
-/// may store English dialogue as either ASCII bytes or wide chars.
+/// Text pool fingerprint: ≥4 consecutive null-terminated strings where each string has
+/// ≥3 printable bytes (0x20–0x7E) and ≥50 % of non-null bytes are printable.
+/// Control bytes below 0x20 are tolerated as BF escape codes (pause, speaker, color).
 ///
-/// Timing: call Find() when the first LineCounterMonitor tick fires — by that point the
-/// dialogue box has rendered and the BF engine has definitely loaded the text pool into
-/// heap memory. Calling at raw hang-out start may miss the pool if P5R loads it lazily.
+/// Call Find() inside OnCmmExecEvent (not just at session-detection time) so the pool
+/// is queried after the BF interpreter has decompressed the scene script into heap memory.
 /// </summary>
 internal static class DialogueTextPoolFinder
 {
-    // Heap VA range for a 64-bit P5R process (filters out module image sections).
-    // static readonly because nuint cannot hold ulong literals as const in C#.
     private static readonly nuint HeapVaLow  = unchecked((nuint)0x0000_0001_0000_0000UL);
     private static readonly nuint HeapVaHigh = unchecked((nuint)0x0007_FFFF_FFFF_0000UL);
 
-    // Pool fingerprint thresholds.
-    private const int MinPoolStrings = 5;
-    private const int MinStrLen      = 10;   // chars
-    private const int MaxStrLen      = 300;  // chars
-    private const int ProbeBytes     = 8192; // bytes per region probe
+    private const int MinPoolStrings    = 4;
+    private const int MinPrintableChars = 3;   // printable bytes required per string
+    private const int MaxStrLen         = 400;
+    private const int ProbeBytes        = 16384; // bytes to probe per candidate
+    private const int SessionScanBytes  = 512;   // bytes of session struct to walk
+    private const int Depth2ScanBytes   = 256;   // bytes of each Phase-1 target to walk
 
     [DllImport("kernel32.dll")]
     private static extern nuint VirtualQuery(
@@ -44,7 +44,6 @@ internal static class DialogueTextPoolFinder
         public nuint BaseAddress;
         public nuint AllocationBase;
         public uint  AllocationProtect;
-        // 4-byte implicit alignment pad (CLR matches Windows 64-bit MEMORY_BASIC_INFORMATION)
         public nuint RegionSize;
         public uint  State;
         public uint  Protect;
@@ -57,69 +56,85 @@ internal static class DialogueTextPoolFinder
     private const uint PAGE_GUARD    = 0x100;
 
     /// <summary>
-    /// Finds the text pool anchored to the current session. Returns 0 if not found.
-    /// Safe to call repeatedly — logs a one-line result each attempt.
+    /// Finds the text pool anchored to the current session struct.
+    /// Returns 0 if not found. Safe to call repeatedly on each CmmExecEvent fire.
     /// </summary>
     internal static nuint Find(nuint sessionBase, Action<string>? log = null)
     {
-        nuint fromCounter = ProbeCounterStruct(log);
-        if (fromCounter != 0) return fromCounter;
+        nuint phase1 = ProbeSessionPointers(sessionBase, depth: 1, log);
+        if (phase1 != 0) return phase1;
 
-        log?.Invoke("[TextPoolFinder] Counter struct probe found nothing — trying heap scan.");
-        return HeapScanBidirectional(sessionBase, log);
+        nuint phase2 = ProbeSessionPointers(sessionBase, depth: 2, log);
+        if (phase2 != 0) return phase2;
+
+        log?.Invoke("[TextPoolFinder] Pointer traversal found nothing — trying heap scan.");
+        nuint phase3 = HeapScanBidirectional(sessionBase, log);
+        if (phase3 != 0) return phase3;
+
+        // Emit a pointer map so the next game session can be inspected manually.
+        DiagnoseSessionPointers(sessionBase, log);
+        log?.Invoke("[TextPoolFinder] No pool found — write-back disabled for this session.");
+        return 0;
     }
 
-    // ── Phase 1: counter struct probe ────────────────────────────────────
+    // ── Phase 1 & 2: pointer traversal from session struct ───────────────
 
-    private static unsafe nuint ProbeCounterStruct(Action<string>? log)
+    private static unsafe nuint ProbeSessionPointers(nuint sessionBase, int depth, Action<string>? log)
     {
-        nuint structBase = P5ROffsets.CMM_LINE_COUNTER_STRUCT_BASE;
-        const int ScanBytes = 256;
+        if (!MemoryGuard.IsReadable(sessionBase, SessionScanBytes)) return 0;
 
-        if (!MemoryGuard.IsReadable(structBase, ScanBytes))
-        {
-            log?.Invoke($"[TextPoolFinder] Counter struct 0x{structBase:X} not readable — skipping Phase 1.");
-            return 0;
-        }
+        byte* p = (byte*)sessionBase;
 
-        byte* p = (byte*)structBase;
-        for (int offset = 0; offset + 8 <= ScanBytes; offset += 8)
+        for (int offset = 0; offset + 8 <= SessionScanBytes; offset += 8)
         {
             nuint candidate = *(nuint*)(p + offset);
             if (candidate < HeapVaLow || candidate > HeapVaHigh) continue;
             if (!MemoryGuard.IsReadable(candidate, ProbeBytes)) continue;
 
-            int count = ProbeCandidate(candidate);
-            if (count > 0)
-                log?.Invoke($"[TextPoolFinder] CounterStruct+0x{offset:X}: 0x{candidate:X} → {count} strings");
-
-            if (count >= MinPoolStrings)
+            if (depth == 1)
             {
-                log?.Invoke($"[TextPoolFinder] Pool found via counter struct at 0x{candidate:X} ({count} strings).");
-                return candidate;
+                int count = CountPoolStrings(candidate, ProbeBytes);
+                if (count >= MinPoolStrings)
+                {
+                    log?.Invoke(
+                        $"[TextPoolFinder] Phase1: session+0x{offset:X3} → 0x{candidate:X} ({count} strings).");
+                    return candidate;
+                }
+            }
+            else
+            {
+                // Depth 2: scan the first Depth2ScanBytes of each Phase-1 target.
+                if (!MemoryGuard.IsReadable(candidate, Depth2ScanBytes)) continue;
+                byte* q = (byte*)candidate;
+
+                for (int off2 = 0; off2 + 8 <= Depth2ScanBytes; off2 += 8)
+                {
+                    nuint cand2 = *(nuint*)(q + off2);
+                    if (cand2 < HeapVaLow || cand2 > HeapVaHigh) continue;
+                    if (!MemoryGuard.IsReadable(cand2, ProbeBytes)) continue;
+
+                    int count = CountPoolStrings(cand2, ProbeBytes);
+                    if (count >= MinPoolStrings)
+                    {
+                        log?.Invoke(
+                            $"[TextPoolFinder] Phase2: session+0x{offset:X3}→+0x{off2:X3} → 0x{cand2:X} ({count} strings).");
+                        return cand2;
+                    }
+                }
             }
         }
         return 0;
     }
 
-    // ── Phase 2: bidirectional heap scan ─────────────────────────────────
+    // ── Phase 3: bidirectional heap scan ─────────────────────────────────
 
     private static nuint HeapScanBidirectional(nuint sessionBase, Action<string>? log)
     {
-        // Scan forward up to 128 MB, then backward up to 32 MB.
-        // The text pool has historically been ~7.7 MB forward from the session struct.
         nuint forward = HeapScanRange(sessionBase, sessionBase + 0x8000000, log);
         if (forward != 0) return forward;
 
-        // The VA address space can place pool before the session struct too.
-        nuint backward = HeapScanRange(
-            sessionBase > 0x2000000 ? sessionBase - 0x2000000 : 0,
-            sessionBase,
-            log);
-        if (backward != 0) return backward;
-
-        log?.Invoke("[TextPoolFinder] No pool found — write-back disabled for this session.");
-        return 0;
+        nuint bwStart = sessionBase > 0x2000000 ? sessionBase - 0x2000000 : 0;
+        return HeapScanRange(bwStart, sessionBase, log);
     }
 
     private static nuint HeapScanRange(nuint start, nuint end, Action<string>? log)
@@ -138,10 +153,12 @@ internal static class DialogueTextPoolFinder
                 (mbi.Protect & PAGE_GUARD)    == 0 &&
                 mbi.RegionSize >= 1024)
             {
-                int count = ProbeCandidate(mbi.BaseAddress);
+                int probeLen = (int)Math.Min(mbi.RegionSize, (nuint)ProbeBytes);
+                int count = CountPoolStrings(mbi.BaseAddress, probeLen);
                 if (count >= MinPoolStrings)
                 {
-                    log?.Invoke($"[TextPoolFinder] Pool found at 0x{mbi.BaseAddress:X} ({count} strings, size=0x{mbi.RegionSize:X}).");
+                    log?.Invoke(
+                        $"[TextPoolFinder] Phase3: 0x{mbi.BaseAddress:X} ({count} strings, sz=0x{mbi.RegionSize:X}).");
                     return mbi.BaseAddress;
                 }
             }
@@ -151,72 +168,76 @@ internal static class DialogueTextPoolFinder
         return 0;
     }
 
-    // ── Fingerprint: try both encodings ──────────────────────────────────
+    // ── Fingerprint ───────────────────────────────────────────────────────
 
-    private static int ProbeCandidate(nuint addr)
-    {
-        int ascii = CountPoolStringsAscii(addr, ProbeBytes);
-        if (ascii >= MinPoolStrings) return ascii;
-
-        int wide = CountPoolStringsUtf16(addr, ProbeBytes);
-        return wide;
-    }
-
-    private static unsafe int CountPoolStringsAscii(nuint addr, int maxBytes)
+    /// <summary>
+    /// Counts consecutive valid strings starting at <paramref name="addr"/>.
+    /// A string is valid if it is null-terminated, has ≥MinPrintableChars printable bytes
+    /// (0x20–0x7E), and at least 50 % of its non-null bytes are printable.
+    /// Bytes 0x01–0x1F are tolerated as BF escape codes.
+    /// </summary>
+    private static unsafe int CountPoolStrings(nuint addr, int maxBytes)
     {
         byte* p     = (byte*)addr;
         int   pos   = 0;
         int   count = 0;
 
-        while (pos + MinStrLen < maxBytes)
+        while (pos < maxBytes - MinPrintableChars)
         {
-            int strEnd = -1;
-            bool valid = true;
+            int printable = 0;
+            int total     = 0;
+            int strEnd    = -1;
 
-            int scanLimit = Math.Min(pos + MaxStrLen + 1, maxBytes);
-            for (int i = pos; i < scanLimit; i++)
+            int limit = Math.Min(pos + MaxStrLen, maxBytes);
+            for (int i = pos; i < limit; i++)
             {
                 byte b = p[i];
                 if (b == 0) { strEnd = i; break; }
-                if (b < 0x20 || b > 0x7E) { valid = false; break; }
+                total++;
+                if (b >= 0x20 && b <= 0x7E) printable++;
             }
 
-            if (!valid || strEnd < 0 || strEnd - pos < MinStrLen) break;
+            if (strEnd < 0)                          break; // no null terminator
+            if (printable < MinPrintableChars)        break; // too few printable chars
+            if (total > 0 && printable * 2 < total)  break; // below 50 % printable
 
             count++;
             pos = strEnd + 1;
         }
+
         return count;
     }
 
-    private static unsafe int CountPoolStringsUtf16(nuint addr, int maxBytes)
+    // ── Diagnostic: pointer map when all phases fail ──────────────────────
+
+    private static unsafe void DiagnoseSessionPointers(nuint sessionBase, Action<string>? log)
     {
-        // UTF-16LE: each char is [lo, hi]. For ASCII content: hi = 0x00, lo = 0x20–0x7E.
-        // Null terminator: [0x00, 0x00].
-        char* p     = (char*)addr;
-        int   maxChars = maxBytes / 2;
-        int   pos   = 0;
-        int   count = 0;
+        if (log is null) return;
+        if (!MemoryGuard.IsReadable(sessionBase, SessionScanBytes)) return;
 
-        while (pos + MinStrLen < maxChars)
+        log($"[TextPoolFinder] Diag session=0x{sessionBase:X} — heap pointers:");
+
+        byte* p = (byte*)sessionBase;
+        for (int offset = 0; offset + 8 <= SessionScanBytes; offset += 8)
         {
-            int strEnd = -1;
-            bool valid = true;
+            nuint candidate = *(nuint*)(p + offset);
+            if (candidate < HeapVaLow || candidate > HeapVaHigh) continue;
+            if (!MemoryGuard.IsReadable(candidate, 64)) continue;
 
-            int scanLimit = Math.Min(pos + MaxStrLen + 1, maxChars);
-            for (int i = pos; i < scanLimit; i++)
+            byte* t = (byte*)candidate;
+            int printable = 0;
+            for (int i = 0; i < 64; i++)
+                if (t[i] >= 0x20 && t[i] <= 0x7E) printable++;
+            int pct = (printable * 100) / 64;
+
+            var sb = new System.Text.StringBuilder(32);
+            for (int i = 0; i < 64 && sb.Length < 32; i++)
             {
-                char c = p[i];
-                if (c == '\0') { strEnd = i; break; }
-                // Accept printable ASCII range in wide form.
-                if (c < 0x20 || c > 0x7E) { valid = false; break; }
+                byte b = t[i];
+                sb.Append(b >= 0x20 && b <= 0x7E ? (char)b : '.');
             }
 
-            if (!valid || strEnd < 0 || strEnd - pos < MinStrLen) break;
-
-            count++;
-            pos = strEnd + 1;
+            log($"[TextPoolFinder] Diag  +0x{offset:X3} → 0x{candidate:X} printable={pct}% \"{sb}\"");
         }
-        return count;
     }
 }
