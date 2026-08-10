@@ -189,8 +189,12 @@ public class Mod : IModV1
                     $"[P5RGenSocialLinks] Hang-out: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber} (0x{session:X})");
 
                 // Attempt 0: probe at detection time (struct may not be populated yet).
-                nuint poolBase = DialogueTextPoolFinder.Find(session, msg => _modLog!.Info(msg));
+                // diagnoseOnFail=false — retries will diagnose if all 10 attempts fail.
+                nuint poolBase = Memory.DialogueTextPoolFinder.Find(
+                    session, msg => _modLog!.Info(msg), diagnoseOnFail: false);
                 _bridge!.SetPoolBase(poolBase);
+                if (poolBase != 0)
+                    Memory.DialogueTextPoolFinder.LogPoolContents(poolBase, 8, msg => _modLog!.Info(msg));
 
                 // Fallback dispatch if hook isn't active.
                 if (!_hookActive)
@@ -199,18 +203,28 @@ public class Mod : IModV1
                 continue;
             }
 
-            // Retry pool discovery on subsequent ticks — the CMM struct populates its internal
-            // heap pointers ~1 tick after session detection, so a one-shot probe at detection
-            // time consistently misses them. Retry up to 10 ticks (≤10 s at default interval).
+            // Retry pool discovery on subsequent ticks — the text pool is allocated lazily by
+            // the BF interpreter (not at session start), so a one-shot probe at detection time
+            // consistently misses it. Retry up to 10 ticks; only emit the verbose Diag on
+            // the final attempt so the log stays clean during the intermediate tries.
             if (_bridge!.PoolBase == 0 && _poolFindRetries < 10)
             {
                 _poolFindRetries++;
-                _modLog!.Info($"[P5RGenSocialLinks] Pool retry #{_poolFindRetries} for 0x{lastSession:X}");
-                nuint pool = DialogueTextPoolFinder.Find(lastSession, msg => _modLog!.Info(msg));
+                bool isFinalRetry = _poolFindRetries == 10;
+                nuint pool = Memory.DialogueTextPoolFinder.Find(
+                    lastSession,
+                    msg => _modLog!.Info(msg),
+                    diagnoseOnFail: isFinalRetry);
+
                 if (pool != 0)
                 {
                     _bridge!.SetPoolBase(pool);
                     _modLog!.Info($"[P5RGenSocialLinks] Text pool found on poll retry #{_poolFindRetries}: 0x{pool:X}");
+                    Memory.DialogueTextPoolFinder.LogPoolContents(pool, 8, msg => _modLog!.Info(msg));
+                }
+                else if (isFinalRetry)
+                {
+                    _modLog!.Info("[TextPoolFinder] No pool found after 10 retries — write-back disabled.");
                 }
             }
 

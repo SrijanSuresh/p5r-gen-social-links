@@ -59,8 +59,11 @@ internal static class DialogueTextPoolFinder
     /// <summary>
     /// Finds the text pool anchored to the current session struct.
     /// Returns 0 if not found. Safe to call repeatedly on each CmmExecEvent fire.
+    /// Pass diagnoseOnFail=false to suppress the verbose pointer-map on failure (use
+    /// during intermediate poll retries; only diagnose on the final attempt).
     /// </summary>
-    internal static nuint Find(nuint sessionBase, Action<string>? log = null)
+    internal static nuint Find(nuint sessionBase, Action<string>? log = null,
+                               bool diagnoseOnFail = true)
     {
         nuint phase1 = ProbeSessionPointers(sessionBase, depth: 1, log);
         if (phase1 != 0) return phase1;
@@ -72,10 +75,38 @@ internal static class DialogueTextPoolFinder
         nuint phase3 = HeapScanBidirectional(sessionBase, log);
         if (phase3 != 0) return phase3;
 
-        // Emit a pointer map so the next game session can be inspected manually.
-        DiagnoseSessionPointers(sessionBase, log);
-        log?.Invoke("[TextPoolFinder] No pool found — write-back disabled for this session.");
+        if (diagnoseOnFail)
+        {
+            DiagnoseSessionPointers(sessionBase, log);
+            log?.Invoke("[TextPoolFinder] No pool found — write-back disabled for this session.");
+        }
         return 0;
+    }
+
+    /// <summary>
+    /// Logs the first <paramref name="maxStrings"/> null-terminated strings at the pool base.
+    /// Call after Find() succeeds to verify the found region contains actual dialogue text.
+    /// </summary>
+    internal static unsafe void LogPoolContents(nuint poolBase, int maxStrings, Action<string> log)
+    {
+        if (poolBase == 0 || !MemoryGuard.IsReadable(poolBase, ProbeBytes)) return;
+
+        byte* p   = (byte*)poolBase;
+        int   pos = 0;
+
+        for (int n = 0; n < maxStrings && pos < ProbeBytes; n++)
+        {
+            var sb = new System.Text.StringBuilder(64);
+            while (pos < ProbeBytes && p[pos] != 0)
+            {
+                byte b = p[pos++];
+                sb.Append(b >= 0x20 && b <= 0x7E ? (char)b : '·'); // '·' for non-printable
+            }
+            pos++; // skip null terminator
+
+            if (sb.Length > 0)
+                log($"[TextPoolFinder] Pool[{n}]: \"{sb}\"");
+        }
     }
 
     // ── Phase 1 & 2: pointer traversal from session struct ───────────────
