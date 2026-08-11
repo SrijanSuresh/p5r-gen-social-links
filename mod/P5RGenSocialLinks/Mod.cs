@@ -644,8 +644,8 @@ public class Mod : IModV1
                 bool isBfPage = bfBase >= regBase && bfBase < regBase + regSize;
                 if (!isBfPage)
                 {
-                    // Probe 32 KB: BMD offset table can consume the first 4–8 KB.
-                    int probeLen = (int)Math.Min(regSize, 32768u);
+                    // Probe 128 KB: BMD header + offset table can consume the first 8–16 KB.
+                    int probeLen = (int)Math.Min(regSize, 131072u);
                     if (MemoryGuard.IsReadable(regBase, probeLen))
                     {
                         int sentences = CountDialogueSentences(regBase, probeLen);
@@ -660,7 +660,7 @@ public class Mod : IModV1
                                 $" s={sentences} [{p4[0]:X2} {p4[1]:X2} {p4[2]:X2} {p4[3]:X2}]");
                         }
 
-                        if (sentences >= 10)
+                        if (sentences >= 5)
                         {
                             _bmdBase = regBase;
                             _modLog!.Info($"[BMD] Candidate locked: 0x{regBase:X} sentences={sentences}");
