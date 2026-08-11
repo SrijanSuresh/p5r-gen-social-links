@@ -676,20 +676,23 @@ public class Mod : IModV1
             int start = i;
             while (i < scanBytes && p[i] != 0) i++;
             int len = i - start;
-            if (len < 8) continue;
+            // Short strings (bone names, labels) are always < 25 chars.
+            // Bone names also have very short average word length ("b l b …" → avg 1-2).
+            if (len < 25) continue;
 
             int spaces = 0, vowels = 0, ascii = 0;
             for (int j = start; j < i; j++)
             {
                 byte c = p[j];
                 if (c == ' ') spaces++;
-                // lowercase check via | 0x20
                 byte lc = (byte)(c | 0x20);
                 if (lc == 'a' || lc == 'e' || lc == 'i' || lc == 'o' || lc == 'u') vowels++;
                 if (c >= 0x20 && c < 0x7F) ascii++;
             }
 
-            if (spaces >= 2 && vowels >= 3 && ascii >= len * 9 / 10)
+            // avgWordLen = len / (wordCount): filters "b l b seifuk02" (avg ≈ 2)
+            int avgWordLen = len / (spaces + 1);
+            if (spaces >= 2 && vowels >= 4 && ascii >= len * 9 / 10 && avgWordLen >= 4)
                 sentences++;
         }
 

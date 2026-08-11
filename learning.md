@@ -3625,3 +3625,44 @@ The region with the highest sentence count that is NOT the BF script itself is t
 Once found, log the first 30 null-separated strings to:
 1. Confirm it's the right BMD (contains rank-specific dialogue).
 2. Reverse-engineer the offset table format (likely `uint32 count` + `uint32 offsets[count]` + strings).
+
+---
+
+## Chapter 46 — False Positive Analysis and Heuristic Refinement
+
+### What went wrong
+
+The scanner found `0x6FE52000` (size 0x11000, 68 KB) and declared it the BMD with 34 "sentences".  
+The logged strings were 3D skeleton bone names:
+
+```
+"b l b seifuk02"   (len 14)
+"Bip01 R Toe0"     (len 12)
+"b r Blur_asi01"   (len 14)
+```
+
+Why they passed the old filter (`len >= 8`, `spaces >= 2`, `vowels >= 3`, `ascii >= 90%`):
+
+| Check | Bone name "b l b seifuk02" | Verdict |
+|---|---|---|
+| len >= 8 | len = 14 ✓ | passes |
+| spaces >= 2 | 3 spaces ✓ | passes |
+| vowels >= 3 | e,i,u in "seifuk" ✓ | passes |
+| ascii >= 90% | fully ASCII ✓ | passes |
+
+Result: every bone name with an underscore prefix counted as a "sentence".
+
+### The discriminating property: average word length
+
+| Content type | Example | Average word length |
+|---|---|---|
+| Bone names | "b l b seifuk02" | 14 / 4 = 3.5 (padded by 3 single-char tokens) |
+| Real dialogue | "Dude, you're seriously the only one" | 34 / 6 ≈ 5.7 |
+| Labels, filenames | "Bip01 R Toe0" | 12 / 3 = 4 |
+
+The correct discriminators for dialogue:
+1. **Minimum string length 25** — bone names top out around 20 chars.
+2. **Average word length ≥ 4** — `len / (spaces + 1) >= 4` eliminates "b l b …" style token sequences.
+3. **Vowel count ≥ 4** — raised from 3 to reduce borderline passes.
+
+Also noted: `bfBase` is NOT static — it changed from `0x702594D8` to `0x6FFC1258` between two game sessions. It must always be read live from `session+0x18`, not cached across sessions. The current code already does this correctly.
