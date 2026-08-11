@@ -56,9 +56,11 @@ public class Mod : IModV1
     // Called for every BF instruction. RCX=channel(0x2B), RDX=opcode type byte,
     // R8=opcode_struct[+0x08], R9=opcode_struct[+0x10].
     // When RDX==5 this is a dialogue instruction — log R8/R9 to find the text pointer.
+    // Return type is nuint (not void) — the dispatcher may return a status value
+    // that callers (e.g. FUN_141844f20) check. Declaring void leaves RAX garbage.
     [Function(CallingConventions.Microsoft)]
-    private delegate void BfOpcodeDispatchDelegate(nuint channel, nuint typeAndFlags,
-                                                    nuint arg2, nuint arg3);
+    private delegate nuint BfOpcodeDispatchDelegate(nuint channel, nuint typeAndFlags,
+                                                     nuint arg2, nuint arg3);
 
     private IHook<BfOpcodeDispatchDelegate>? _bfDispatchHook;
 
@@ -90,51 +92,72 @@ public class Mod : IModV1
 
         _llmClient = new LLMClient(_cfg.ServerUrl);
         ServerHealthChecker.CheckAsync(_cfg.ServerUrl, msg => _logger.WriteLine(msg));
+        _logger.WriteLine("[P5RGenSocialLinks] Post-health — entering setup.");
 
-        nuint moduleBase = (nuint)Process.GetCurrentProcess().MainModule!.BaseAddress;
-        _logger.WriteLine($"[P5RGenSocialLinks] Base: 0x{moduleBase:X}");
+        try
+        {
+            nuint moduleBase = (nuint)Process.GetCurrentProcess().MainModule!.BaseAddress;
+            _logger.WriteLine($"[P5RGenSocialLinks] Base: 0x{moduleBase:X}");
 
-        _reader = new SocialLinkReader(moduleBase, _cfg.VerboseChain,
-            msg => _logger!.WriteLine(msg));
-        _bridge = new DialogueBridge(_llmClient!, new LoggerAdapter(_logger!), _cfg);
+            _reader = new SocialLinkReader(moduleBase, _cfg.VerboseChain,
+                msg => _logger!.WriteLine(msg));
+            _logger.WriteLine("[P5RGenSocialLinks] SocialLinkReader OK.");
 
-        loader.GetController<IReloadedHooks>()?.TryGetTarget(out _hooks);
+            _bridge = new DialogueBridge(_llmClient!, new LoggerAdapter(_logger!), _cfg);
+            _logger.WriteLine("[P5RGenSocialLinks] DialogueBridge OK.");
 
-        TryActivateHook();
-        SetupMemcpyHook();
-        SetupBfDispatchHook();
-        StartPollLoop();
+            loader.GetController<IReloadedHooks>()?.TryGetTarget(out _hooks);
+            _logger.WriteLine($"[P5RGenSocialLinks] IReloadedHooks: {(_hooks is not null ? "OK" : "null")}");
 
-        _logger.WriteLine($"[P5RGenSocialLinks] Started — hook:{(_hookActive ? "ON" : "OFF")} poll:ON");
+            TryActivateHook();
+            SetupMemcpyHook();
+            // BfDispatch hook crashes regardless of handler — abandoned, hunting text ptr via CE instead
+            StartPollLoop();
+
+            _logger.WriteLine($"[P5RGenSocialLinks] Started — hook:{(_hookActive ? "ON" : "OFF")} poll:ON");
+        }
+        catch (Exception ex)
+        {
+            _logger.WriteLine($"[P5RGenSocialLinks] STARTUP CRASH: {ex.GetType().Name}: {ex.Message}");
+            _logger.WriteLine(ex.StackTrace ?? "(no stack trace)");
+        }
     }
 
     private bool _hookActive;
 
-    private void SetupBfDispatchHook()
+    private unsafe void SetupBfDispatchHook()
     {
         if (_hooks is null) return;
-        nuint moduleBase = (nuint)Process.GetCurrentProcess().MainModule!.BaseAddress;
-        nuint addr = moduleBase + 0x24EE00;
-        _bfDispatchHook = _hooks.CreateHook<BfOpcodeDispatchDelegate>(
-            OnBfOpcodeDispatch, (long)addr).Activate();
-        _logger!.WriteLine($"[P5RGenSocialLinks] BfDispatch hook ACTIVE at 0x{addr:X}");
+        try
+        {
+            nuint moduleBase = (nuint)Process.GetCurrentProcess().MainModule!.BaseAddress;
+            nuint addr = moduleBase + 0x24EE00;
+
+            // Sanity-check: log first 8 bytes so we can verify this is a real function
+            // prologue and not a data section or already-patched trampoline.
+            byte* p = (byte*)addr;
+            string byteDump = $"{p[0]:X2} {p[1]:X2} {p[2]:X2} {p[3]:X2} {p[4]:X2} {p[5]:X2} {p[6]:X2} {p[7]:X2}";
+            _logger!.WriteLine($"[P5RGenSocialLinks] BfDispatch target 0x{addr:X} bytes: {byteDump}");
+
+            _bfDispatchHook = _hooks.CreateHook<BfOpcodeDispatchDelegate>(
+                OnBfOpcodeDispatch, (long)addr).Activate();
+            _logger!.WriteLine($"[P5RGenSocialLinks] BfDispatch hook ACTIVE at 0x{addr:X}");
+        }
+        catch (Exception ex)
+        {
+            _logger!.WriteLine($"[P5RGenSocialLinks] BfDispatch hook FAILED: {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
-    private unsafe void OnBfOpcodeDispatch(nuint channel, nuint typeAndFlags,
-                                            nuint arg2, nuint arg3)
+    // Diagnostic: bare pass-through — if this crashes, the hook address/convention is wrong.
+    // If this is stable, the crash is in our logging/memory-read code above.
+    private static int _bfCallCount;
+    private unsafe nuint OnBfOpcodeDispatch(nuint channel, nuint typeAndFlags,
+                                             nuint arg2, nuint arg3)
     {
-        _bfDispatchHook!.OriginalFunction(channel, typeAndFlags, arg2, arg3);
-
-        byte opType = (byte)(typeAndFlags & 0xFF);
-        if (opType != 5) return;
-
-        // arg2 (R8) and arg3 (R9) are fields from the opcode struct.
-        // One of them points to the dialogue text in the BF script buffer.
-        // Log both so we can identify the text pointer from the output.
-        string preview2 = TryReadString(arg2);
-        string preview3 = TryReadString(arg3);
-        _modLog!.Info(
-            $"[BFOp5] ch=0x{channel:X} R8=0x{arg2:X}\"{preview2}\" R9=0x{arg3:X}\"{preview3}\"");
+        nuint result = _bfDispatchHook!.OriginalFunction(channel, typeAndFlags, arg2, arg3);
+        System.Threading.Interlocked.Increment(ref _bfCallCount);
+        return result;
     }
 
     private static unsafe string TryReadString(nuint addr)
@@ -155,13 +178,17 @@ public class Mod : IModV1
             _logger!.WriteLine("[P5RGenSocialLinks] Memcpy inner hook skipped — IReloadedHooks null.");
             return;
         }
-        nuint moduleBase = (nuint)Process.GetCurrentProcess().MainModule!.BaseAddress;
-        // Hook the REP MOVSB inner function directly (not the outer dispatcher).
-        // The dialogue system reaches FUN_1405a8570 via a function pointer, bypassing
-        // FUN_1405a8590, so hooking the inner function catches all paths.
-        nuint addr = moduleBase + 0x5A8570;
-        _memcpyHook = _hooks.CreateHook<MemcpyInnerDelegate>(OnGameMemcpy, (long)addr).Activate();
-        _logger!.WriteLine($"[P5RGenSocialLinks] Memcpy inner hook ACTIVE at 0x{addr:X}");
+        try
+        {
+            nuint moduleBase = (nuint)Process.GetCurrentProcess().MainModule!.BaseAddress;
+            nuint addr = moduleBase + 0x5A8570;
+            _memcpyHook = _hooks.CreateHook<MemcpyInnerDelegate>(OnGameMemcpy, (long)addr).Activate();
+            _logger!.WriteLine($"[P5RGenSocialLinks] Memcpy inner hook ACTIVE at 0x{addr:X}");
+        }
+        catch (Exception ex)
+        {
+            _logger!.WriteLine($"[P5RGenSocialLinks] Memcpy hook FAILED: {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
     private unsafe void OnGameMemcpy(nuint dst, nuint src, nuint count)
@@ -282,7 +309,7 @@ public class Mod : IModV1
     // ── Poll loop — session lifecycle + text pool discovery ───────────────
 
     private readonly StructDiffScanner _diffScanner = new();
-    private ushort _lastBfPc;       // change-detection: fires only when PC moves
+    private uint _lastBfPc;       // change-detection: fires only when PC moves (32-bit per mov [rbx+20],eax)
 
     /// <summary>
     /// Runs every poll tick while in a session. Scans the first 1024 bytes of the
@@ -496,30 +523,31 @@ public class Mod : IModV1
     }
 
     /// <summary>
-    /// Logs one line per dialogue advance using the cached BF buffer + BF PC.
+    /// Fires on every BF PC change. Reads the live opcode struct at session+0x18
+    /// (a pointer advanced 0x10 bytes per instruction, confirmed via CE write trace).
+    /// Logs bytes + tries to read text pointers at struct offsets +0x08 and +0x10
+    /// to identify which field carries the dialogue string pointer.
     /// </summary>
     private unsafe void ProbeBfLine(nuint session)
     {
-        if (_bfBufferBase == 0) return;   // buffer not found yet
-
-        if (!Memory.MemoryGuard.IsReadable(session + 0x20, 2)) return;
-        ushort pc = *(ushort*)((byte*)session + 0x20);
+        if (!Memory.MemoryGuard.IsReadable(session + 0x18, 12)) return;
+        uint pc = *(uint*)((byte*)session + 0x20);
         if (pc == _lastBfPc) return;
         _lastBfPc = pc;
 
-        nuint lineAddr = _bfBufferBase + pc;
-        if (!Memory.MemoryGuard.IsReadable(lineAddr, 64)) return;
-        byte* b = (byte*)lineAddr;
+        // session+0x18 = BF script base pointer (constant, below HeapLow — not heap).
+        // session+0x20 = PC: byte offset into the BF script from that base.
+        nuint bfBase = *(nuint*)((byte*)session + 0x18);
+        if (bfBase == 0) return;
 
-        var hex  = new System.Text.StringBuilder(24);
-        for (int i = 0; i < 8; i++) hex.Append($"{b[i]:X2} ");
+        nuint instrAddr = bfBase + pc;
+        if (!Memory.MemoryGuard.IsReadable(instrAddr, 16)) return;
 
-        var text = new System.Text.StringBuilder(128);
-        for (int i = 0; i < 64; i++)
-            if (b[i] >= 0x20 && b[i] <= 0x7E) text.Append((char)b[i]);
+        byte* b = (byte*)instrAddr;
+        var hex = new System.Text.StringBuilder(48);
+        for (int i = 0; i < 16; i++) hex.Append($"{b[i]:X2} ");
 
-        _modLog!.Info(
-            $"[BFLine] pc=0x{pc:X4} @0x{lineAddr:X} [0x{_bfBufferOff:X3}+pc] [{hex}]: \"{text}\"");
+        _modLog!.Info($"[BFInstr] pc=0x{pc:X} @0x{instrAddr:X}: {hex}");
     }
 
     private void StartPollLoop()
