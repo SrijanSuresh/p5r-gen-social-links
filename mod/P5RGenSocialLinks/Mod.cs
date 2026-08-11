@@ -645,27 +645,24 @@ public class Mod : IModV1
                 bool isBfPage = bfBase >= regBase && bfBase < regBase + regSize;
                 if (!isBfPage)
                 {
-                    // Probe 128 KB: BMD header + offset table can consume the first 8–16 KB.
-                    int probeLen = (int)Math.Min(regSize, 131072u);
-                    if (MemoryGuard.IsReadable(regBase, probeLen))
+                    if (MemoryGuard.IsReadable(regBase, 4))
                     {
-                        // BMD files always start with version=13 as LE uint16 → [0D 00].
-                        // This eliminates Windows DLLs, PE images, and other read-only mappings.
+                        // BMD header: [uint16 version=13][uint16 msgCount]
                         byte* hdr = (byte*)regBase;
                         if (hdr[0] != 0x0D || hdr[1] != 0x00) goto nextRegion;
 
-                        int runs = CountPrintableRuns(regBase, probeLen);
+                        ushort msgCount = (ushort)(hdr[2] | (hdr[3] << 8));
                         regionsChecked++;
-
-                        byte* p4 = (byte*)regBase;
                         _modLog!.Info(
-                            $"[BMD] Region 0x{regBase:X} sz=0x{regSize:X} prot=0x{protect:X}" +
-                            $" r={runs} [{p4[0]:X2} {p4[1]:X2} {p4[2]:X2} {p4[3]:X2}]");
+                            $"[BMD] Region 0x{regBase:X} sz=0x{regSize:X} count={msgCount}" +
+                            $" [{hdr[0]:X2} {hdr[1]:X2} {hdr[2]:X2} {hdr[3]:X2}]");
 
-                        if (runs >= 5)
+                        // Lock on the largest dialogue BMD (count ≥ 1000).
+                        // Small BMDs (tips, UI) have count < 500; main dialogue has 1252.
+                        if (msgCount >= 1000)
                         {
                             _bmdBase = regBase;
-                            _modLog!.Info($"[BMD] Candidate locked: 0x{regBase:X} runs={runs}");
+                            _modLog!.Info($"[BMD] Locked: 0x{regBase:X} msgCount={msgCount}");
                             TryLogBmdStrings();
                             return;
                         }
