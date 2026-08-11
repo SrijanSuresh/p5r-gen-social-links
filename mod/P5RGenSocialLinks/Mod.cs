@@ -618,7 +618,7 @@ public class Mod : IModV1
         if (bfBase == 0) return;
 
         const uint  MEM_COMMIT    = 0x1000;
-        const uint  PAGE_NOACCESS = 0x01;
+        const uint  PAGE_READONLY = 0x02;
         const uint  PAGE_GUARD    = 0x100;
         // All P5R mapped-file assets observed in [0x60000000, 0xFFFF0000].
         // Scan the full lower-4GB so the window never misses due to bfBase drift.
@@ -637,7 +637,7 @@ public class Mod : IModV1
             nuint next = regBase + regSize;
 
             if (state == MEM_COMMIT &&
-                (protect & PAGE_NOACCESS) == 0 &&
+                protect == PAGE_READONLY &&           // BMD files are memory-mapped read-only
                 (protect & PAGE_GUARD) == 0 &&
                 regSize >= 1024 &&
                 regSize <= 64u * 1024u * 1024u)
