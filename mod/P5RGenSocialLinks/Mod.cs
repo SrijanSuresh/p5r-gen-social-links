@@ -607,24 +607,25 @@ public class Mod : IModV1
 
     // ── BMD scanner ───────────────────────────────────────────────────────
 
-    // Scans ±128 MB around _confirmedBfBase for a committed, readable region
-    // that contains 10+ English dialogue sentences (the BMD string table).
+    // Scans the entire lower-4GB mapped-file region for a committed, readable
+    // region containing ≥5 English dialogue sentences (the BMD string table).
+    // Uses an absolute range because bfBase shifts by 200+ MB between runs,
+    // making a relative window unreliable.
     // Fires once per session (_bmdScanDone gate in caller).
-    // Logs every region with ≥1 sentence for diagnostics if the threshold isn't met.
     private unsafe void TryScanForBmd()
     {
         nuint bfBase = _confirmedBfBase;
         if (bfBase == 0) return;
 
-        const uint MEM_COMMIT    = 0x1000;
-        const uint PAGE_NOACCESS = 0x01;
-        const uint PAGE_GUARD    = 0x100;
-        const uint WindowBytes   = 128u * 1024u * 1024u; // 128 MB each direction
+        const uint  MEM_COMMIT    = 0x1000;
+        const uint  PAGE_NOACCESS = 0x01;
+        const uint  PAGE_GUARD    = 0x100;
+        // All P5R mapped-file assets observed in [0x60000000, 0xFFFF0000].
+        // Scan the full lower-4GB so the window never misses due to bfBase drift.
+        nuint scanStart = (nuint)0x1000UL;
+        nuint scanEnd   = (nuint)0xFFFF0000UL;
 
-        nuint scanStart = bfBase >= WindowBytes ? bfBase - WindowBytes : 0;
-        nuint scanEnd   = bfBase + WindowBytes;
-
-        _modLog!.Info($"[BMD] Scan start: bfBase=0x{bfBase:X} range=[0x{scanStart:X},0x{scanEnd:X}]");
+        _modLog!.Info($"[BMD] Scan start: bfBase=0x{bfBase:X} (full lower-4GB scan)");
 
         int regionsChecked = 0;
         nuint probe = scanStart;
