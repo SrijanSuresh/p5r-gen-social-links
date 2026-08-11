@@ -52,6 +52,16 @@ public class Mod : IModV1
 
     private IHook<MemcpyInnerDelegate>? _memcpyHook;
 
+    // BF opcode dispatcher hook: FUN_14024EE00.
+    // Called for every BF instruction. RCX=channel(0x2B), RDX=opcode type byte,
+    // R8=opcode_struct[+0x08], R9=opcode_struct[+0x10].
+    // When RDX==5 this is a dialogue instruction — log R8/R9 to find the text pointer.
+    [Function(CallingConventions.Microsoft)]
+    private delegate void BfOpcodeDispatchDelegate(nuint channel, nuint typeAndFlags,
+                                                    nuint arg2, nuint arg3);
+
+    private IHook<BfOpcodeDispatchDelegate>? _bfDispatchHook;
+
     // Dialogue heap sits above 256 GB; CLR/runtime copies are all below 4 GB.
     private static readonly nuint HeapLow = unchecked((nuint)0x4000000000UL);
 
@@ -92,12 +102,51 @@ public class Mod : IModV1
 
         TryActivateHook();
         SetupMemcpyHook();
+        SetupBfDispatchHook();
         StartPollLoop();
 
         _logger.WriteLine($"[P5RGenSocialLinks] Started — hook:{(_hookActive ? "ON" : "OFF")} poll:ON");
     }
 
     private bool _hookActive;
+
+    private void SetupBfDispatchHook()
+    {
+        if (_hooks is null) return;
+        nuint moduleBase = (nuint)Process.GetCurrentProcess().MainModule!.BaseAddress;
+        nuint addr = moduleBase + 0x24EE00;
+        _bfDispatchHook = _hooks.CreateHook<BfOpcodeDispatchDelegate>(
+            OnBfOpcodeDispatch, (long)addr).Activate();
+        _logger!.WriteLine($"[P5RGenSocialLinks] BfDispatch hook ACTIVE at 0x{addr:X}");
+    }
+
+    private unsafe void OnBfOpcodeDispatch(nuint channel, nuint typeAndFlags,
+                                            nuint arg2, nuint arg3)
+    {
+        _bfDispatchHook!.OriginalFunction(channel, typeAndFlags, arg2, arg3);
+
+        byte opType = (byte)(typeAndFlags & 0xFF);
+        if (opType != 5) return;
+
+        // arg2 (R8) and arg3 (R9) are fields from the opcode struct.
+        // One of them points to the dialogue text in the BF script buffer.
+        // Log both so we can identify the text pointer from the output.
+        string preview2 = TryReadString(arg2);
+        string preview3 = TryReadString(arg3);
+        _modLog!.Info(
+            $"[BFOp5] ch=0x{channel:X} R8=0x{arg2:X}\"{preview2}\" R9=0x{arg3:X}\"{preview3}\"");
+    }
+
+    private static unsafe string TryReadString(nuint addr)
+    {
+        if (addr < unchecked((nuint)0x1000000UL)) return "";
+        if (!Memory.MemoryGuard.IsReadable(addr, 32)) return "?";
+        byte* p = (byte*)addr;
+        var sb = new System.Text.StringBuilder(32);
+        for (int i = 0; i < 32 && p[i] != 0; i++)
+            sb.Append(p[i] >= 0x20 && p[i] <= 0x7E ? (char)p[i] : '·');
+        return sb.ToString();
+    }
 
     private void SetupMemcpyHook()
     {
@@ -546,6 +595,7 @@ public class Mod : IModV1
         _cts.Cancel();
         _conversationHook?.Disable();
         _memcpyHook?.Disable();
+        _bfDispatchHook?.Disable();
         _diffScanner.Reset();
         _logger?.WriteLine("[P5RGenSocialLinks] Suspended.");
     }
@@ -554,6 +604,7 @@ public class Mod : IModV1
     {
         _conversationHook?.Enable();
         _memcpyHook?.Enable();
+        _bfDispatchHook?.Enable();
         StartPollLoop();
         _logger?.WriteLine("[P5RGenSocialLinks] Resumed.");
     }
@@ -566,6 +617,7 @@ public class Mod : IModV1
         _llmClient?.Dispose();
         _conversationHook?.Disable();
         _memcpyHook?.Disable();
+        _bfDispatchHook?.Disable();
         _diffScanner.Reset();
         _logger?.WriteLine("[P5RGenSocialLinks] Unloaded.");
     }
