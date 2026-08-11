@@ -24,8 +24,10 @@ internal sealed class GenConfig
     [JsonPropertyName("poll_interval_ms")]
     public int PollIntervalMs { get; init; } = 500;
 
+    // When true, logs every BF instruction byte-dump ([BFInstr]) and StructDiff slot changes.
+    // Defaults off — the [MSG] and [LLM] events are sufficient for normal operation.
     [JsonPropertyName("struct_diff_enabled")]
-    public bool StructDiffEnabled { get; init; } = true;
+    public bool StructDiffEnabled { get; init; } = false;
 
     /// <summary>
     /// When true, PointerChainResolver logs each chain step with address and dereferenced value.
