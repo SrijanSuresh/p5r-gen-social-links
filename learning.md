@@ -3666,3 +3666,22 @@ The correct discriminators for dialogue:
 3. **Vowel count ≥ 4** — raised from 3 to reduce borderline passes.
 
 Also noted: `bfBase` is NOT static — it changed from `0x702594D8` to `0x6FFC1258` between two game sessions. It must always be read live from `session+0x18`, not cached across sessions. The current code already does this correctly.
+
+---
+
+## Chapter 47 — Diagnostic Scan: Why the BMD Is Still Hidden
+
+### Two root causes from the ±32 MB scan failure
+
+**Cause 1 — Scan fires every poll tick.**  
+The gate `if (_confirmedBfBase != 0 && _bmdBase == 0)` fires once per poll interval (~500 ms) because `_bmdBase` stays 0. Walking ±32 MB of address space on every tick is wasteful and produces log spam. Fix: add a `_bmdScanDone` bool that flips true on first attempt.
+
+**Cause 2 — BMD header precedes strings.**  
+P5R `.bmd` (message) files start with a binary header: a magic word, string count, then an offset table (4 bytes per string). That header section can be several KB. If the BMD region is, say, 68 KB and the offset table takes the first 10 KB, scanning only the first 8 KB of the region will hit zero real sentences. Fix: scan 32 KB per region.
+
+**Cause 3 — Window may be too narrow.**  
+`bfBase` shifts between `0x6FAA35F8` and `0x702594D8` across runs — the BF script is not at a fixed address. The BMD for the same event is usually in the same CPK archive, but after decompression it may land in a different VirtualAlloc range. Expanding to ±128 MB covers almost the entire lower-4 GB mapped-file zone.
+
+### Diagnostic approach
+
+Instead of stopping at the first 10-sentence region, log EVERY committed readable region that has ≥1 qualifying sentence. Output its base, size, protect flags, first 4 raw bytes (to identify file magic), and sentence count. This gives a full map of what text regions exist in the window and why the threshold isn't being met.
