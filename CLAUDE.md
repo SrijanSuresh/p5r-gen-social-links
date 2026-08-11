@@ -10,6 +10,8 @@ You are acting as an expert systems engineering mentor and pair programmer. For 
 4. **COMMIT:** Once the code passes, immediately execute a Git commit.
 
 ## Git Protocol
+- **Branch workflow (MANDATORY):** Never commit directly to `main`. At the start of each session, create a feature branch named `feat/<short-topic>` (e.g., `feat/bf-dispatch-hook`). All commits go on that branch.
+- At PR time: redate all branch commits to today's date, push the branch, then open a PR targeting `main` with `gh pr create`.
 - Commit messages must follow Conventional Commits (e.g., `feat:`, `fix:`, `refactor:`, `docs:`).
 - Commits must be atomic. Do not bundle multiple logical changes into one commit.
 - Automatically execute `git add` and `git commit`. Do not wait for user approval to commit if the tests pass.
