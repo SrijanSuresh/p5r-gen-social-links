@@ -21,6 +21,34 @@ internal static class MemoryGuard
         uint  flNewProtect,
         out uint lpflOldProtect);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool ReadProcessMemory(
+        nint  hProcess,
+        nuint lpBaseAddress,
+        byte[] lpBuffer,
+        nuint nSize,
+        out nuint lpNumberOfBytesRead);
+
+    [DllImport("kernel32.dll")]
+    private static extern nint GetCurrentProcess();
+
+    /// <summary>
+    /// Copies game memory into a managed buffer, returning false instead of faulting.
+    ///
+    /// IsReadable followed by a raw pointer walk is a time-of-check/time-of-use race: the
+    /// game frees and remaps heap on its own threads, so a region validated at the start
+    /// of a multi-megabyte scan can vanish partway through. That raises an
+    /// AccessViolationException, which .NET 8 treats as a corrupted-state exception —
+    /// uncatchable, and fatal to the whole process. Routing bulk scans through
+    /// ReadProcessMemory turns that crash into a false return.
+    /// </summary>
+    internal static bool TryRead(nuint addr, byte[] buffer, int len)
+    {
+        if (addr == 0 || len <= 0 || len > buffer.Length) return false;
+        return ReadProcessMemory(GetCurrentProcess(), addr, buffer, (nuint)len, out nuint got)
+               && (int)got == len;
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     private struct MEMORY_BASIC_INFORMATION
     {

@@ -4430,3 +4430,69 @@ or index. That object is the game's own handle on the displayed message, populat
 exactly while a message is on screen. Following it beats guessing at pool
 addresses, which is what `ProbeMessageObject` now does — dumping every heap pointer
 it holds and testing each target as both ASCII and UTF-16.
+
+---
+
+## Chapter 61: TOCTOU, and Why the Scan Killed the Game
+
+### The crash
+
+```
+Fatal error. System.AccessViolationException: Attempted to read or write protected memory.
+   at P5RGenSocialLinks.Mod.FindAsciiEnglish(UIntPtr, Int32, Int32)
+   at P5RGenSocialLinks.Mod.TryFindHeapDialoguePool()
+```
+
+The scan validated a region and then read it:
+
+```csharp
+if (MemoryGuard.IsReadable(regionBase, len))     // check
+    foreach (var hit in FindAsciiEnglish(regionBase, len, 8192))  // ...then use
+```
+
+That is a textbook time-of-check/time-of-use race. `IsReadable` is a single
+`VirtualQuery` describing the address space *at that instant*. The walk that follows
+covers up to 8 MB and takes real time, on a background poll thread, while the game's
+own threads continue allocating and freeing heap. Somewhere mid-scan the region was
+unmapped and the next dereference hit unmapped memory.
+
+The window scaled with exactly the thing that had been increased to improve coverage:
+larger regions meant longer scans meant a wider window to lose the memory.
+
+### Why this one is fatal rather than catchable
+
+`AccessViolationException` is a *corrupted-state exception*. Since .NET Core, it
+cannot be caught at all — not by `catch (Exception)`, not by
+`catch (AccessViolationException)`. The legacy
+`<LegacyCorruptedStateExceptionsPolicy>` escape hatch does not exist on modern
+runtimes. The process dies, taking the game with it.
+
+So this cannot be handled defensively after the fact. It has to be made impossible.
+
+### The fix: copy instead of dereference
+
+```csharp
+internal static bool TryRead(nuint addr, byte[] buffer, int len)
+    => ReadProcessMemory(GetCurrentProcess(), addr, buffer, (nuint)len, out var got)
+       && (int)got == len;
+```
+
+`ReadProcessMemory` against the current process performs the same validation the
+CPU would, but reports failure through a return value instead of a fault. If the
+region vanished, the call returns `false` and the scan skips that chunk.
+
+Reading 256 KB at a time is a deliberate balance: small enough that a chunk copy is
+effectively atomic against the game's allocator, large enough that scanning 2 GB
+costs roughly 8000 syscalls rather than millions.
+
+### The general rule
+
+Tightening the check does not fix a TOCTOU race — it only narrows the window.
+Checking every 4 KB instead of every 8 MB would have made the crash rarer and
+therefore harder to diagnose, not absent. The race is only eliminated by making the
+check and the use the *same operation*, which is precisely what `ReadProcessMemory`
+does: validation and copy happen together inside one kernel call.
+
+A corollary worth carrying: raw pointer walks over another subsystem's live memory
+are safe only for small, immediate reads. Anything that scans in bulk should copy
+first and parse the copy.

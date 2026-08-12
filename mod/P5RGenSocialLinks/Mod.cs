@@ -967,6 +967,59 @@ public class Mod : IModV1
         return hits;
     }
 
+    // Reusable scan buffer — the heap sweep reads hundreds of megabytes per pass and
+    // must not allocate a fresh array per chunk.
+    private const int ScanChunk = 0x40000; // 256 KB
+    private readonly byte[] _scanBuf = new byte[ScanChunk];
+
+    /// <summary>
+    /// Buffer-based counterpart to <see cref="FindAsciiEnglish"/>. Operates on a copy made
+    /// by <see cref="MemoryGuard.TryRead"/> so a region freed mid-scan cannot fault.
+    /// </summary>
+    private static System.Collections.Generic.List<(nuint Addr, string Text)>
+        FindAsciiEnglishBuf(byte[] buf, int len, nuint baseAddr, int maxHits)
+    {
+        var hits = new System.Collections.Generic.List<(nuint, string)>();
+        int i = 0;
+
+        while (i < len && hits.Count < maxHits)
+        {
+            while (i < len && !IsPrintable(buf[i])) i++;
+            int begin = i;
+            while (i < len && IsPrintable(buf[i])) i++;
+
+            int slen = i - begin;
+            if (slen < 10 || slen > 400) continue;
+
+            string s = System.Text.Encoding.ASCII.GetString(buf, begin, slen);
+            if (IsEnglishString(s)) hits.Add((baseAddr + (nuint)begin, s));
+        }
+        return hits;
+    }
+
+    /// <summary>
+    /// Captures (offset, length) slots across a region using buffered reads. Strings that
+    /// straddle a chunk boundary are dropped rather than stitched — at 256 KB chunks that
+    /// is a negligible fraction, and it keeps every read bounds-checked.
+    /// </summary>
+    private (int Off, int Len)[] CapturePoolSlotsSafe(nuint poolBase, int scanLen)
+    {
+        var slots = new System.Collections.Generic.List<(int, int)>();
+
+        for (int chunkOff = 0; chunkOff < scanLen && slots.Count < 20000; chunkOff += ScanChunk)
+        {
+            int want = Math.Min(ScanChunk, scanLen - chunkOff);
+            if (!MemoryGuard.TryRead(poolBase + (nuint)chunkOff, _scanBuf, want)) continue;
+
+            foreach (var (addr, text) in FindAsciiEnglishBuf(_scanBuf, want, poolBase + (nuint)chunkOff, 20000))
+            {
+                slots.Add(((int)(addr - poolBase), text.Length));
+                if (slots.Count >= 20000) break;
+            }
+        }
+        return slots.ToArray();
+    }
+
     private static unsafe string AsciiPreview(nuint addr, int maxChars)
     {
         if (!MemoryGuard.IsReadable(addr, maxChars)) return "";
@@ -1267,23 +1320,32 @@ public class Mod : IModV1
             if (usable && regionSize >= 0x1000 && regionSize <= 0x4000000)
             {
                 int len = (int)Math.Min((ulong)regionSize, (ulong)maxScan);
-                if (MemoryGuard.IsReadable(regionBase, len))
+
+                // Read through TryRead in chunks rather than dereferencing the region
+                // directly: the game frees heap on its own threads and a raw walk over
+                // megabytes will eventually fault on memory that vanished mid-scan.
+                int    score  = 0;
+                string sample = "";
+                int    read   = 0;
+
+                for (int chunkOff = 0; chunkOff < len; chunkOff += ScanChunk)
                 {
-                    // 8192, not 256: at 256 every text-heavy region saturated the cap and
-                    // scored identically, so the sort was a no-op and the lowest address —
-                    // a shader string block — won by default.
-                    int    score  = 0;
-                    string sample = "";
-                    foreach (var (a, t) in FindAsciiEnglish(regionBase, len, 8192))
+                    int want = Math.Min(ScanChunk, len - chunkOff);
+                    if (!MemoryGuard.TryRead(regionBase + (nuint)chunkOff, _scanBuf, want)) break;
+                    read += want;
+
+                    foreach (var (a, t) in FindAsciiEnglishBuf(_scanBuf, want,
+                                                              regionBase + (nuint)chunkOff, 8192))
                     {
                         int s = DialogueScore(t);
                         if (s == 0) continue;
                         if (sample.Length == 0) sample = t;
                         score += s;
                     }
-                    if (score >= 20) ranked.Add((score, regionBase, len, sample));
-                    totalScanned += len;
                 }
+
+                if (score >= 20) ranked.Add((score, regionBase, len, sample));
+                totalScanned += read;
             }
             addr = regionEnd;
         }
@@ -1306,7 +1368,7 @@ public class Mod : IModV1
         for (int i = 0; i < take; i++)
         {
             var c = ranked[i];
-            var slots = CapturePoolSlots(c.Base, c.Len);
+            var slots = CapturePoolSlotsSafe(c.Base, c.Len);
             if (slots.Length == 0) continue;
             _heapPools.Add((c.Base, c.Len, slots));
             _modLog!.Info(
@@ -1335,7 +1397,10 @@ public class Mod : IModV1
 
         foreach (var (poolBase, poolLen, slots) in _heapPools)
         {
-            if (!MemoryGuard.IsWritable(poolBase, 16)) continue;
+            // Validate the whole range, not just the first bytes. The region was captured
+            // on an earlier tick and the game may have freed it since; writing through a
+            // stale base would fault fatally the same way the scan did.
+            if (!MemoryGuard.IsWritable(poolBase, poolLen)) continue;
 
             byte* p = (byte*)poolBase;
             int wrote = 0;
