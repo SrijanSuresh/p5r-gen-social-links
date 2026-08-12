@@ -160,42 +160,68 @@ public class Mod : IModV1
         return result;
     }
 
+    // Windows x64 user-mode addresses are capped at 128 TB (bit 47).
+    // Values above this are data misread as pointers — reject them.
+    private static readonly nuint UserAddrMax = unchecked((nuint)0x7FFFFFFFFFFFUL);
+
     // Applies the 3-hop chain: descriptor → descriptor+0x18 → textObj → *(textObj) → charPtr.
-    // Returns 0 if any link is null, unreadable, or below HeapLow.
+    // Returns 0 if any link is null, unreadable, below HeapLow, or above the 48-bit VA cap.
     private static unsafe nuint FollowTextObjChain(nuint descriptor)
     {
         if (!MemoryGuard.IsReadable(descriptor + 0x18, 8)) return 0;
         nuint textObj = *(nuint*)(descriptor + 0x18);
         if (textObj == 0 || !MemoryGuard.IsReadable(textObj, 8)) return 0;
         nuint charPtr = *(nuint*)textObj;
-        return charPtr >= HeapLow ? charPtr : 0;
+        return (charPtr >= HeapLow && charPtr <= UserAddrMax) ? charPtr : 0;
     }
 
-    // Finds the actual character buffer by scanning the readable part of the session struct
-    // for external heap pointers and probing each as a potential descriptor. Tries session+0xD0
-    // first (the known primary path), then scans [0x00..0xC8) for fallback candidates.
-    // This handles C++ session subclasses that store the descriptor at different offsets.
+    // Returns true if ≥8 printable ASCII bytes and ≥1 space in first 48 bytes — looks
+    // like English dialogue rather than binary data, a filepath, or a null region.
+    private static unsafe bool LooksLikeText(nuint addr)
+    {
+        if (!MemoryGuard.IsReadable(addr, 48)) return false;
+        byte* p = (byte*)addr;
+        int printable = 0, spaces = 0;
+        for (int i = 0; i < 48 && p[i] != 0; i++)
+        {
+            if (p[i] >= 0x20 && p[i] <= 0x7E) { printable++; if (p[i] == ' ') spaces++; }
+        }
+        return printable >= 8 && spaces >= 1;
+    }
+
+    // Finds the actual character buffer. Tries three paths in order:
+    //   A) session+0xD0 → heap descriptor chain (4-hop)
+    //   B) session+0xD0 value is a direct mapped-file pointer (< HeapLow, looks like text)
+    //   C) Fallback heap scan of session[0x00..0xC8) — external ptrs probed as descriptors
     private static unsafe nuint TryReadTextAddr(nuint session)
     {
-        // Primary: session+0xD0 (works when C++ subclass includes the dialogue fields)
         if (MemoryGuard.IsReadable(session + 0xD0, 8))
         {
             nuint d = *(nuint*)((byte*)session + 0xD0);
             if (d != 0)
             {
-                nuint cp = FollowTextObjChain(d);
-                if (cp != 0) return cp;
+                // Path A: d is a heap descriptor → follow chain
+                if (d >= HeapLow && d <= UserAddrMax)
+                {
+                    nuint cp = FollowTextObjChain(d);
+                    if (cp != 0) return cp;
+                }
+                // Path B: d is a mapped-file address → treat as direct text pointer
+                else if (d >= 0x1000 && d < HeapLow && LooksLikeText(d))
+                {
+                    return d;
+                }
             }
         }
 
-        // Fallback: scan session[0x00..0xC8) for external, non-self-referential heap ptrs.
+        // Path C: scan session[0x00..0xC8) for external heap pointers
         const int scanLen = 0xC8;
         if (!MemoryGuard.IsReadable(session, scanLen)) return 0;
         byte* sp = (byte*)session;
         for (int off = 0; off + 8 <= scanLen; off += 8)
         {
             nuint ptr = *(nuint*)(sp + off);
-            if (ptr < HeapLow) continue;
+            if (ptr < HeapLow || ptr > UserAddrMax) continue;
             if (ptr >= session && ptr < session + 0x1000) continue; // self-referential
             nuint cp = FollowTextObjChain(ptr);
             if (cp != 0) return cp;
@@ -694,6 +720,20 @@ public class Mod : IModV1
                         }
                         _modLog!.Info(bndSb.ToString());
 
+                        // Dump raw bytes at the session+0xD0 value when it's a low-memory
+                        // (mapped-file) address — shows whether it's BMD text or BF script.
+                        if (MemoryGuard.IsReadable(session + 0xD0, 8))
+                        {
+                            nuint d0val = *(nuint*)((byte*)session + 0xD0);
+                            if (d0val >= 0x1000 && d0val < HeapLow && MemoryGuard.IsReadable(d0val, 48))
+                            {
+                                byte* tb = (byte*)d0val;
+                                var dSb = new System.Text.StringBuilder($"[MSG] D0Direct(0x{d0val:X}): ");
+                                for (int di = 0; di < 48; di++) dSb.Append($"{tb[di]:X2} ");
+                                _modLog!.Info(dSb.ToString());
+                            }
+                        }
+
                         // Heap pointer scan: shows fallback descriptor candidates
                         if (MemoryGuard.IsReadable(session, 0xC8))
                         {
@@ -975,8 +1015,23 @@ public class Mod : IModV1
         const int MaxWrite = 200;
         if (!Memory.MemoryGuard.IsWritable(textAddr, MaxWrite))
         {
-            _modLog!.Warn($"[BMD] Write: 0x{textAddr:X} not writable (sz={MaxWrite})");
-            return false;
+            // Mapped-file pages are PAGE_READONLY — upgrade to PAGE_WRITECOPY so the
+            // OS gives us a private writable copy without touching the file on disk.
+            if (textAddr < HeapLow)
+            {
+                const uint PAGE_WRITECOPY = 0x08;
+                if (!Memory.MemoryGuard.VirtualProtect(textAddr, (nuint)MaxWrite, PAGE_WRITECOPY, out _))
+                {
+                    _modLog!.Warn($"[BMD] VirtualProtect WRITECOPY failed for 0x{textAddr:X}");
+                    return false;
+                }
+                _modLog!.Info($"[BMD] VirtualProtect WRITECOPY applied to mapped page 0x{textAddr:X}");
+            }
+            else
+            {
+                _modLog!.Warn($"[BMD] Write: 0x{textAddr:X} not writable (sz={MaxWrite})");
+                return false;
+            }
         }
 
         // Encode as ASCII — Latin characters are valid single-byte Shift-JIS values,

@@ -4105,3 +4105,44 @@ We also add a targeted dump of session[0xB8..0xE0] — one 8-byte slot at a time
 ```
 
 If +0xC8 is the first unreadable slot, the struct is exactly 0xC8 bytes. If +0xD0 is unreadable but +0xC8 is readable-but-null, the struct exists but hasn't been populated yet at that offset.
+
+---
+
+## Chapter 55: Memory-Mapped Files vs. Heap — Two Totally Different Pointer Ranges
+
+### What We Missed
+
+We assumed dialogue text lives on the game heap (> 256 GB / `0x4000000000`). That was true for one type of session object. But `session+0xD0 = 0x610A3768` — that's in the **memory-mapped file region** (all `0x61...` addresses), the same range as `bfBase`. This is where P5R maps BMD dialogue files directly off disk into process memory via `MapViewOfFile`.
+
+### Memory-Mapped Files in Windows
+
+`MapViewOfFile` maps a file into the process address space. The OS picks an address in user space — typically in the 1–4 GB range for 32-bit compatible mappings, or wherever VirtualAlloc finds space. P5R uses `0x61...` for most of its game data files.
+
+Protection is `PAGE_READONLY` (0x02) by default — the CPU MMU enforces this; any write triggers an access violation. To write to a mapped region without modifying the file on disk, call `VirtualProtect` with `PAGE_WRITECOPY` (0x08). The OS switches that page to copy-on-write: your process gets a private writable copy, the on-disk file is untouched.
+
+### The False Positive Bug
+
+`0x65007300610062` decoded as UTF-16 LE is "base" — a fragment of a shader filename. It sneaked through because our `charPtr >= HeapLow` check only has a **lower** bound (256 GB) but no **upper** bound. Valid Windows user-mode addresses cap at `0x7FFFFFFFFFFF` (48-bit VA space, 128 TB). Any value above that is data being misread as a pointer. Adding `charPtr <= 0x7FFFFFFFFFFF` rejects all such garbage.
+
+### The Fix: Three-Path Text Discovery
+
+```
+Path A (primary heap path):
+  session+0xD0 → descriptor (heap) → descriptor+0x18 → textObj → *(textObj) → charPtr
+
+Path B (direct mapped-file path):  ← NEW
+  session+0xD0 → value < HeapLow → bytes there look like English? → return it directly
+
+Path C (fallback heap scan):
+  scan session[0x00..0xC8) for external heap ptrs (with 48-bit cap) → follow chain
+```
+
+Path B handles the mapped-file case. If `*(session+0xD0)` is in low memory (`0x1000 < val < HeapLow`) and the bytes at that address contain ≥8 printable ASCII chars with ≥1 space, we treat it as the dialogue text directly.
+
+### Writing to a Mapped Page
+
+If textAddr < HeapLow (mapped file), `IsWritable` returns false (it's PAGE_READONLY). Before writing, call:
+```csharp
+VirtualProtect(textAddr, MaxWrite, PAGE_WRITECOPY, out oldProtect)
+```
+This makes the page copy-on-write. The write succeeds. The game's renderer, reading from this address, now sees our patched text instead of the original. No file on disk is modified.
