@@ -3796,7 +3796,107 @@ We can only overwrite up to `slotSize` bytes. If the LLM text is longer, we trun
 
 ---
 
-## Chapter 50 — Reverse-Engineering the BMD Offset Table via Known-Anchor Scan
+## Chapter 50 — Why 0x190000 Was the Wrong BMD: Glyph Tables vs. Dialogue Scripts
+
+### The false positive
+
+Our scan locked on address 0x190000 because it matched three filters:
+1. Magic `[0D 00]` at byte 0
+2. `msgCount = 1252` ≥ our 1000-threshold
+3. PAGE_READONLY memory-mapped region
+
+But the reverse-anchor scan returned **zero hits** — values 0x0120, 0x013E, 0x0158 did not appear in the first 1024 bytes. This is the smoking gun.
+
+Then look at what TryLogBmdStrings found in the big 15837-byte block at +0x0223:
+
+```
+............................... !"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwx.
+```
+
+The leading dots are bytes ≥ 0x80 (Shift-JIS lead bytes). Then there's a space (0x20), followed by the entire ASCII printable sequence 0x21–0x7E. That IS the ASCII character table, ordered by code point. This region is a **glyph descriptor table** (probably font metrics or character-set mapping), not dialogue BMD. The count 1252 = number of glyphs, not messages.
+
+### Why the scan-all-memory approach breaks
+
+Scanning the full lower 4 GB for `[0D 00]` + large count was always fragile: the magic bytes and size threshold are coincidentally satisfied by non-BMD resources. The correct approach is to go directly to the source — the BF (FlowScript Binary) that the game loaded for this conversation.
+
+---
+
+## Chapter 51 — Parsing the BF Section Table to Find the Embedded BMD
+
+### BF binary format (P5R, little-endian, version 3)
+
+A BF file is a structured binary with a fixed header followed by a section table. Every field is little-endian:
+
+```
+Offset  Size  Field
+0x00    4     field00 (= 0)
+0x04    1     compressionFlag
+0x05    1     userId
+0x06    2     version (int16)
+0x08    4     fileSize
+0x0C    4     magic: "FLW\0" = 0x00574C46  ("FLF\0" for some variants)
+0x10    2     sectionCount (int16)
+0x12    2     localIntVariableCount
+0x14    2     localFloatVariableCount
+0x16    2     padding
+0x18    ...   SectionHeader[sectionCount], each 16 bytes
+```
+
+Each `SectionHeader` is 16 bytes:
+
+```
++0x00  int32  firstElementOffset   ← byte offset from BF buffer start to section data
++0x04  int32  elementSize          ← bytes per element
++0x08  int32  elementCount         ← number of elements (= section byte length when elementSize=1)
++0x0C  int32  reserved (= 0)
+```
+
+The sections appear in a fixed order by type:
+
+| Index | Type               | elementSize | Content                          |
+|-------|--------------------|-------------|----------------------------------|
+| 0     | ProcedureLabelTable| 0x20        | Procedure descriptor entries     |
+| 1     | JumpLabelTable     | 0x04        | Jump target offsets              |
+| 2     | Text (bytecode)    | 0x04        | BF instruction stream            |
+| 3     | MessageScript      | 0x01        | Embedded BMD (raw bytes)         |
+| 4     | StringTable        | 0x01        | Null-terminated C strings        |
+
+**Section 3 is the BMD.** Its data starts at `bfBase + sections[3].firstElementOffset`.
+
+### Why this is better than memory scanning
+
+The BF binary is the authoritative source. The game engine already knows where the BMD is — it loaded it from the same BF file. By reading the section table, we get the exact address with zero ambiguity, no false positives, and no dependence on magic-byte heuristics.
+
+### Implementation
+
+```csharp
+private unsafe void TryScanForBmd()
+{
+    nuint bfBase = _confirmedBfBase;
+    if (bfBase == 0) return;
+
+    byte* bf = (byte*)bfBase;
+    uint  magic        = *(uint*)(bf + 0x0C);
+    short sectionCount = *(short*)(bf + 0x10);
+
+    for (int s = 0; s < sectionCount && s < 8; s++)
+    {
+        byte* sh = bf + 0x18 + s * 16;
+        int firstOff  = *(int*)(sh + 0);
+        int elemSize  = *(int*)(sh + 4);
+        int elemCount = *(int*)(sh + 8);
+
+        // Section 3 = MessageScript, elementSize=1 means raw bytes
+        if (s == 3 && elemSize == 1 && elemCount > 0)
+        {
+            _bmdBase = bfBase + (nuint)(uint)firstOff;
+            // → now _bmdBase points to the real embedded BMD
+        }
+    }
+}
+```
+
+Once `_bmdBase` is set correctly, `TryWriteToBmd` can read the actual offset table and write LLM text to the right message slot.
 
 ### The problem: offset table location is unknown
 
