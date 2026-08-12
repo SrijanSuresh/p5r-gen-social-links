@@ -979,6 +979,27 @@ public class Mod : IModV1
     private readonly byte[] _scanBuf = new byte[ScanChunk];
 
     /// <summary>
+    /// Allocation-free approximation of the letter/lowercase/space ratios in
+    /// <see cref="IsEnglishString"/>. Deliberately looser — it only has to reject the
+    /// obvious non-prose cheaply so the real test runs on a small remainder.
+    /// </summary>
+    private static bool QuickEnglishBytes(byte[] buf, int begin, int len)
+    {
+        int letters = 0, lower = 0, spaces = 0;
+        int end = begin + len;
+        for (int i = begin; i < end; i++)
+        {
+            byte c = buf[i];
+            if      (c >= 'a' && c <= 'z') { letters++; lower++; }
+            else if (c >= 'A' && c <= 'Z') letters++;
+            else if (c == ' ')             spaces++;
+        }
+        return spaces >= 1
+               && letters * 100 >= len * 55
+               && lower   * 100 >= letters * 40;
+    }
+
+    /// <summary>
     /// Buffer-based counterpart to <see cref="FindAsciiEnglish"/>. Operates on a copy made
     /// by <see cref="MemoryGuard.TryRead"/> so a region freed mid-scan cannot fault.
     /// </summary>
@@ -996,6 +1017,11 @@ public class Mod : IModV1
 
             int slen = i - begin;
             if (slen < 10 || slen > 400) continue;
+
+            // Byte-level pre-check before allocating. A full scan covers ~1.5 GB, and
+            // materialising a string for every printable run produced millions of
+            // allocations per pass — enough GC pressure to visibly stutter the game.
+            if (!QuickEnglishBytes(buf, begin, slen)) continue;
 
             string s = System.Text.Encoding.ASCII.GetString(buf, begin, slen);
             if (IsEnglishString(s)) hits.Add((baseAddr + (nuint)begin, s));
@@ -1402,11 +1428,17 @@ public class Mod : IModV1
     {
         if (_heapPools.Count == 0) return 0;
 
-        byte[] enc = System.Text.Encoding.ASCII.GetBytes(text);
         int totalSlots = 0, regions = 0;
 
-        foreach (var (poolBase, poolLen, slots) in _heapPools)
+        for (int r = 0; r < _heapPools.Count; r++)
         {
+            var (poolBase, poolLen, slots) = _heapPools[r];
+
+            // Tag each region with its index so the one that actually reaches the screen
+            // is identifiable by eye. Seeing "[R3] ..." in the bubble collapses the
+            // shotgun to a single target — no ranking heuristic can tell us this.
+            byte[] enc = System.Text.Encoding.ASCII.GetBytes($"[R{r}] {text}");
+
             // Validate the whole range, not just the first bytes. The region was captured
             // on an earlier tick and the game may have freed it since; writing through a
             // stale base would fault fatally the same way the scan did.
@@ -1710,8 +1742,11 @@ public class Mod : IModV1
                     // textAddr=0: dump readable/unreadable status for offsets around the
                     // known boundary (+0xB8..+0xE0) to pinpoint the struct end,
                     // plus all external heap pointers in [0x00..0xC8) for fallback probing.
+                    // Gated: these fire on every message and the pool write path no longer
+                    // depends on any of them.
                     unsafe
                     {
+                        if (!_cfg.StructDiffEnabled) goto skipDiag;
                         // Boundary scan: individual IsReadable per slot
                         var bndSb = new System.Text.StringBuilder("[MSG] BndScan: ");
                         for (int di = 0xB8; di <= 0xE0; di += 8)
@@ -1781,6 +1816,8 @@ public class Mod : IModV1
                             for (int ei = 0; ei < 48; ei++) epSb.Append($"{ep[ei]:X2} ");
                             _modLog!.Info(epSb.ToString());
                         }
+
+                        skipDiag: ;
                     }
                 }
                 _currentMsgTextAddr = capturedTextAddr;

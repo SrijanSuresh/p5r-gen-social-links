@@ -28,4 +28,25 @@
     <PackageReference Include="Reloaded.Mod.Interfaces" Version="2.5.0" />
   </ItemGroup>
 
+  <!-- Deploy to the Reloaded-II mod folder on build.
+       Reloaded loads the DLL from its own Mods directory, not from bin/, so a successful
+       build says nothing about what the game will actually load. A stale deploy cost a
+       full play session: the log reported behaviour from a build two commits old and the
+       symptoms were indistinguishable from a code bug.
+
+       ContinueOnError: the DLL is locked while P5R is running, and a failed copy must
+       not fail the build - it just means the game needs restarting to pick it up. -->
+  <Target Name="DeployToReloaded" AfterTargets="Build">
+    <PropertyGroup>
+      <ReloadedModDir>$(USERPROFILE)\Desktop\Reloaded-II\Mods\P5GenSocialLinks</ReloadedModDir>
+    </PropertyGroup>
+    <Copy SourceFiles="@(None);$(TargetPath)"
+          DestinationFolder="$(ReloadedModDir)"
+          Condition="Exists('$(ReloadedModDir)')"
+          ContinueOnError="WarnAndContinue" />
+    <Message Importance="high"
+             Text="Deployed $(TargetFileName) -&gt; $(ReloadedModDir)"
+             Condition="Exists('$(ReloadedModDir)')" />
+  </Target>
+
 </Project>
