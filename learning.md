@@ -4213,3 +4213,73 @@ Result:
 - Message 2+: LLM text (cache hit, instant inline write)
 
 This is the correct beta architecture. The LLM "looks ahead" one message, which is imperceptible in normal play.
+
+---
+
+## Chapter 58: Writing the Pool, Not the Pointer
+
+### What the memcpy log ruled out
+
+Chapter 57's inline interception assumed dialogue text flows through the hooked
+`memcpy`. The log disproved it. Every capture with `sp>=2` looked like this:
+
+```
+[MemcpyText] src=0x134C6E8F0 dst=0x418F0BFE00 n=192 sp=3: "·S·D(5·D········$··D···D·······"
+```
+
+Those `·D` pairs are the high bytes of `0x...44......` heap pointers — this is an
+array of pointer structs, not a sentence. The space characters that passed the
+`sp>=2` filter were coincidental `0x20` bytes inside binary fields.
+
+Conclusion: P5R's text renderer does not bulk-copy dialogue. It walks the BMD
+glyph-by-glyph, dereferencing directly. There is no copy to intercept.
+
+### The remaining lever: mutate the source
+
+If the renderer reads the BMD in place, then the BMD *is* the render buffer. We
+don't need to find the render target — we need to edit the source before it's read.
+
+### Two properties that make this safe
+
+**1. Write within the original length.** Each entry is null-terminated and the
+BMD's offset table stores absolute byte offsets to each entry. If we write a
+shorter string and re-terminate in place, every offset in that table still points
+where it did. Overrun the original length and we'd clobber the next entry's first
+bytes, desynchronizing the table.
+
+```csharp
+int wl = Math.Min(enc.Length, len - 1);   // len - 1 leaves room for the terminator
+System.Buffer.MemoryCopy(src, p + off, len, wl);
+p[off + wl] = 0;
+```
+
+**2. Capture slot lengths once, before the first write.** This is the subtle one.
+If we re-measured entry lengths on each write pass, the second pass would measure
+the *shortened* string we just wrote:
+
+```
+original:  "So what do you want to do today?"   len = 32
+write #1:  "Hey there."                          len becomes 10
+write #2:  measures 10, can only write 9 bytes
+write #3:  measures 9, can only write 8 bytes ...
+```
+
+The usable space ratchets down to nothing. `CapturePoolSlots` snapshots
+`(offset, length)` at discovery time and every later write measures against those
+originals.
+
+### PAGE_WRITECOPY and why the .bmd on disk is safe
+
+BMD files are memory-mapped `PAGE_READONLY`. `VirtualProtect(..., PAGE_WRITECOPY)`
+flips the page to copy-on-write: the first write triggers the OS to allocate a
+private physical page, copy the contents, and point our process's page table entry
+at the copy. Every subsequent read in this process sees our text; the file on disk
+and every other mapping of it are untouched. This is the same mechanism that backs
+`fork()` semantics and DLL relocation.
+
+### Known limitation
+
+Every dialogue-looking slot in the pool gets the same text, so a scene will repeat
+one line. That is intentional for now — it proves the write reaches the renderer.
+Targeting the single entry for the current `msgId` requires parsing the BMD offset
+table, which is the next step once we have visual confirmation.

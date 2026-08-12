@@ -77,6 +77,11 @@ public class Mod : IModV1
     // per session after bfBase is confirmed; written via VirtualProtect(PAGE_WRITECOPY).
     private nuint _bmdTextPool;
     private bool  _bmdScanDoneV2;
+    private int   _bmdScanAttempts;
+
+    // (offset, original length) of every dialogue-looking string in _bmdTextPool.
+    // Captured once at discovery, BEFORE any write — see CapturePoolSlots for why.
+    private (int Off, int Len)[]? _poolSlots;
 
     // Most recent LLM response. Written on the async LLM thread; read volatilely on the
     // game thread inside OnGameMemcpy so no lock is needed (reference read/write is
@@ -621,8 +626,11 @@ public class Mod : IModV1
     // first page with ≥5 such strings as _bmdTextPool.
     private unsafe void TryScanBmdVicinity()
     {
+        // Retry across ticks rather than one-shot: the BMD is mapped lazily and may not
+        // be resident the first time bfBase is confirmed. 20 ticks ≈ 10s at the default
+        // 500 ms interval, which comfortably covers the load.
         if (_bmdTextPool != 0 || _bmdScanDoneV2) return;
-        _bmdScanDoneV2 = true;
+        if (++_bmdScanAttempts >= 20) _bmdScanDoneV2 = true;
 
         nuint center = _confirmedBfBase != 0 ? _confirmedBfBase : _bfBufferBase;
         if (center == 0) return;
@@ -632,8 +640,11 @@ public class Mod : IModV1
         nuint start = center > window ? center - window : 0x1000;
         nuint end   = center + window;
 
+        nuint bfPage = center & ~(nuint)0xFFF; // page that contains bfBase — skip it
+
         for (nuint addr = start; addr < end; addr += (nuint)pageSize)
         {
+            if (addr == bfPage) continue;          // don't confuse BF script with BMD
             if (!MemoryGuard.IsReadable(addr, pageSize)) continue;
 
             // Skip first 0x100 bytes (possible binary header), scan the rest
@@ -662,10 +673,84 @@ public class Mod : IModV1
                 if (p[i] >= 0x20 && p[i] <= 0x7E) preview.Append((char)p[i]);
 
             _bmdTextPool = dataStart;
-            _modLog!.Info($"[BMD2] TextPool found at 0x{dataStart:X} (bfBase±512KB): \"{preview}\"");
+            _poolSlots   = CapturePoolSlots(dataStart, scanLen);
+            _modLog!.Info(
+                $"[BMD2] TextPool found at 0x{dataStart:X} slots={_poolSlots.Length} (bfBase±512KB): \"{preview}\"");
+
+            // If the LLM already answered while we were still hunting for the pool,
+            // apply that text right now rather than waiting for the next message.
+            string? pending = _lastLlmText;
+            if (pending != null) WritePoolStrings(pending);
             return;
         }
-        _modLog!.Info($"[BMD2] No text pool found in 0x{start:X}–0x{end:X}");
+        // Only report on the final attempt — otherwise this spams once per tick.
+        if (_bmdScanDoneV2)
+            _modLog!.Info($"[BMD2] No text pool found in 0x{start:X}–0x{end:X} after {_bmdScanAttempts} attempts");
+    }
+
+    // Records (offset, original length) for every dialogue-looking string in the pool.
+    // Captured once, before any write, so every later write measures against the
+    // ORIGINAL entry lengths. Without this, each pass would re-measure the shortened
+    // string it wrote last time and the usable space would ratchet down to nothing.
+    private static unsafe (int Off, int Len)[] CapturePoolSlots(nuint poolBase, int scanLen)
+    {
+        var slots = new System.Collections.Generic.List<(int, int)>();
+        byte* p = (byte*)poolBase;
+        int pos = 0;
+
+        while (pos < scanLen && slots.Count < 64)
+        {
+            int start = pos, printable = 0, spaces = 0;
+            while (pos < scanLen && p[pos] != 0)
+            {
+                byte c = p[pos++];
+                if (c >= 0x20 && c <= 0x7E) { printable++; if (c == ' ') spaces++; }
+            }
+            if (printable >= 10 && spaces >= 2) slots.Add((start, pos - start));
+            if (pos < scanLen) pos++; // skip null
+        }
+        return slots.ToArray();
+    }
+
+    // Overwrites every captured dialogue slot in the BMD text pool with <paramref name="text"/>.
+    // Writes at most (origLen - 1) bytes per slot and re-terminates in place, so entry
+    // boundaries — and therefore the BMD's internal offset table — stay valid; the renderer
+    // still finds each entry exactly where it expects, just with our characters in it.
+    // Mapped-file pages are PAGE_READONLY, so the page is first upgraded to PAGE_WRITECOPY:
+    // the OS hands back a private copy and the .bmd on disk is never modified.
+    private unsafe int WritePoolStrings(string text)
+    {
+        if (_bmdTextPool == 0 || _poolSlots is null || _poolSlots.Length == 0) return 0;
+
+        const int  pageSize       = 0x1000;
+        const uint PAGE_WRITECOPY = 0x08;
+        nuint pageBase = _bmdTextPool - 0x100;
+
+        if (!MemoryGuard.IsWritable(_bmdTextPool, 16) &&
+            !MemoryGuard.VirtualProtect(pageBase, (nuint)pageSize, PAGE_WRITECOPY, out _))
+        {
+            _modLog!.Warn($"[BMD2] VirtualProtect WRITECOPY failed for page 0x{pageBase:X}");
+            return 0;
+        }
+
+        byte[] enc = System.Text.Encoding.ASCII.GetBytes(text);
+        byte*  p   = (byte*)_bmdTextPool;
+        int written = 0;
+
+        foreach ((int off, int len) in _poolSlots)
+        {
+            int wl = Math.Min(enc.Length, len - 1);
+            if (wl <= 0) continue;
+            fixed (byte* src = enc)
+                System.Buffer.MemoryCopy(src, p + off, len, wl);
+            p[off + wl] = 0;
+            written++;
+        }
+
+        _modLog!.Info(
+            $"[BMD2] Pool write: {written}/{_poolSlots.Length} slots at 0x{_bmdTextPool:X} " +
+            $"← \"{text[..Math.Min(text.Length, 60)]}\"");
+        return written;
     }
 
     private static unsafe int CountNullTermStrings(byte* buf, int maxBytes, int minPrintable)
@@ -1053,10 +1138,9 @@ public class Mod : IModV1
             // Cache immediately so OnGameMemcpy can use it on the next text copy.
             _lastLlmText = text;
             _modLog!.Info($"[LLM] msgId=0x{msgId:X}: \"{text[..Math.Min(text.Length, 100)]}\"");
-            bool wrote = TryWriteToBmd(msgId, text);
-            _modLog!.Info(wrote
-                ? $"[LLM] BMD write OK — msgId=0x{msgId:X}"
-                : "[LLM] BMD write SKIPPED (no BMD locked or msgId out of range).");
+            bool wrote      = TryWriteToBmd(msgId, text);
+            int  poolWrites = WritePoolStrings(text);
+            _modLog!.Info($"[LLM] msgId=0x{msgId:X} — ptrWrite={(wrote ? "OK" : "skip")} poolWrites={poolWrites}");
         }
         catch (Server.InferenceInFlightException)  { /* server busy, ignore */ }
         catch (OperationCanceledException)
@@ -1185,6 +1269,8 @@ public class Mod : IModV1
                     _currentMsgTextAddr  = 0;
                     _bmdTextPool         = 0;
                     _bmdScanDoneV2       = false;
+                    _bmdScanAttempts     = 0;
+                    _poolSlots           = null;
                     _lastLlmText         = null;
                     lock (_largeCopyLock) _largeCopyDsts.Clear();
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
