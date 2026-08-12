@@ -316,6 +316,7 @@ public class Mod : IModV1
     private nuint  _capturedSession; // session address when _currentMsgId was last confirmed
     private nuint  _confirmedBfBase; // real BF script base (session+0x18, memory-mapped <4 GB)
     private nuint  _bmdBase;         // BMD text table found by TryScanForBmd(); 0 until found
+    private bool   _bmdScanDone;     // true after the one-shot scan fires this session
 
     /// <summary>
     /// Runs every poll tick while in a session. Scans the first 1024 bytes of the
@@ -606,24 +607,26 @@ public class Mod : IModV1
 
     // ── BMD scanner ───────────────────────────────────────────────────────
 
-    // Scans ±32 MB around _confirmedBfBase for a committed, readable region
+    // Scans ±128 MB around _confirmedBfBase for a committed, readable region
     // that contains 10+ English dialogue sentences (the BMD string table).
-    // Sets _bmdBase on the first qualifying candidate and logs its strings.
+    // Fires once per session (_bmdScanDone gate in caller).
+    // Logs every region with ≥1 sentence for diagnostics if the threshold isn't met.
     private unsafe void TryScanForBmd()
     {
         nuint bfBase = _confirmedBfBase;
-        if (bfBase == 0 || _bmdBase != 0) return;
+        if (bfBase == 0) return;
 
         const uint MEM_COMMIT    = 0x1000;
         const uint PAGE_NOACCESS = 0x01;
         const uint PAGE_GUARD    = 0x100;
-        const uint WindowBytes   = 32u * 1024u * 1024u; // 32 MB each direction
+        const uint WindowBytes   = 128u * 1024u * 1024u; // 128 MB each direction
 
         nuint scanStart = bfBase >= WindowBytes ? bfBase - WindowBytes : 0;
         nuint scanEnd   = bfBase + WindowBytes;
 
         _modLog!.Info($"[BMD] Scan start: bfBase=0x{bfBase:X} range=[0x{scanStart:X},0x{scanEnd:X}]");
 
+        int regionsChecked = 0;
         nuint probe = scanStart;
         while (probe < scanEnd)
         {
@@ -636,19 +639,31 @@ public class Mod : IModV1
                 (protect & PAGE_NOACCESS) == 0 &&
                 (protect & PAGE_GUARD) == 0 &&
                 regSize >= 1024 &&
-                regSize <= 32u * 1024u * 1024u)
+                regSize <= 64u * 1024u * 1024u)
             {
                 bool isBfPage = bfBase >= regBase && bfBase < regBase + regSize;
                 if (!isBfPage)
                 {
-                    int probeLen = (int)Math.Min(regSize, 8192u);
+                    // Probe 32 KB: BMD offset table can consume the first 4–8 KB.
+                    int probeLen = (int)Math.Min(regSize, 32768u);
                     if (MemoryGuard.IsReadable(regBase, probeLen))
                     {
                         int sentences = CountDialogueSentences(regBase, probeLen);
+                        regionsChecked++;
+
+                        // Log any region with even one qualifying sentence (diagnostic).
+                        if (sentences >= 1)
+                        {
+                            byte* p4 = (byte*)regBase;
+                            _modLog!.Info(
+                                $"[BMD] Region 0x{regBase:X} sz=0x{regSize:X} prot=0x{protect:X}" +
+                                $" s={sentences} [{p4[0]:X2} {p4[1]:X2} {p4[2]:X2} {p4[3]:X2}]");
+                        }
+
                         if (sentences >= 10)
                         {
                             _bmdBase = regBase;
-                            _modLog!.Info($"[BMD] Candidate: 0x{regBase:X} size=0x{regSize:X} sentences={sentences}");
+                            _modLog!.Info($"[BMD] Candidate locked: 0x{regBase:X} sentences={sentences}");
                             TryLogBmdStrings();
                             return;
                         }
@@ -660,7 +675,7 @@ public class Mod : IModV1
             probe = next;
         }
 
-        _modLog!.Info("[BMD] Scan complete — no qualifying region in ±32 MB window.");
+        _modLog!.Info($"[BMD] Scan done — {regionsChecked} text regions, none hit ≥10 sentences.");
     }
 
     private static unsafe int CountDialogueSentences(nuint regionBase, int scanBytes)
@@ -818,6 +833,7 @@ public class Mod : IModV1
                     _capturedSession = 0;
                     _confirmedBfBase = 0;
                     _bmdBase         = 0;
+                    _bmdScanDone     = false;
                     lock (_largeCopyLock) _largeCopyDsts.Clear();
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
                 }
@@ -860,10 +876,12 @@ public class Mod : IModV1
             // BF line probe: read current dialogue text from bfBase+pc on every tick.
             ProbeBfLine(session);
 
-            // Once the BF base is confirmed, scan ±32 MB for the BMD string table.
-            // Only fires until _bmdBase is found (one-shot per session).
-            if (_confirmedBfBase != 0 && _bmdBase == 0)
+            // One-shot BMD scan per session — fires once after first msgId confirmation.
+            if (_confirmedBfBase != 0 && _bmdBase == 0 && !_bmdScanDone)
+            {
+                _bmdScanDone = true;
                 TryScanForBmd();
+            }
         }
     }
 
