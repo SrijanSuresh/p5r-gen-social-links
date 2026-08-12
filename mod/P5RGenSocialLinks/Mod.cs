@@ -97,6 +97,13 @@ public class Mod : IModV1
     // one-shot guard applies only to the MSG1 item tables.
     private bool _poolIsHeap;
 
+    // Every high-scoring heap region, not just the winner. Ranking by content picked a
+    // shader block first and, once fixed, still would not have found the live scene: the
+    // confirmed address 0x41DD7F6389 fell outside every region the scan surfaced. Writing
+    // to all strong candidates removes the need to guess correctly on the first try.
+    private readonly System.Collections.Generic.List<(nuint Base, int Len, (int Off, int Len)[] Slots)>
+        _heapPools = new();
+
     // UTF-16 hunt state. _utf16CpyLogged caps the memcpy log; the sweep cursor lets a
     // multi-GB heap scan resume across ticks instead of stalling one.
     private int   _utf16CpyLogged;
@@ -1230,9 +1237,12 @@ public class Mod : IModV1
     private unsafe void TryFindHeapDialoguePool()
     {
         const uint MEM_COMMIT = 0x1000, PAGE_NOACCESS = 0x01, PAGE_GUARD = 0x100;
-        const int  maxScan     = 0x100000;        // 1 MB sampled per region
+        // 8 MB per region, not 256 KB. Sampling only a region's start is what hid the live
+        // dialogue: the confirmed address 0x41DD7F6389 sits ~12 MB past the base of the
+        // nearest region the scan reported, so it was never read.
+        const int  maxScan     = 0x800000;
         const int  maxRegions  = 4096;
-        const long totalBudget = 192L * 1024 * 1024;
+        const long totalBudget = 512L * 1024 * 1024;
 
         var ranked = new System.Collections.Generic.List<(int Score, nuint Base, int Len, string Sample)>();
         nuint addr = GameHeapStart;
@@ -1251,7 +1261,7 @@ public class Mod : IModV1
                           && (protect & PAGE_NOACCESS) == 0
                           && (protect & PAGE_GUARD) == 0;
 
-            if (usable && regionSize >= 0x1000 && regionSize <= 0x1000000)
+            if (usable && regionSize >= 0x1000 && regionSize <= 0x4000000)
             {
                 int len = (int)Math.Min((ulong)regionSize, (ulong)maxScan);
                 if (MemoryGuard.IsReadable(regionBase, len))
@@ -1278,18 +1288,63 @@ public class Mod : IModV1
         if (ranked.Count == 0) return;
         ranked.Sort((a, b) => b.Score.CompareTo(a.Score));
 
-        for (int i = 0; i < Math.Min(5, ranked.Count); i++)
-            _modLog!.Info($"[POOL] cand#{i} 0x{ranked[i].Base:X} score={ranked[i].Score}: \"{ranked[i].Sample}\"");
+        // Take the top 8 rather than the single winner. The confirmed live address was in
+        // none of the regions a top-1 pick would have chosen, and one wrong guess costs a
+        // whole play session to discover.
+        int take = Math.Min(8, ranked.Count);
+        _heapPools.Clear();
 
-        var pick = ranked[0];
-        _bmdTextPool = pick.Base;
-        _bmdPoolLen  = pick.Len;
-        _poolIsHeap  = true;
-        _poolSlots   = CapturePoolSlots(pick.Base, pick.Len);
-        _modLog!.Info($"[POOL] SELECTED 0x{pick.Base:X} len={pick.Len} score={pick.Score} slots={_poolSlots.Length}");
+        for (int i = 0; i < take; i++)
+        {
+            var c = ranked[i];
+            var slots = CapturePoolSlots(c.Base, c.Len);
+            if (slots.Length == 0) continue;
+            _heapPools.Add((c.Base, c.Len, slots));
+            _modLog!.Info(
+                $"[POOL] #{i} 0x{c.Base:X} len={c.Len} score={c.Score} slots={slots.Length}: \"{c.Sample}\"");
+        }
+
+        if (_heapPools.Count == 0) return;
+        _poolIsHeap = true;
+        _modLog!.Info($"[POOL] {_heapPools.Count} regions armed for write");
 
         string? pending = _lastLlmText;
-        if (pending != null) WritePoolStrings(pending);
+        if (pending != null) WriteAllHeapPools(pending);
+    }
+
+    /// <summary>
+    /// Writes <paramref name="text"/> into every armed heap region. Same in-place rules as
+    /// the single-pool writer: never exceed a slot's original run length, and pad with
+    /// spaces rather than a NUL so the surrounding function codes stay intact.
+    /// </summary>
+    private unsafe int WriteAllHeapPools(string text)
+    {
+        if (_heapPools.Count == 0) return 0;
+
+        byte[] enc = System.Text.Encoding.ASCII.GetBytes(text);
+        int totalSlots = 0, regions = 0;
+
+        foreach (var (poolBase, poolLen, slots) in _heapPools)
+        {
+            if (!MemoryGuard.IsWritable(poolBase, 16)) continue;
+
+            byte* p = (byte*)poolBase;
+            int wrote = 0;
+            foreach ((int off, int len) in slots)
+            {
+                int wl = Math.Min(enc.Length, len);
+                if (wl <= 0) continue;
+                fixed (byte* src = enc)
+                    System.Buffer.MemoryCopy(src, p + off, len, wl);
+                for (int i = wl; i < len; i++) p[off + i] = (byte)' ';
+                wrote++;
+            }
+            if (wrote > 0) { totalSlots += wrote; regions++; }
+        }
+
+        _modLog!.Info($"[POOL] wrote {totalSlots} slots across {regions} regions ← " +
+                      $"\"{text[..Math.Min(text.Length, 50)]}\"");
+        return totalSlots;
     }
 
     private static bool IsVowel(byte c) =>
@@ -1846,7 +1901,9 @@ public class Mod : IModV1
             _modLog!.Info($"[LLM] msgId=0x{msgId:X}: \"{text[..Math.Min(text.Length, 100)]}\"");
             bool wrote      = TryWriteToBmd(msgId, text);
             int  poolWrites = WritePoolStrings(text);
-            _modLog!.Info($"[LLM] msgId=0x{msgId:X} — ptrWrite={(wrote ? "OK" : "skip")} poolWrites={poolWrites}");
+            int  heapWrites = WriteAllHeapPools(text);
+            _modLog!.Info($"[LLM] msgId=0x{msgId:X} — ptrWrite={(wrote ? "OK" : "skip")} " +
+                          $"poolWrites={poolWrites} heapWrites={heapWrites}");
         }
         catch (Server.InferenceInFlightException)  { /* server busy, ignore */ }
         catch (OperationCanceledException)
@@ -1980,6 +2037,7 @@ public class Mod : IModV1
                     _bmdPoolLen          = 0x1000;
                     _poolWriteDone       = false;
                     _poolIsHeap          = false;
+                    _heapPools.Clear();
                     _utf16CpyLogged      = 0;
                     _heapSweepCursor     = 0;
                     _utf16SweepHits      = 0;
@@ -2043,7 +2101,7 @@ public class Mod : IModV1
             // Primary target: the heap dialogue pool. The mapped-file scans below reach
             // only the global item/skill tables — the live conversation is on the heap,
             // as ASCII, confirmed at 0x41DD7F6389 / 0x42102CAAA9.
-            if (_currentMsgId != 0 && _bmdTextPool == 0)
+            if (_currentMsgId != 0 && _heapPools.Count == 0)
                 TryFindHeapDialoguePool();
 
             // Diagnostic sweeps, off by default now that the pool location is known.
