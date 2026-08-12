@@ -609,93 +609,117 @@ public class Mod : IModV1
 
     // Scans the entire lower-4GB mapped-file region for a committed, readable
     // region containing ≥5 English dialogue sentences (the BMD string table).
-    // P5R BF (FlowScript Binary) header layout (little-endian, version 3):
-    //   0x00: int32  field00 (= 0)
-    //   0x04: uint8  compressionFlag
-    //   0x05: uint8  userId
-    //   0x06: int16  version
-    //   0x08: int32  fileSize
-    //   0x0C: int32  magic ("FLW\0" = 0x00574C46, or "FLF\0" = 0x00464C46)
-    //   0x10: int16  sectionCount
-    //   0x12: int16  localIntCount
-    //   0x14: int16  localFloatCount
-    //   0x16: int16  padding
-    //   0x18: SectionHeader[sectionCount]
+    // Three-strategy BMD discovery:
     //
-    // SectionHeader (16 bytes each):
-    //   0x00: int32  firstElementOffset  (byte offset from BF buffer start to section data)
-    //   0x04: int32  elementSize         (bytes per element)
-    //   0x08: int32  elementCount        (number of elements)
-    //   0x0C: int32  reserved (= 0)
+    // Strategy 1 — Session struct pointer scan:
+    //   Walk session+0x00..0xF8 in 8-byte steps. For each uint64 that looks like a
+    //   readable pointer, check its first 4 bytes for [0D 00 ?? ??] with 5 ≤ count ≤ 3000.
+    //   The game stores a BMD reference somewhere in its BF runtime context.
     //
-    // Section index → type (fixed order):
-    //   0 = ProcedureLabelTable  (elementSize = 0x20)
-    //   1 = JumpLabelTable       (elementSize = 0x04)
-    //   2 = Text (bytecode)      (elementSize = 0x04)
-    //   3 = MessageScript (BMD)  (elementSize = 0x01, raw bytes)
-    //   4 = StringTable          (elementSize = 0x01, null-terminated strings)
+    // Strategy 2 — Backward scan for BF file magic:
+    //   bfBase = session+0x18 = start of the in-memory TEXT section (instruction buffer).
+    //   The full BF file was memory-mapped before this; the file header with magic
+    //   "FLW\0" (0x00574C46 LE) lives at fileBase+0x0C. Scanning backward from bfBase
+    //   through the same VirtualQuery region finds the file header, after which we can
+    //   parse the section table to get section[3] = MessageScript (BMD).
     //
-    // The BMD is section index 3. Its data starts at bfBase + sections[3].firstElementOffset.
-    // Fires once per session (_bmdScanDone gate in caller).
+    // Strategy 3 — Forward region scan fallback:
+    //   Scan the VirtualQuery region that contains bfBase for any [0D 00] with
+    //   reasonable msgCount. Catches cases where the BMD is beyond, not before, bfBase.
     private unsafe void TryScanForBmd()
     {
-        nuint bfBase = _confirmedBfBase;
+        nuint bfBase  = _confirmedBfBase;
+        nuint session = _capturedSession;
         if (bfBase == 0) return;
 
-        if (!MemoryGuard.IsReadable(bfBase, 0x20))
+        // ── Strategy 1: session struct pointer scan ──────────────────────────
+        _modLog!.Info($"[BMD] S1: scanning session=0x{session:X} for BMD pointer");
+        if (session != 0 && MemoryGuard.IsReadable(session, 0x100))
         {
-            _modLog!.Warn($"[BMD] bfBase=0x{bfBase:X} not readable — cannot parse BF header");
-            return;
-        }
-
-        byte* bf = (byte*)bfBase;
-
-        // Dump first 64 bytes so we can verify the BF format in the log.
-        var hexSb = new System.Text.StringBuilder("[BF] Header hex: ");
-        for (int di = 0; di < 64; di++)
-        {
-            if (!MemoryGuard.IsReadable(bfBase + (nuint)di, 1)) { hexSb.Append("??"); break; }
-            if (di > 0 && di % 16 == 0) hexSb.Append(" | ");
-            hexSb.Append($"{bf[di]:X2} ");
-        }
-        _modLog!.Info(hexSb.ToString());
-
-        // Read magic (at +0x0C) and section count (at +0x10).
-        uint magic        = (uint)(bf[0x0C] | bf[0x0D]<<8 | bf[0x0E]<<16 | bf[0x0F]<<24);
-        short sectionCount = (short)(bf[0x10] | bf[0x11]<<8);
-        _modLog!.Info($"[BF] magic=0x{magic:X8} sections={sectionCount}");
-
-        // Dump all section headers (each 16 bytes, starting at bfBase+0x18).
-        for (int s = 0; s < sectionCount && s < 8; s++)
-        {
-            nuint secAddr = bfBase + 0x18u + (nuint)(s * 16);
-            if (!MemoryGuard.IsReadable(secAddr, 16)) break;
-            byte* sh = (byte*)secAddr;
-            int  firstOff  = sh[0] | sh[1]<<8 | sh[2]<<16 | sh[3]<<24;
-            int  elemSize  = sh[4] | sh[5]<<8 | sh[6]<<16 | sh[7]<<24;
-            int  elemCount = sh[8] | sh[9]<<8 | sh[10]<<16 | sh[11]<<24;
-            _modLog!.Info($"[BF] Section[{s}] off=0x{firstOff:X} elemSz={elemSize} count={elemCount}");
-
-            // Section 3 = MessageScript (BMD). ElementSize must be 1 (raw bytes).
-            if (s == 3 && elemSize == 1 && elemCount > 0)
+            for (int off = 0; off < 0x100; off += 8)
             {
-                nuint bmdAddr = bfBase + (nuint)(uint)firstOff;
-                if (!MemoryGuard.IsReadable(bmdAddr, 8))
-                {
-                    _modLog!.Warn($"[BMD] Section[3] addr=0x{bmdAddr:X} not readable");
-                    continue;
-                }
-                byte* bmdHdr = (byte*)bmdAddr;
-                _modLog!.Info($"[BMD] Section[3] at 0x{bmdAddr:X} size={elemCount} " +
-                              $"hdr=[{bmdHdr[0]:X2} {bmdHdr[1]:X2} {bmdHdr[2]:X2} {bmdHdr[3]:X2}]");
-                _bmdBase = bmdAddr;
+                nuint candidate = *(nuint*)((byte*)session + off);
+                // Plausible pointer range: above 0x1000, fits in 4 or 8 GB
+                if (candidate < 0x1000UL || candidate > 0x0000_FFFF_FFFF_0000UL) continue;
+                if (!MemoryGuard.IsReadable(candidate, 8)) continue;
+                byte* h = (byte*)candidate;
+                if (h[0] != 0x0D || h[1] != 0x00) continue;
+                ushort cnt = (ushort)(h[2] | h[3] << 8);
+                if (cnt < 5 || cnt > 3000) continue;
+                _modLog!.Info($"[BMD] S1 hit sess+0x{off:X3}→0x{candidate:X} count={cnt} " +
+                              $"[{h[0]:X2} {h[1]:X2} {h[2]:X2} {h[3]:X2}]");
+                _bmdBase = candidate;
                 TryLogBmdStrings();
+                return;
+            }
+            _modLog!.Info("[BMD] S1: no BMD pointer in session struct");
+        }
+
+        // ── Strategy 2: backward scan for BF file magic ──────────────────────
+        _modLog!.Info($"[BMD] S2: backward scan from bfBase=0x{bfBase:X} for FLW magic");
+        var (qok, regBase, regSize, _, _) = MemoryGuard.QueryRegion(bfBase);
+        if (qok && bfBase > regBase)
+        {
+            int maxBack = (int)Math.Min((ulong)(bfBase - regBase), 8u * 1024 * 1024);
+            for (int back = 4; back < maxBack; back += 4)
+            {
+                nuint addr = bfBase - (nuint)back;
+                if (!MemoryGuard.IsReadable(addr, 4)) continue;
+                uint val = *(uint*)addr;
+                // FLW\0 = 0x00574C46, FLF\0 = 0x00464C46, FLB\0 = 0x00424C46
+                if (val != 0x00574C46u && val != 0x00464C46u && val != 0x00424C46u) continue;
+
+                // Magic is at fileBase+0x0C
+                nuint fileBase = addr - 0x0Cu;
+                if (!MemoryGuard.IsReadable(fileBase, 0x20)) continue;
+                short secCount = *(short*)(fileBase + 0x10u);
+                if (secCount < 1 || secCount > 10) continue;
+                _modLog!.Info($"[BF] S2 magic=0x{val:X8} at 0x{addr:X} → fileBase=0x{fileBase:X} sections={secCount}");
+
+                for (int s = 0; s < secCount && s < 8; s++)
+                {
+                    nuint shAddr = fileBase + 0x18u + (nuint)(s * 16);
+                    if (!MemoryGuard.IsReadable(shAddr, 16)) break;
+                    byte* sh       = (byte*)shAddr;
+                    int firstOff   = sh[0]|sh[1]<<8|sh[2]<<16|sh[3]<<24;
+                    int elemSize   = sh[4]|sh[5]<<8|sh[6]<<16|sh[7]<<24;
+                    int elemCount  = sh[8]|sh[9]<<8|sh[10]<<16|sh[11]<<24;
+                    _modLog!.Info($"[BF] S2 Section[{s}] off=0x{firstOff:X} elemSz={elemSize} count={elemCount}");
+                    if (s == 3 && elemSize == 1 && elemCount > 0)
+                    {
+                        nuint bmdAddr = fileBase + (nuint)(uint)firstOff;
+                        if (!MemoryGuard.IsReadable(bmdAddr, 4)) continue;
+                        byte* bh = (byte*)bmdAddr;
+                        _modLog!.Info($"[BMD] S2 found at 0x{bmdAddr:X} hdr=[{bh[0]:X2} {bh[1]:X2} {bh[2]:X2} {bh[3]:X2}]");
+                        _bmdBase = bmdAddr;
+                        TryLogBmdStrings();
+                        return;
+                    }
+                }
+            }
+            _modLog!.Info("[BMD] S2: FLW magic not found");
+        }
+
+        // ── Strategy 3: forward scan of bfBase region for [0D 00] ────────────
+        _modLog!.Info("[BMD] S3: scanning region for [0D 00] magic");
+        if (qok && regSize > 0)
+        {
+            nuint scanLimit = Math.Min(regSize, 8u * 1024 * 1024);
+            for (nuint off = 0; off < scanLimit; off += 4)
+            {
+                nuint probe = regBase + off;
+                if (!MemoryGuard.IsReadable(probe, 4)) continue;
+                byte* hdr = (byte*)probe;
+                if (hdr[0] != 0x0D || hdr[1] != 0x00) continue;
+                ushort cnt = (ushort)(hdr[2] | hdr[3] << 8);
+                if (cnt < 5 || cnt > 3000) continue;
+                _modLog!.Info($"[BMD] S3 hit 0x{probe:X} count={cnt}");
+                _bmdBase = probe;
+                TryLogBmdStrings();
+                return;
             }
         }
-
-        if (_bmdBase == 0)
-            _modLog!.Warn("[BMD] MessageScript section not found in BF header — " +
-                          "check [BF] Section[] lines above to diagnose");
+        _modLog!.Warn("[BMD] All 3 strategies exhausted — no BMD found");
     }
 
     private static unsafe int CountPrintableRuns(nuint regionBase, int scanBytes)

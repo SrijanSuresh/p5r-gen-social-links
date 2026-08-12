@@ -3898,6 +3898,40 @@ private unsafe void TryScanForBmd()
 
 Once `_bmdBase` is set correctly, `TryWriteToBmd` can read the actual offset table and write LLM text to the right message slot.
 
+---
+
+## Chapter 52 — bfBase Points to the Instruction Buffer, Not the File Header
+
+### What the BF hex dump revealed
+
+Dumping 64 bytes at `bfBase=0x620F4FF8` showed a repeating 16-byte pattern:
+```
+08 00 02 04 33 00 C3 02 00 00 00 00 00 00 00 00
+08 00 02 05 3C 00 C3 02 00 00 00 00 00 00 00 00
+```
+
+This is NOT a BF file header — it's the **in-memory instruction buffer**. Each 16-byte record is one expanded BF instruction: [opcode][type][value][metadata][padding]. The game's BF runtime expands compact 4-byte file instructions to 16-byte in-memory structs for faster dispatch.
+
+`session+0x18` = bfBase = **start of the TEXT section** (instruction buffer), NOT the BF file start. So our section-walk code was parsing instruction data as section headers, producing garbage (magic=0x00000000, counts like 100 million).
+
+### Three-strategy discovery
+
+Since we can't use bfBase as a file header, we use three approaches in order:
+
+**Strategy 1 — Session struct scan**: The BF runtime likely stores a pointer to the BMD somewhere in the session struct (the object that holds all dialogue state). We walk session+0x00..0xF8 in 8-byte steps, and for each value that's a readable pointer, check the first 4 bytes for `[0D 00]` with a sane message count.
+
+**Strategy 2 — Backward FLW magic scan**: The BF file was memory-mapped as a contiguous block. The instruction buffer (`bfBase`) is the Text section inside that file. Scanning backward from `bfBase` through the same VirtualQuery region for `FLW\0` (magic=0x00574C46) at offset +0x0C finds the file base. From there, the standard 16-byte section table at fileBase+0x18 gives us section[3] = BMD.
+
+**Strategy 3 — Region forward scan**: Fallback — scan the entire VirtualQuery region containing bfBase for any `[0D 00]` pattern with 5 ≤ msgCount ≤ 3000.
+
+### Lesson: verify pointer provenance before parsing
+
+`session+0x18` is documented as "BF script base", but the BF system distinguishes between:
+- The FILE base (where the file mapping starts, contains the header)
+- The TEXT base (where the instruction bytecode lives, = what `session+0x18` holds)
+
+Always verify what a pointer actually points to by dumping a few bytes before assuming it's the start of a structured format.
+
 ### The problem: offset table location is unknown
 
 We have a binary blob (`_bmdBase`, 0x11000 bytes). We know the first string of actual message text sits at `bmdBase+0x0120`. But reading `bmdBase+8+msgId×4` as a flat `uint32[]` offset table returns `0x3F3F3F3F` — four `3F` bytes, which is just the ASCII `?` character repeated. That region is not an offset table; it's literal content.
