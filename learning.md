@@ -4057,3 +4057,51 @@ Any pointer ≥ 0x4000000000 is heap-allocated dialogue data. We can dereference
 | Later messages (warm path) | ~50ms (reuses existing buffer) | 0–1s after PC change | Hit |
 
 The poll-loop retry collapses this distinction: both paths converge to "populated within 2–3 ticks," which is well inside the LLM's inference window.
+
+---
+
+## Chapter 54: C++ Polymorphic Session Types and Adaptive Pointer Scanning
+
+### The Problem: Fixed Offsets Break Across Subclasses
+
+P5R's dialogue session is a C++ object. Like most game engine objects, it uses inheritance — the base class stores common fields (BF script base, PC, confidant data), and subclasses add dialogue-specific fields at higher offsets. The problem: **two runs of the same scene can land on different subclasses**.
+
+Why? Because the game reuses a pool of session objects. The previous run left a "full" session (which had +0xD0 populated) at address 0x424D8E1190. This run got a "lite" session at 0x4250321640 that ends or has a null pointer at +0xD0. Same scene, different C++ type from the pool.
+
+The `SessPointers` output shows this clearly — the current run has no pointer-shaped value at +0xD0, but does have a stable external heap pointer at +0x90.
+
+### The Fix: Adaptive Scan Instead of Fixed Offset
+
+Instead of hardcoding `session+0xD0`, we scan ALL pointer-sized slots in the readable portion of the session struct and test each external heap pointer as a potential descriptor:
+
+```
+For each offset in [0x00, 0xC8) step 8:
+    ptr = session[offset]
+    if ptr is external heap (≥ 0x4000000000) and not self-referential:
+        candidate = FollowTextObjChain(ptr)
+        if candidate != 0: return it
+```
+
+`FollowTextObjChain` applies the known 3-hop pattern:
+```
+descriptor → descriptor+0x18 → textObj → *(textObj) → charPtr
+```
+
+Only returns non-zero if every link is non-null, readable, and the final charPtr is in heap range. This is safe — a false positive (accidentally valid chain) is checked at write time by `IsWritable`.
+
+### Why the Scan Is Safe
+
+The scan doesn't write anything — it only reads. If a random pointer accidentally passes all three chain checks, the worst case is a spurious `[MSG] TextAddr recovered` log. The write gate (`IsWritable`) prevents actual corruption. And in practice, pointer chains with 4 valid heap dereferences are very rare by accident.
+
+### Boundary-Scan Logging
+
+We also add a targeted dump of session[0xB8..0xE0] — one 8-byte slot at a time, checking each independently — to show exactly which offsets are readable and what values they hold. This lets us see the exact VirtualQuery boundary and understand WHY +0xD0 fails even when +0xC0 passes.
+
+```
+[MSG] sess+0xB8: R 0x42503215A0
+[MSG] sess+0xC0: R 0x0000000000000000
+[MSG] sess+0xC8: F                     ← boundary here
+[MSG] sess+0xD0: F
+```
+
+If +0xC8 is the first unreadable slot, the struct is exactly 0xC8 bytes. If +0xD0 is unreadable but +0xC8 is readable-but-null, the struct exists but hasn't been populated yet at that offset.

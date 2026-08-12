@@ -160,22 +160,47 @@ public class Mod : IModV1
         return result;
     }
 
-    // Follows the full pointer chain to the actual character buffer:
-    //   session+0xD0 → descriptor → descriptor+0x18 → textObj → *(textObj) → char data
-    // textObj is a string-wrapper struct whose first 8 bytes are the char* pointer.
-    // Returns 0 if any link in the chain is null or unreadable.
-    private static unsafe nuint TryReadTextAddr(nuint session)
+    // Applies the 3-hop chain: descriptor → descriptor+0x18 → textObj → *(textObj) → charPtr.
+    // Returns 0 if any link is null, unreadable, or below HeapLow.
+    private static unsafe nuint FollowTextObjChain(nuint descriptor)
     {
-        if (!MemoryGuard.IsReadable(session + 0xD0, 8)) return 0;
-        nuint descriptor = *(nuint*)((byte*)session + 0xD0);
-        if (descriptor == 0) return 0;
         if (!MemoryGuard.IsReadable(descriptor + 0x18, 8)) return 0;
         nuint textObj = *(nuint*)(descriptor + 0x18);
-        if (textObj == 0) return 0;
-        // textObj[0] is the actual char* — the string-wrapper stores its data pointer first.
-        if (!MemoryGuard.IsReadable(textObj, 8)) return 0;
+        if (textObj == 0 || !MemoryGuard.IsReadable(textObj, 8)) return 0;
         nuint charPtr = *(nuint*)textObj;
-        return charPtr;
+        return charPtr >= HeapLow ? charPtr : 0;
+    }
+
+    // Finds the actual character buffer by scanning the readable part of the session struct
+    // for external heap pointers and probing each as a potential descriptor. Tries session+0xD0
+    // first (the known primary path), then scans [0x00..0xC8) for fallback candidates.
+    // This handles C++ session subclasses that store the descriptor at different offsets.
+    private static unsafe nuint TryReadTextAddr(nuint session)
+    {
+        // Primary: session+0xD0 (works when C++ subclass includes the dialogue fields)
+        if (MemoryGuard.IsReadable(session + 0xD0, 8))
+        {
+            nuint d = *(nuint*)((byte*)session + 0xD0);
+            if (d != 0)
+            {
+                nuint cp = FollowTextObjChain(d);
+                if (cp != 0) return cp;
+            }
+        }
+
+        // Fallback: scan session[0x00..0xC8) for external, non-self-referential heap ptrs.
+        const int scanLen = 0xC8;
+        if (!MemoryGuard.IsReadable(session, scanLen)) return 0;
+        byte* sp = (byte*)session;
+        for (int off = 0; off + 8 <= scanLen; off += 8)
+        {
+            nuint ptr = *(nuint*)(sp + off);
+            if (ptr < HeapLow) continue;
+            if (ptr >= session && ptr < session + 0x1000) continue; // self-referential
+            nuint cp = FollowTextObjChain(ptr);
+            if (cp != 0) return cp;
+        }
+        return 0;
     }
 
     private static unsafe string TryReadString(nuint addr)
@@ -647,20 +672,37 @@ public class Mod : IModV1
                 }
                 else
                 {
-                    // session+0xD0 not yet populated (first message, cold path).
-                    // Dump heap-pointer-shaped values in the readable part of the session
-                    // struct so we can locate the descriptor via exploration.
+                    // textAddr=0: dump readable/unreadable status for offsets around the
+                    // known boundary (+0xB8..+0xE0) to pinpoint the struct end,
+                    // plus all external heap pointers in [0x00..0xC8) for fallback probing.
                     unsafe
                     {
-                        int dumpLen = 0xC8; // up to the unreadable boundary
-                        if (MemoryGuard.IsReadable(session, dumpLen))
+                        // Boundary scan: individual IsReadable per slot
+                        var bndSb = new System.Text.StringBuilder("[MSG] BndScan: ");
+                        for (int di = 0xB8; di <= 0xE0; di += 8)
+                        {
+                            nuint addr = session + (nuint)di;
+                            if (MemoryGuard.IsReadable(addr, 8))
+                            {
+                                nuint val = *(nuint*)(byte*)addr;
+                                bndSb.Append($"+0x{di:X2}=0x{val:X} ");
+                            }
+                            else
+                            {
+                                bndSb.Append($"+0x{di:X2}=NR ");
+                            }
+                        }
+                        _modLog!.Info(bndSb.ToString());
+
+                        // Heap pointer scan: shows fallback descriptor candidates
+                        if (MemoryGuard.IsReadable(session, 0xC8))
                         {
                             byte* sp = (byte*)session;
-                            var ptrSb = new System.Text.StringBuilder("[MSG] SessPointers: ");
-                            for (int di = 0; di + 8 <= dumpLen; di += 8)
+                            var ptrSb = new System.Text.StringBuilder("[MSG] SessHeapPtrs: ");
+                            for (int di = 0; di + 8 <= 0xC8; di += 8)
                             {
                                 nuint val = *(nuint*)(sp + di);
-                                if (val >= HeapLow)
+                                if (val >= HeapLow && !(val >= session && val < session + 0x1000))
                                     ptrSb.Append($"+0x{di:X2}→0x{val:X} ");
                             }
                             _modLog!.Info(ptrSb.ToString());
