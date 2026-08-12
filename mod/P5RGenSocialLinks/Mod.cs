@@ -292,52 +292,12 @@ public class Mod : IModV1
             }
         }
 
-        // Small-copy text detection: catches heap-to-heap AND mapped-file→anywhere.
-        // Requires ≥2 spaces (English sentences) — filters out binary/shader data that
-        // coincidentally contains vowel-valued bytes.
-        if (count < 10 || count > 200) return;
-        if (!Memory.MemoryGuard.IsReadable(dst, (int)count)) return;
-
-        byte* d = (byte*)dst;
-        int spaces = 0, printable = 0;
-        for (nuint i = 0; i < count; i++)
-        {
-            byte b = d[i];
-            if (b >= 0x20 && b <= 0x7E) { printable++; if (b == ' ') spaces++; }
-        }
-        if (spaces < 2 || printable < 8) return;
-
-        // ── Synchronous inline write ─────────────────────────────────────────
-        // If src is from a mapped-file page (BMD lives below 4 GB) and we're inside
-        // a confirmed dialogue beat, overwrite dst with the cached LLM text right now.
-        // The game renderer reads dst AFTER this hook returns — the swap is invisible.
-        if (_currentMsgId != 0 && src < unchecked((nuint)0x100000000UL) && src >= (nuint)0x10000UL)
-        {
-            string? cached = _lastLlmText;
-            if (cached != null && Memory.MemoryGuard.IsWritable(dst, (int)count))
-            {
-                byte[] enc = System.Text.Encoding.ASCII.GetBytes(cached);
-                int wl = Math.Min(enc.Length, (int)count - 1);
-                if (wl > 0)
-                {
-                    fixed (byte* csrc = enc)
-                        System.Buffer.MemoryCopy(csrc, d, (long)count, wl);
-                    d[wl] = 0;
-                    _modLog!.Info(
-                        $"[BMD] InlineWrite dst=0x{dst:X} src=0x{src:X} n={count} wrote={wl}: " +
-                        $"\"{cached[..Math.Min(cached.Length, 60)]}\"");
-                    return;
-                }
-            }
-        }
-
-        // ── Diagnostic log (fires when inline write did not apply) ───────────
-        var text = new System.Text.StringBuilder(200);
-        for (nuint i = 0; i < count && text.Length < 200; i++)
-            text.Append(d[i] >= 0x20 && d[i] <= 0x7E ? (char)d[i] : '·');
-
-        _modLog!.Info(
-            $"[MemcpyText] src=0x{src:X} dst=0x{dst:X} n={count} sp={spaces}: \"{text}\"");
+        // No small-copy text inspection here. The [MemcpyText] probe established that
+        // dialogue never flows through this function — every capture that passed an
+        // "English text" filter turned out to be an array of heap pointers whose 0x20
+        // bytes happened to look like spaces. The renderer walks the BMD in place, so
+        // the write target is the pool itself (see WritePoolStrings). Scanning bytes on
+        // every memcpy the game makes was pure overhead in a very hot path.
     }
 
     private void TryActivateHook()
@@ -921,8 +881,10 @@ public class Mod : IModV1
                         }
                         _modLog!.Info(ptrSb.ToString());
 
-                        // Dump first 48 bytes of each external heap target — shows structure layout.
-                        for (int di = 0; di < 0x100; di += 8)
+                        // Dump first 48 bytes of each external heap target — shows structure
+                        // layout. Gated: this emits a line per pointer and the session-chain
+                        // approach it was built for is no longer the primary strategy.
+                        for (int di = 0; _cfg.StructDiffEnabled && di < 0x100; di += 8)
                         {
                             nuint slotAddr = session + (nuint)di;
                             if (!MemoryGuard.IsReadable(slotAddr, 8)) continue;
