@@ -4355,3 +4355,78 @@ resident in memory. Reading the declared length would fault, so the length is
 resolved down in page steps until it is actually readable, and the scan uses that.
 Declared sizes are a claim about the format; `VirtualQuery` is the truth about
 this process.
+
+---
+
+## Chapter 60: The Encoding Was the Blind Spot
+
+### What 21 valid message files actually told us
+
+The MSG1 scan worked perfectly and every file scored well:
+
+```
+msgs=696  score=1188: "ARestores 20 HP to one ally. | AA new drug develop"
+msgs=1050 score=856:  "ALight Fire dmg to | one foe. Chance of"
+msgs=464  score=2081: "AThe greatest angel | legend. He is known"
+```
+
+Weapons, clothes, healing items, skills, Persona lore. Every one of the 21 files
+is a *global data table*. None is scene dialogue. The entry dump made it explicit:
+
+```
+[MSG1] entry[709] kind=0 offset=0xCBE4
+[MSG1] fileBase+off: "ABLANK·····skill_268···"
+```
+
+Message 709 is named `skill_268`. The `msgId` extracted from the BF instruction
+window indexes skills in that file, not conversation lines. Selecting the file by
+`msgCount > msgId` was therefore selecting on a coincidence — any table with
+enough rows would have matched.
+
+### The line that reframed everything
+
+The session's message object dumped this:
+
+```
+52 00 4F 00 52 00 00 00     ->  "R\0O\0R\0"
+```
+
+That is UTF-16LE. Every scanner written for this project so far — `LooksLikeText`,
+`ProbeForBfContent`, `IsEnglishSentence`, `CountEnglishSentences` — reads one byte
+per character. Against UTF-16 they do not merely score badly, they are
+*structurally incapable* of producing a hit:
+
+```
+UTF-16 "Hello":  48 00 65 00 6C 00 6C 00 6F 00
+ASCII run walk:  ^^ run ends here (0x00 is not printable)
+```
+
+Every run is exactly one character long, so `len < 12` rejects all of them. A
+UTF-16 dialogue buffer would look like empty space to all of this code. The text
+may have been sitting in a scanned region the whole time.
+
+The general lesson: when a detector finds nothing anywhere, suspect the
+representation before tuning the thresholds. Thresholds produce weak signals;
+a wrong representation produces exactly zero, which is what we kept seeing.
+
+### Reusing the test across encodings
+
+Rather than write the ratio test twice, decode first and share one predicate:
+
+```csharp
+IsEnglishString(string s)   // the ratio test, encoding-agnostic
+IsEnglishSentence(byte*, n) // ASCII: bytes are already characters
+FindUtf16English(...)       // decode even bytes, then IsEnglishString
+```
+
+The UTF-16 scan keys on the pattern "printable in even byte, 0x00 in odd byte",
+accumulates the run, then hands the decoded string to the same predicate.
+
+### session+0xC8 is the real handle
+
+Also new this run: `session+0xC8 = 0x41D6D21780`, a live heap object with a vtable
+at +0x00, and `session+0xD0 = 0x175E` — far too small for a pointer, so an offset
+or index. That object is the game's own handle on the displayed message, populated
+exactly while a message is on screen. Following it beats guessing at pool
+addresses, which is what `ProbeMessageObject` now does — dumping every heap pointer
+it holds and testing each target as both ASCII and UTF-16.

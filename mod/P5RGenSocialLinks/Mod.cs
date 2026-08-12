@@ -720,9 +720,14 @@ public class Mod : IModV1
 
                     int score = CountEnglishSentences((byte*)hdr, usableLen);
                     hits.Add((hdr, fileSize, msgCount, score));
-                    _modLog!.Info(
-                        $"[MSG1] 0x{hdr:X} size={fileSize} msgs={msgCount} score={score} " +
-                        $"{(hdr >= center ? "after" : "before")}bf: \"{PreviewSentences(hdr, usableLen, 80)}\"");
+
+                    // Only list files that could actually hold the live index — the full
+                    // 21-file listing is noise now that these are known to be the global
+                    // item/skill tables rather than scene dialogue.
+                    if (_cfg.StructDiffEnabled || _currentMsgId == 0 || msgCount > _currentMsgId)
+                        _modLog!.Info(
+                            $"[MSG1] 0x{hdr:X} size={fileSize} msgs={msgCount} score={score} " +
+                            $"{(hdr >= center ? "after" : "before")}bf: \"{PreviewSentences(hdr, usableLen, 80)}\"");
                 }
             }
             addr = regionEnd;
@@ -818,6 +823,126 @@ public class Mod : IModV1
         int len = 0;
         while (len + page <= want && MemoryGuard.IsReadable(addr, len + page)) len += page;
         return len;
+    }
+
+    /// <summary>
+    /// Same ratio test as <see cref="IsEnglishSentence"/> but over a decoded string, so
+    /// UTF-16 runs can reuse it without duplicating the pointer walk.
+    /// </summary>
+    private static bool IsEnglishString(string s)
+    {
+        if (s.Length < 10 || s.Length > 400) return false;
+        int letters = 0, lower = 0, vowels = 0, digits = 0, spaces = 0, other = 0;
+        foreach (char ch in s)
+        {
+            if (ch >= 'a' && ch <= 'z')      { letters++; lower++; if (IsVowel((byte)ch)) vowels++; }
+            else if (ch >= 'A' && ch <= 'Z') { letters++; if (IsVowel((byte)(ch | 0x20))) vowels++; }
+            else if (ch == ' ')              spaces++;
+            else if (ch >= '0' && ch <= '9') digits++;
+            else if (ch == '.' || ch == ',' || ch == '!' || ch == '?' || ch == '\'' ||
+                     ch == '"' || ch == '-' || ch == ':' || ch == ';') { }
+            else other++;
+        }
+        if (spaces < 1)                       return false;
+        if (letters * 100 < s.Length * 55)    return false;
+        if (lower   * 100 < letters * 40)     return false;
+        if (vowels  * 100 < letters * 25)     return false;
+        if (vowels  * 100 > letters * 60)     return false;
+        if (digits  * 100 > s.Length * 10)    return false;
+        if (other   * 100 > s.Length * 5)     return false;
+        return true;
+    }
+
+    /// <summary>
+    /// Finds UTF-16LE English runs — printable ASCII in even bytes, 0x00 in odd bytes.
+    /// The session's message object holds "52 00 4F 00 52 00" (UTF-16 "ROR"), so the
+    /// live dialogue is very likely wide-char. Every scanner before this was single-byte
+    /// and would step over UTF-16 text without ever seeing a candidate: the interleaved
+    /// nulls break each run after one character.
+    /// </summary>
+    private static unsafe System.Collections.Generic.List<(nuint Addr, string Text)>
+        FindUtf16English(nuint region, int byteLen, int maxHits)
+    {
+        var hits = new System.Collections.Generic.List<(nuint, string)>();
+        byte* p = (byte*)region;
+        int i = 0;
+
+        while (i + 1 < byteLen && hits.Count < maxHits)
+        {
+            if (!(IsPrintable(p[i]) && p[i + 1] == 0)) { i++; continue; }
+
+            int begin = i;
+            var sb = new System.Text.StringBuilder(64);
+            while (i + 1 < byteLen && IsPrintable(p[i]) && p[i + 1] == 0 && sb.Length < 400)
+            {
+                sb.Append((char)p[i]);
+                i += 2;
+            }
+            string s = sb.ToString();
+            if (IsEnglishString(s)) hits.Add((region + (nuint)begin, s));
+        }
+        return hits;
+    }
+
+    private static unsafe string AsciiPreview(nuint addr, int maxChars)
+    {
+        if (!MemoryGuard.IsReadable(addr, maxChars)) return "";
+        byte* p = (byte*)addr;
+        int begin = 0;
+        while (begin < maxChars && !IsPrintable(p[begin])) begin++;
+        int end = begin;
+        while (end < maxChars && IsPrintable(p[end])) end++;
+        if (end - begin < 8) return "";
+        var sb = new System.Text.StringBuilder(end - begin);
+        for (int i = begin; i < end; i++) sb.Append((char)p[i]);
+        return IsEnglishString(sb.ToString()) ? sb.ToString() : "";
+    }
+
+    /// <summary>
+    /// Follows the message object at session+0xC8 — populated exactly while a message is
+    /// on screen — dumping every heap pointer it holds and testing each target for both
+    /// ASCII and UTF-16 text, then sweeping the heap around the object itself for UTF-16
+    /// dialogue. This replaces guessing at pool addresses: the object is the game's own
+    /// handle on the live message.
+    /// </summary>
+    private unsafe void ProbeMessageObject(nuint session)
+    {
+        if (!MemoryGuard.IsReadable(session + 0xC8, 8)) return;
+        nuint obj = *(nuint*)(session + 0xC8);
+        if (obj < HeapLow || obj > UserAddrMax) return;
+        if (!MemoryGuard.IsReadable(obj, 0x100)) return;
+
+        byte* o = (byte*)obj;
+        for (int off = 0; off + 8 <= 0x100; off += 8)
+        {
+            nuint val = *(nuint*)(o + off);
+            if (val < HeapLow || val > UserAddrMax) continue;
+            if (!MemoryGuard.IsReadable(val, 256)) continue;
+
+            string ascii = AsciiPreview(val, 96);
+            var wide = FindUtf16English(val, 256, 2);
+            if (ascii.Length == 0 && wide.Count == 0) continue;
+
+            _modLog!.Info($"[OBJ] +0x{off:X2}→0x{val:X} ascii=\"{ascii}\" " +
+                          $"utf16=\"{(wide.Count > 0 ? wide[0].Text : "")}\"");
+        }
+
+        // Sweep ±64 KB around the object for UTF-16 English, page by page so an
+        // unmapped page in the middle does not abort the whole sweep.
+        const int win = 0x10000, page = 0x1000;
+        nuint from = obj > (nuint)win ? obj - win : obj;
+        int reported = 0;
+        for (nuint a = from; a < obj + win && reported < 8; a += page)
+        {
+            if (!MemoryGuard.IsReadable(a, page)) continue;
+            foreach (var (addr, text) in FindUtf16English(a, page, 4))
+            {
+                _modLog!.Info($"[UTF16] 0x{addr:X}: \"{text}\"");
+                if (++reported >= 8) break;
+            }
+        }
+        if (reported == 0)
+            _modLog!.Info($"[UTF16] none within ±64KB of msgObj 0x{obj:X}");
     }
 
     private static bool IsVowel(byte c) =>
@@ -1135,6 +1260,10 @@ public class Mod : IModV1
                                 ptrSb.Append($"+0x{di:X2}→0x{val:X} ");
                         }
                         _modLog!.Info(ptrSb.ToString());
+
+                        // session+0xC8 is the live message object — follow it and sweep
+                        // for UTF-16, which every earlier scanner was blind to.
+                        ProbeMessageObject(session);
 
                         // Dump first 48 bytes of each external heap target — shows structure
                         // layout. Gated: this emits a line per pointer and the session-chain
