@@ -3503,3 +3503,72 @@ The confirmed BF buffer (`0x4178E79D48`) and the session struct are in different
 heap arenas — the session struct has NO reachable pointer to the BF buffer within
 any scan window. The copy-log approach bypasses this completely: it records the BF
 buffer address directly at the moment it's written, without needing a pointer chain.
+
+
+---
+
+## Chapter 44 — Reading the BF Script: base pointer, PC, and extracting a msg_id
+
+### The two offsets that matter
+
+We confirmed two fields in the social-link session struct:
+
+| Offset | Width | Meaning |
+|--------|-------|---------|
+| `+0x18` | 8 bytes (pointer) | Base address of the compiled BF script in memory |
+| `+0x20` | 4 bytes (uint32) | PC — byte offset from that base to the *current* instruction |
+
+`bfBase = *(nuint*)(session + 0x18)` is **constant** for the entire hang-out; it is the load address of the `.bf` scene file.  
+`pc = *(uint*)(session + 0x20)` is written by `mov [rbx+20], eax` (confirmed by CE hardware write-trap) and advances with every BF opcode dispatch.
+
+Reading `bfBase + pc` gives us the raw bytes of the instruction the interpreter paused at **after each dialogue box advance**.
+
+### Why `bfBase` appears "below the heap"
+
+Our earlier `HeapLow` filter (`> 0x4000000000`) silently rejected `bfBase` because the BF file is mapped into a non-heap region (~`0x700D7038` range).  Removing the HeapLow guard and accepting any non-zero value was the fix.
+
+### The 32-byte instruction window
+
+Each pause captures a 32-byte snapshot starting at `bfBase + pc`.  
+Empirical data from a Ryuji gym hang-out (msgId = 0x0348 = 840):
+
+```
+pc=0x109: 00 00 00 00 00 00 00 09 00 01 03 05 01 [48 03] 00 ...
+pc=0x139: 00 00 00 00 00 00 00 09 00 01 06 05 01 [48 03] 00 ...
+pc=0x16A: 00 00 00 00 00 00 09 00 01 09 05 01    [48 03] 00 ...
+pc=0x2D9: 00 00 00 00 00 00 00 0A 00 01 03 5B 00 [48 03] 00 ...
+```
+
+`48 03` in little-endian = **0x0348 = 840** — the BMD message index for this scene.  
+The varying bytes (`03`, `06`, `09`) are the sub-line index within the same message.
+
+### The msg_id extraction heuristic
+
+Scanning the 32-byte window for the **last** little-endian uint16 in the range `[0x0200, 0x07FF]` robustly identifies the msg_id:
+
+- Sub-line indices (`03`, `06`, `09` read as `0x0003`, `0x0006`, `0x0009`) are below 0x0200 — filtered out.
+- Opcode bytes (`09`, `0A`, `05`) interpreted as LE pairs (`0x0009`, `0x000A`, `0x0005`) are also below 0x0200 — filtered out.
+- The actual msg_id (`0x0348`, `0x02D6`, `0x02C5`) is always in the 0x0200–0x07FF band.
+
+Taking the **last** occurrence in the 32-byte window avoids the varying sub-line bytes that appear *before* the stable msg_id.
+
+**Confirmation threshold = 3 consecutive windows** with the same value.  This eliminates false positives (values that appear in 1–2 instruction windows but are not real msg_ids).
+
+### The full scene break-down (Ryuji gym, rank-1)
+
+| PC range     | Confirmed msg_id | Interpretation |
+|---|---|---|
+| 0x109–0x16A  | 0x0348 = 840   | Ryuji's gym invite speech (3 sub-lines) |
+| 0x1C1–0x21E  | 0x02D6 = 726   | Follow-up / response segment (4 sub-lines) |
+| 0x360–0x3BE  | 0x02C5 = 709   | Third dialogue segment |
+
+### What comes next: BMD lookup and write-back
+
+The BMD file (Binary Message Data) is the static string table that maps msg_id → null-terminated dialogue text.  The game computes `bmd_base + offset_table[msg_id]` — it never stores a raw string pointer, which is why CE write-breakpoints on the text address found nothing.
+
+To inject LLM text we must:
+1. Find `bmd_base` in memory (the loaded BMD file).
+2. Read `offset_table[msg_id]` to get the string offset.
+3. Write LLM text in-place at `bmd_base + offset`.
+
+**Short-term beta path**: The social-link description text is written *inline* in the session struct at `session+0x9B0` and is readable/writable.  Writing LLM text there lets us display generated content in the hang-out UI while the full BMD injection is wired up.

@@ -309,7 +309,11 @@ public class Mod : IModV1
     // ── Poll loop — session lifecycle + text pool discovery ───────────────
 
     private readonly StructDiffScanner _diffScanner = new();
-    private uint _lastBfPc;       // change-detection: fires only when PC moves (32-bit per mov [rbx+20],eax)
+    private uint   _lastBfPc;        // change-detection: fires only when PC moves (32-bit per mov [rbx+20],eax)
+    private ushort _msgIdCandidate;  // current candidate from the last BF instruction window
+    private int    _msgIdStreak;     // consecutive windows with the same candidate
+    private ushort _currentMsgId;    // last confirmed msg_id (3+ consecutive windows)
+    private nuint  _capturedSession; // session address when _currentMsgId was last confirmed
 
     /// <summary>
     /// Runs every poll tick while in a session. Scans the first 1024 bytes of the
@@ -523,10 +527,13 @@ public class Mod : IModV1
     }
 
     /// <summary>
-    /// Fires on every BF PC change. Reads the live opcode struct at session+0x18
-    /// (a pointer advanced 0x10 bytes per instruction, confirmed via CE write trace).
-    /// Logs bytes + tries to read text pointers at struct offsets +0x08 and +0x10
-    /// to identify which field carries the dialogue string pointer.
+    /// Fires on every BF PC change. Reads 32 bytes at bfBase+pc (session+0x18 base,
+    /// session+0x20 offset). Extracts msg_id by taking the last LE uint16 in
+    /// [0x0200, 0x07FF] — sub-line indices and opcodes are smaller, unrelated code
+    /// values are larger. Requires 3 consecutive windows with the same value before
+    /// confirming, eliminating one-off code values as false positives.
+    /// When a new msg_id is confirmed, dispatches an LLM request and writes the
+    /// response to session+0x9B0 (social-link description slot, confirmed writable).
     /// </summary>
     private unsafe void ProbeBfLine(nuint session)
     {
@@ -535,19 +542,120 @@ public class Mod : IModV1
         if (pc == _lastBfPc) return;
         _lastBfPc = pc;
 
-        // session+0x18 = BF script base pointer (constant, below HeapLow — not heap).
-        // session+0x20 = PC: byte offset into the BF script from that base.
         nuint bfBase = *(nuint*)((byte*)session + 0x18);
         if (bfBase == 0) return;
 
         nuint instrAddr = bfBase + pc;
-        if (!Memory.MemoryGuard.IsReadable(instrAddr, 16)) return;
+        const int readLen = 32;
+        if (!Memory.MemoryGuard.IsReadable(instrAddr, readLen)) return;
 
         byte* b = (byte*)instrAddr;
-        var hex = new System.Text.StringBuilder(48);
-        for (int i = 0; i < 16; i++) hex.Append($"{b[i]:X2} ");
 
-        _modLog!.Info($"[BFInstr] pc=0x{pc:X} @0x{instrAddr:X}: {hex}");
+        // Verbose raw-bytes dump — gated so it doesn't spam the log by default.
+        if (_cfg.StructDiffEnabled)
+        {
+            var hex = new System.Text.StringBuilder(96);
+            for (int i = 0; i < readLen; i++) hex.Append($"{b[i]:X2} ");
+            _modLog!.Info($"[BFInstr] pc=0x{pc:X}: {hex}");
+        }
+
+        // Scan for msg_id: take the LAST LE uint16 in [0x0200, 0x07FF].
+        // Sub-line indices (3,6,9 → 0x0003-0x0009) and opcodes (0x09, 0x0A → <0x0200)
+        // are below the band; large code constants are above it.
+        ushort best = 0;
+        for (int i = 0; i + 1 < readLen; i++)
+        {
+            ushort v = (ushort)(b[i] | (b[i + 1] << 8));
+            if (v >= 0x0200 && v <= 0x07FF) best = v;
+        }
+
+        // Require 3 consecutive windows with the same value before confirming.
+        if (best == 0)
+        {
+            _msgIdStreak = 0;
+        }
+        else if (best == _msgIdCandidate)
+        {
+            _msgIdStreak++;
+            if (_msgIdStreak == 3 && best != _currentMsgId)
+            {
+                _currentMsgId    = best;
+                _capturedSession = session;
+                _modLog!.Info($"[MSG] pc=0x{pc:X} msgId=0x{best:X} ({best}) bfBase=0x{bfBase:X}");
+
+                // Fire-and-forget LLM call; write result to session+0x9B0 on response.
+                // Cannot await inside unsafe — call the async method and discard the Task.
+                SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
+                if (snap is not null)
+                {
+                    nuint  capturedSess = session;
+                    ushort capturedId   = best;
+                    _ = DispatchMsgLlmAsync(snap, capturedId, capturedSess);
+                }
+            }
+        }
+        else
+        {
+            _msgIdCandidate = best;
+            _msgIdStreak    = 1;
+        }
+    }
+
+    private async System.Threading.Tasks.Task DispatchMsgLlmAsync(
+        SocialLinkSnapshot snap, ushort msgId, nuint session)
+    {
+        using var cts = new System.Threading.CancellationTokenSource(
+            TimeSpan.FromSeconds(_cfg.TimeoutSeconds));
+        try
+        {
+            string ctx = Memory.ContextBuilder.Build(snap) + $" [msg_0x{msgId:X}]";
+            var req = new Server.GenerateRequest
+            {
+                ConfidantId   = snap.ConfidantId,
+                Rank          = snap.RankLevel,
+                Context       = ctx,
+                CharacterName = Memory.ConfidantNames.Resolve(snap.ConfidantId),
+            };
+
+            string text = await _llmClient!.GenerateAsync(req, cts.Token);
+            if (string.IsNullOrWhiteSpace(text)) return;
+
+            _modLog!.Info($"[LLM] msgId=0x{msgId:X}: \"{text[..Math.Min(text.Length, 100)]}\"");
+            bool wrote = TryWriteToSessionDesc(session, text);
+            _modLog!.Info(wrote
+                ? $"[LLM] Wrote {text.Length} chars to session+0x9B0."
+                : "[LLM] Write-back SKIPPED (session gone or slot too small).");
+        }
+        catch (Server.InferenceInFlightException)  { /* server busy, ignore */ }
+        catch (OperationCanceledException)
+        {
+            _modLog!.Warn("[LLM] Timeout — keeping original dialogue.");
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            _modLog!.Warn($"[LLM] Error: {ex.Message}");
+        }
+    }
+
+    private static unsafe bool TryWriteToSessionDesc(nuint session, string text)
+    {
+        nuint addr = session + 0x9B0;
+        if (!Memory.MemoryGuard.IsReadable(addr, 4)) return false;
+
+        byte* cur = (byte*)addr;
+        // Measure existing string length — must not exceed it to avoid overwriting adjacent data.
+        int origLen = 0;
+        while (origLen < 200 && cur[origLen] != 0) origLen++;
+        if (origLen < 4) return false;  // empty/binary slot
+
+        if (!Memory.MemoryGuard.IsWritable(addr, origLen + 1)) return false;
+
+        byte[] encoded = System.Text.Encoding.UTF8.GetBytes(text);
+        int writeLen   = Math.Min(encoded.Length, origLen);
+        fixed (byte* src = encoded)
+            System.Buffer.MemoryCopy(src, cur, origLen, writeLen);
+        cur[writeLen] = 0;
+        return true;
     }
 
     private void StartPollLoop()
@@ -569,9 +677,13 @@ public class Mod : IModV1
                 {
                     _diffScanner.Reset();
                     _bridge!.ResetSession();
-                    _lastBfPc     = 0;
-                    _bfBufferBase = 0;
-                    _bfBufferOff  = 0;
+                    _lastBfPc        = 0;
+                    _bfBufferBase    = 0;
+                    _bfBufferOff     = 0;
+                    _currentMsgId    = 0;
+                    _msgIdCandidate  = 0;
+                    _msgIdStreak     = 0;
+                    _capturedSession = 0;
                     lock (_largeCopyLock) _largeCopyDsts.Clear();
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
                 }
