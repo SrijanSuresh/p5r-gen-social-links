@@ -649,17 +649,18 @@ public class Mod : IModV1
                     int probeLen = (int)Math.Min(regSize, 131072u);
                     if (MemoryGuard.IsReadable(regBase, probeLen))
                     {
+                        // BMD files always start with version=13 as LE uint16 → [0D 00].
+                        // This eliminates Windows DLLs, PE images, and other read-only mappings.
+                        byte* hdr = (byte*)regBase;
+                        if (hdr[0] != 0x0D || hdr[1] != 0x00) goto nextRegion;
+
                         int runs = CountPrintableRuns(regBase, probeLen);
                         regionsChecked++;
 
-                        // Log any region with even one qualifying run (diagnostic).
-                        if (runs >= 1)
-                        {
-                            byte* p4 = (byte*)regBase;
-                            _modLog!.Info(
-                                $"[BMD] Region 0x{regBase:X} sz=0x{regSize:X} prot=0x{protect:X}" +
-                                $" r={runs} [{p4[0]:X2} {p4[1]:X2} {p4[2]:X2} {p4[3]:X2}]");
-                        }
+                        byte* p4 = (byte*)regBase;
+                        _modLog!.Info(
+                            $"[BMD] Region 0x{regBase:X} sz=0x{regSize:X} prot=0x{protect:X}" +
+                            $" r={runs} [{p4[0]:X2} {p4[1]:X2} {p4[2]:X2} {p4[3]:X2}]");
 
                         if (runs >= 5)
                         {
@@ -668,6 +669,7 @@ public class Mod : IModV1
                             TryLogBmdStrings();
                             return;
                         }
+                        nextRegion:;
                     }
                 }
             }
