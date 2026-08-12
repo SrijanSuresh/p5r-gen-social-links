@@ -16,9 +16,14 @@
   // How often (ms) the session-change poll loop runs.
   "poll_interval_ms": 500,
 
-  // Whether to log struct field diffs during hang-out (for offset discovery).
-  // Set to false once per-line trigger offsets are confirmed.
-  "struct_diff_enabled": true,
+  // Diagnostics for the offset-discovery era: struct field diffs, BF instruction dumps,
+  // the per-message session dumps (BndScan / D0Direct / SessHeapPtrs), and the mapped-file
+  // and UTF-16 heap sweeps.
+  //
+  // Keep false during play. The sweeps run every poll tick and scan tens of megabytes
+  // each, which is enough to stutter the game, and the dialogue pool write path does not
+  // depend on any of it. Turn on only when a pool stops being found.
+  "struct_diff_enabled": false,
 
   // Log every pointer chain step with address + dereferenced value.
   // Enable when TryResolve() fails and you need to find the broken link.
