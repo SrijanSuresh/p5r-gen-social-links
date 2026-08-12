@@ -119,6 +119,12 @@ public class Mod : IModV1
     // that sits around 0x4188xxxxxx.
     private static readonly nuint GameHeapStart = unchecked((nuint)0x4100000000UL);
 
+    // Upper bound for the scan. Without one the walk continued into 0x7FF... DLL space and
+    // scored the CLR's own resource strings ("Cannot create an abstract class."), which
+    // wasted the region budget and armed writes against runtime memory that cannot hold
+    // dialogue and must not be modified.
+    private static readonly nuint GameHeapEnd = unchecked((nuint)0x4400000000UL);
+
     // Pointers harvested from the per-message D0 array — swept before the linear scan,
     // since they point at objects the game is using for the message on screen right now.
     private readonly System.Collections.Generic.List<nuint> _sweepSeeds = new();
@@ -1305,7 +1311,7 @@ public class Mod : IModV1
         int   seen = 0;
         long  totalScanned = 0;
 
-        while (addr < UserAddrMax && seen < maxRegions && totalScanned < totalBudget)
+        while (addr < GameHeapEnd && seen < maxRegions && totalScanned < totalBudget)
         {
             var (ok, regionBase, regionSize, state, protect) = MemoryGuard.QueryRegion(addr);
             if (!ok || regionSize == 0) break;
@@ -1359,10 +1365,11 @@ public class Mod : IModV1
         if (ranked.Count == 0) return;
         ranked.Sort((a, b) => b.Score.CompareTo(a.Score));
 
-        // Take the top 8 rather than the single winner. The confirmed live address was in
-        // none of the regions a top-1 pick would have chosen, and one wrong guess costs a
-        // whole play session to discover.
-        int take = Math.Min(8, ranked.Count);
+        // Arm every scored region, not the top 8. The previous run scored 41 regions and
+        // wrote only 8 — the scene's own dialogue is plausibly ranked below that cutoff,
+        // found and then discarded before the write. Ranking has picked wrong at every
+        // threshold tried, so stop relying on it to be right.
+        int take = Math.Min(32, ranked.Count);
         _heapPools.Clear();
 
         for (int i = 0; i < take; i++)
@@ -1371,8 +1378,11 @@ public class Mod : IModV1
             var slots = CapturePoolSlotsSafe(c.Base, c.Len);
             if (slots.Length == 0) continue;
             _heapPools.Add((c.Base, c.Len, slots));
-            _modLog!.Info(
-                $"[POOL] #{i} 0x{c.Base:X} len={c.Len} score={c.Score} slots={slots.Length}: \"{c.Sample}\"");
+
+            // Only the strongest are worth listing; the rest are armed silently.
+            if (i < 12)
+                _modLog!.Info(
+                    $"[POOL] #{i} 0x{c.Base:X} len={c.Len} score={c.Score} slots={slots.Length}: \"{c.Sample}\"");
         }
 
         if (_heapPools.Count == 0) return;
