@@ -96,12 +96,27 @@ Switched backend from auto-gptq to llama-cpp-python. Wired real Llama-3.1-8B-Ins
 - CI: GitHub Actions runs Python tests + .NET build on every push
 
 ### 🔄 Phase 3 — Dialogue write-back *(in progress)*
-The LLM response currently logs to the Reloaded-II console. Write-back — making it appear on screen — requires locating the pointer from the session struct to the pre-loaded script text pool. Cheat Engine found the pool at `~0x41DE9104BA`; Ghidra analysis needed to find the stable pointer chain.
 
-**What we know so far:**
-- Script text pool is pre-loaded at hang-out start (all lines in one contiguous heap block)
-- Line counter at `0x006FFC28`, written by `mov [rcx+18],eax` in a system DLL
-- `DialogueWriter.cs` is stubbed and ready — needs `bufferPtr` from the pointer chain
+#### 🏆 Milestone: injected text rendered in-game
+
+Custom text written into the live dialogue buffer renders in Ryuji's speech bubble, drawn by the game's own renderer:
+
+> **Ryuji** — *"Here we are... LLM WAS HERE!!!"*
+
+This closes the central open question of the project. Everything downstream of locating the buffer is confirmed working: the memory is writable at runtime, the renderer reads it live, and injected text displays verbatim with correct font, styling, and speaker attribution.
+
+**What the hunt established:**
+
+| Finding | Detail |
+|---|---|
+| Encoding | **ASCII**, single-byte — not UTF-16 |
+| Location | **Heap** (`0x41DD7F6389`, `0x42102CAAA9`) — not the mapped BMD file region |
+| Buffers | Two hold the live line; both accept writes |
+| Delivery | Renderer reads the buffer **in place** — the text is never `memcpy`'d, so there is no copy to intercept |
+
+Both facts in the first two rows were needed together, and searching either dimension alone finds nothing. Automated scans covered ASCII in the mapped-file region and UTF-16 in the heap, and so missed the text repeatedly; the address was ultimately pinned by a Cheat Engine string scan against the line visible on screen. Chapters 53–60 of `learning.md` document each wrong assumption and how it was ruled out.
+
+**Remaining for the phase:** hook the instruction that writes the buffer, so the address is resolved from the game rather than searched for. The buffer address changes every launch, but the writer instruction sits at a fixed module offset — hooking it yields the destination pointer directly, with no scanning or session-struct dependency.
 
 ### ⏳ Phase 4 — Per-line contextual generation
 Use the `LineCounterMonitor` trigger and `SessionHistory` rolling buffer to generate dialogue that responds to the specific line the player just read — not just the hang-out metadata. Requires knowing which line index maps to which text entry in the script pool.
