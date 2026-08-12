@@ -99,6 +99,16 @@ public class Mod : IModV1
     private int   _utf16SweepHits;
     private bool  _heapSweepDone;
 
+    // Every game object pointer observed so far lands in 0x42xxxxxxxx, while the linear
+    // sweep starts at HeapLow (0x4000000000) and spends whole sessions crawling through
+    // DirectInput and font data around 0x4188xxxxxx without ever reaching game memory.
+    private static readonly nuint GameHeapStart = unchecked((nuint)0x4200000000UL);
+
+    // Pointers harvested from the per-message D0 array — swept before the linear scan,
+    // since they point at objects the game is using for the message on screen right now.
+    private readonly System.Collections.Generic.List<nuint> _sweepSeeds = new();
+    private readonly object _seedLock = new();
+
     // Most recent LLM response. Written on the async LLM thread; read volatilely on the
     // game thread inside OnGameMemcpy so no lock is needed (reference read/write is
     // atomic on x64, and we only need eventual visibility, not strict ordering).
@@ -989,8 +999,30 @@ public class Mod : IModV1
         const int  chunk     = 0x100000;          // 1 MB per read
         const uint MEM_COMMIT = 0x1000, PAGE_NOACCESS = 0x01, PAGE_GUARD = 0x100;
 
+        // Seeded sweeps first — ±2 MB around pointers the game is using for the message
+        // currently on screen is far better odds than anywhere the linear scan has reached.
+        nuint[] seeds;
+        lock (_seedLock) { seeds = _sweepSeeds.ToArray(); _sweepSeeds.Clear(); }
+
+        foreach (nuint seed in seeds)
+        {
+            if (_utf16SweepHits >= 40) return;
+            const int span = 0x200000;
+            nuint sFrom = seed > (nuint)span ? seed - span : seed;
+            for (nuint a = sFrom; a < seed + span; a += chunk)
+            {
+                if (!MemoryGuard.IsReadable(a, chunk)) continue;
+                foreach (var (addr2, t) in FindUtf16English(a, chunk, 64))
+                {
+                    if (IsSystemString(t)) continue;
+                    _modLog!.Info($"[SEEDUTF16] 0x{addr2:X}: \"{t}\"");
+                    if (++_utf16SweepHits >= 40) return;
+                }
+            }
+        }
+
         long  scanned = 0;
-        nuint addr    = _heapSweepCursor != 0 ? _heapSweepCursor : HeapLow;
+        nuint addr    = _heapSweepCursor != 0 ? _heapSweepCursor : GameHeapStart;
 
         while (scanned < budget)
         {
@@ -1067,6 +1099,11 @@ public class Mod : IModV1
             nuint p1 = *(nuint*)(arr + (nuint)i);
             if (p1 < 0x10000 || p1 > UserAddrMax)      continue;
             if (!MemoryGuard.IsReadable(p1, 256))      continue;
+
+            // Seed the sweep even when this slot holds no text itself: it points into the
+            // region the game is actively using for this message.
+            if (p1 >= HeapLow)
+                lock (_seedLock) { if (_sweepSeeds.Count < 32) _sweepSeeds.Add(p1); }
 
             if (ReportText($"+0x{i:X2}", p1)) { logged++; continue; }
 
