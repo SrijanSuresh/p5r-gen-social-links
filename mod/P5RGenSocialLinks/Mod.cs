@@ -1357,6 +1357,7 @@ public class Mod : IModV1
                 // directly: the game frees heap on its own threads and a raw walk over
                 // megabytes will eventually fault on memory that vanished mid-scan.
                 int    score  = 0;
+                int    matches = 0;
                 string sample = "";
                 int    read   = 0;
 
@@ -1373,10 +1374,21 @@ public class Mod : IModV1
                         if (s == 0) continue;
                         if (sample.Length == 0) sample = t;
                         score += s;
+                        matches++;
                     }
                 }
 
-                if (score >= 20) ranked.Add((score, regionBase, len, sample));
+                // Rank by average score per matched line, not the sum. A summed score is
+                // really a measure of size: a 2MB item-description table outscores a
+                // 400KB conversation pool on volume alone, which is how the region that
+                // actually renders ended up ranked #14. Per-line, casual speech (ends in
+                // punctuation, second-person, contractions) separates cleanly from
+                // "Restores 20 HP to one ally."
+                if (matches >= 30)
+                {
+                    int avg = score * 100 / matches;
+                    ranked.Add((avg, regionBase, len, sample));
+                }
                 totalScanned += read;
             }
             addr = regionEnd;
@@ -1405,10 +1417,13 @@ public class Mod : IModV1
             if (slots.Length == 0) continue;
             _heapPools.Add((c.Base, c.Len, slots));
 
-            // Only the strongest are worth listing; the rest are armed silently.
-            if (i < 12)
-                _modLog!.Info(
-                    $"[POOL] #{i} 0x{c.Base:X} len={c.Len} score={c.Score} slots={slots.Length}: \"{c.Sample}\"");
+            // Log every armed region, not just the leaders. The region that actually
+            // rendered was #14 — outside the previous 12-line cutoff, so the one entry
+            // that mattered was the one never printed. The properties of the winner are
+            // what a better ranking has to be derived from.
+            _modLog!.Info(
+                $"[POOL] #{i} 0x{c.Base:X} len={c.Len} avg={c.Score / 100.0:F2} " +
+                $"slots={slots.Length}: \"{c.Sample}\"");
         }
 
         if (_heapPools.Count == 0) return;
