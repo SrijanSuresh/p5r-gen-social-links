@@ -663,6 +663,17 @@ public class Mod : IModV1
                         {
                             _bmdBase = regBase;
                             _modLog!.Info($"[BMD] Locked: 0x{regBase:X} msgCount={msgCount}");
+
+                            // Dump first 64 bytes so we can read the exact header layout.
+                            var hexSb = new System.Text.StringBuilder("[BMD] Header hex: ");
+                            byte* dump = (byte*)regBase;
+                            for (int di = 0; di < 64; di++)
+                            {
+                                if (di > 0 && di % 16 == 0) hexSb.Append(" | ");
+                                hexSb.Append($"{dump[di]:X2} ");
+                            }
+                            _modLog!.Info(hexSb.ToString());
+
                             TryLogBmdStrings();
                             return;
                         }
@@ -829,7 +840,9 @@ public class Mod : IModV1
         uint nextOffset = msgId + 1 < msgCount ? offsets[msgId + 1] : (uint)0x11000;
         int  slotSize   = (int)(nextOffset - msgOffset);
 
-        _modLog!.Info($"[BMD] Write probe: msgId={msgId} off=0x{msgOffset:X} next=0x{nextOffset:X} slot={slotSize} addr=0x{msgAddr:X}");
+        // Dump the 8 raw bytes we actually read so we can verify the format.
+        byte* raw = (byte*)(offsets + msgId);
+        _modLog!.Info($"[BMD] Write probe: msgId={msgId} off=0x{msgOffset:X} next=0x{nextOffset:X} slot={slotSize} addr=0x{msgAddr:X} rawBytes=[{raw[0]:X2} {raw[1]:X2} {raw[2]:X2} {raw[3]:X2} | {raw[4]:X2} {raw[5]:X2} {raw[6]:X2} {raw[7]:X2}]");
 
         if (slotSize <= 1)
         {
