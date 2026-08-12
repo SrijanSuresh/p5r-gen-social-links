@@ -4000,3 +4000,60 @@ That tells us:
 
 We then update `TryWriteToBmd` to read offsets using those discovered constants, and the SKIPPED log lines turn into successful writes.
 6. The game's renderer re-reads from the same address next frame → shows new text
+
+---
+
+## Chapter 53: Deferred Pointer Capture — Why "Not Yet Populated" Isn't the Same as "Doesn't Exist"
+
+### The Bug in One Sentence
+
+Our hook fires when the BF interpreter *advances the PC*. The game's C++ dialogue system populates `session+0xD0` (the message descriptor pointer) slightly *later*, when the renderer actually constructs the speech bubble. These are two separate code paths, and ours runs first.
+
+### Why This Happens
+
+The BF virtual machine and the rendering layer are **decoupled**. The BF interpreter runs ahead — it steps through opcodes, encounters a "SHOW MESSAGE" instruction, calls into the C++ dialogue manager, and then *blocks waiting for player input*. But that blocking happens at the C++ level, not at the BF level. Our poll loop samples the BF PC while the C++ layer is still in the middle of its own setup.
+
+Timeline:
+```
+t=0ms   BF interpreter hits SHOW_MSG opcode at pc=0x8B1
+t=0ms   ProbeBfLine fires (PC changed), starts 3-streak countdown
+t+~1s   3rd streak confirms: ProbeBfLine reads session+0xD0 → ZERO (not yet set)
+t+1.5s  C++ dialogue manager allocates text buffer, writes ptr to session+0xD0
+t+5s    LLM inference completes — TryWriteToBmd runs
+```
+
+On warm subsequent messages, the C++ setup happens faster (memory already allocated and reused), so the 3-streak window (≈1s at 500ms poll) overlaps with a populated +0xD0. On the very first message of a session (cold path), the allocation happens after our confirmation window closes.
+
+### The Fix: Poll-Loop Lazy Retry
+
+Instead of treating the captured-at-confirmation value as final, treat it as a *best-effort snapshot*. The poll loop runs every 500ms for the entire session. If we have a confirmed `_currentMsgId` but `_currentMsgTextAddr` is still 0, we re-probe `session+0xD0` every tick until it fills in.
+
+```
+Every 500ms tick:
+  if _currentMsgId != 0 AND _currentMsgTextAddr == 0:
+      attempt TryReadTextAddr(_capturedSession)
+      if non-zero: store it, log "[MSG] TextAddr recovered"
+```
+
+By the time the LLM inference returns (3–30 seconds), the game has had 6–60 additional ticks to populate the field. The lazy write in `TryWriteToBmd` is a final safety net for the case where the recovery tick fires just before the LLM response arrives.
+
+### Session Struct Dumps: The Debugging Tool
+
+When `textAddr == 0` after confirmation, we dump all pointer-shaped values (≥ `HeapLow = 0x4000000000`) in the readable portion of the session struct. This shows which offsets ARE populated and point into the game's heap — letting us locate the descriptor via exploration rather than just trial-and-error at fixed offsets.
+
+```
+[MSG] SessPointers: +0x18→0x61B7F5F8  (skip: below HeapLow)
+[MSG] SessPointers: +0x40→0x420A8B3C10  ← candidate
+[MSG] SessPointers: +0x58→0x41DCE9A000  ← candidate
+```
+
+Any pointer ≥ 0x4000000000 is heap-allocated dialogue data. We can dereference each one and look for text or for the descriptor layout (zeros + two heap pointers at +0x18/+0x20).
+
+### Why First-Message vs. Later-Message Timing Differs
+
+| Condition | C++ dialogue setup time | Our 3-streak window | Result |
+|---|---|---|---|
+| First message (cold path) | ~1.5s (allocates heap buffer) | 0–1s after PC change | Miss |
+| Later messages (warm path) | ~50ms (reuses existing buffer) | 0–1s after PC change | Hit |
+
+The poll-loop retry collapses this distinction: both paths converge to "populated within 2–3 ticks," which is well inside the LLM's inference window.

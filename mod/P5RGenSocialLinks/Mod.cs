@@ -160,6 +160,18 @@ public class Mod : IModV1
         return result;
     }
 
+    // Follows the session+0xD0 → descriptor → descriptor+0x18 chain to the actual text address.
+    // Returns 0 if any link in the chain is null or unreadable.
+    private static unsafe nuint TryReadTextAddr(nuint session)
+    {
+        if (!MemoryGuard.IsReadable(session + 0xD0, 8)) return 0;
+        nuint descriptor = *(nuint*)((byte*)session + 0xD0);
+        if (descriptor == 0) return 0;
+        if (!MemoryGuard.IsReadable(descriptor + 0x18, 8)) return 0;
+        nuint textAddr = *(nuint*)(descriptor + 0x18);
+        return textAddr;
+    }
+
     private static unsafe string TryReadString(nuint addr)
     {
         if (addr < unchecked((nuint)0x1000000UL)) return "";
@@ -587,17 +599,17 @@ public class Mod : IModV1
                 _capturedSession = session;
                 if (_confirmedBfBase == 0) _confirmedBfBase = bfBase;
 
-                // session+0xD0 → a message descriptor struct (not raw text).
-                // The actual text pointer is embedded at descriptor+0x18.
-                // We capture that inner address so TryWriteToBmd writes to the real text.
-                unsafe
+                // session+0xD0 → descriptor struct → descriptor+0x18 → actual text bytes.
+                // TryReadTextAddr follows all three hops; returns 0 if any link is not yet set.
+                nuint capturedTextAddr = TryReadTextAddr(session);
+
+                if (capturedTextAddr != 0)
                 {
-                    if (MemoryGuard.IsReadable(session + 0xD0, 8))
+                    // Dump descriptor layout and text bytes to confirm encoding.
+                    unsafe
                     {
                         nuint descriptor = *(nuint*)((byte*)session + 0xD0);
-
-                        // Dump descriptor so we can verify its layout
-                        if (descriptor != 0 && MemoryGuard.IsReadable(descriptor, 64))
+                        if (MemoryGuard.IsReadable(descriptor, 64))
                         {
                             byte* db = (byte*)descriptor;
                             var dumpSb = new System.Text.StringBuilder("[MSG] Descriptor: ");
@@ -609,28 +621,42 @@ public class Mod : IModV1
                             _modLog!.Info(dumpSb.ToString());
                         }
 
-                        // Follow the text pointer at descriptor+0x18
-                        nuint textAddr = 0;
-                        if (descriptor != 0 && MemoryGuard.IsReadable(descriptor + 0x18, 8))
+                        if (MemoryGuard.IsReadable(capturedTextAddr, 64))
                         {
-                            textAddr = *(nuint*)(descriptor + 0x18);
-
-                            // Dump actual text bytes to confirm encoding
-                            if (textAddr != 0 && MemoryGuard.IsReadable(textAddr, 64))
+                            byte* tb = (byte*)capturedTextAddr;
+                            var txtSb = new System.Text.StringBuilder("[MSG] TextBytes: ");
+                            for (int di = 0; di < 64; di++)
                             {
-                                byte* tb = (byte*)textAddr;
-                                var txtSb = new System.Text.StringBuilder("[MSG] TextBytes: ");
-                                for (int di = 0; di < 64; di++)
-                                {
-                                    if (di > 0 && di % 16 == 0) txtSb.Append(" | ");
-                                    txtSb.Append($"{tb[di]:X2} ");
-                                }
-                                _modLog!.Info(txtSb.ToString());
+                                if (di > 0 && di % 16 == 0) txtSb.Append(" | ");
+                                txtSb.Append($"{tb[di]:X2} ");
                             }
+                            _modLog!.Info(txtSb.ToString());
                         }
-                        _currentMsgTextAddr = textAddr;
                     }
                 }
+                else
+                {
+                    // session+0xD0 not yet populated (first message, cold path).
+                    // Dump heap-pointer-shaped values in the readable part of the session
+                    // struct so we can locate the descriptor via exploration.
+                    unsafe
+                    {
+                        int dumpLen = 0xC8; // up to the unreadable boundary
+                        if (MemoryGuard.IsReadable(session, dumpLen))
+                        {
+                            byte* sp = (byte*)session;
+                            var ptrSb = new System.Text.StringBuilder("[MSG] SessPointers: ");
+                            for (int di = 0; di + 8 <= dumpLen; di += 8)
+                            {
+                                nuint val = *(nuint*)(sp + di);
+                                if (val >= HeapLow)
+                                    ptrSb.Append($"+0x{di:X2}→0x{val:X} ");
+                            }
+                            _modLog!.Info(ptrSb.ToString());
+                        }
+                    }
+                }
+                _currentMsgTextAddr = capturedTextAddr;
 
                 _modLog!.Info($"[MSG] pc=0x{pc:X} msgId=0x{best:X} ({best}) bfBase=0x{bfBase:X} textAddr=0x{_currentMsgTextAddr:X}");
 
@@ -873,6 +899,20 @@ public class Mod : IModV1
     private unsafe bool TryWriteToBmd(ushort msgId, string text)
     {
         nuint textAddr = _currentMsgTextAddr;
+
+        // Final-chance lazy recovery: if still 0, re-read the chain now.
+        // This catches the race where the LLM responds in the same tick that
+        // the poll loop's retry would have fired.
+        if (textAddr == 0 && _capturedSession != 0)
+        {
+            textAddr = TryReadTextAddr(_capturedSession);
+            if (textAddr != 0)
+            {
+                _currentMsgTextAddr = textAddr;
+                _modLog!.Info($"[BMD] TextAddr lazy-recovered in write path: 0x{textAddr:X}");
+            }
+        }
+
         if (textAddr == 0)
         {
             _modLog!.Warn("[BMD] Write: no textAddr captured yet");
@@ -971,6 +1011,19 @@ public class Mod : IModV1
 
             // BF line probe: read current dialogue text from bfBase+pc on every tick.
             ProbeBfLine(session);
+
+            // Lazy textAddr re-probe: session+0xD0 may not be populated at BF-PC detection
+            // time (cold first-message path). Retry every tick until the C++ dialogue
+            // system catches up; the LLM latency (3-30s) gives us plenty of cycles.
+            if (_currentMsgId != 0 && _currentMsgTextAddr == 0 && _capturedSession != 0)
+            {
+                nuint recovered = TryReadTextAddr(_capturedSession);
+                if (recovered != 0)
+                {
+                    _currentMsgTextAddr = recovered;
+                    _modLog!.Info($"[MSG] TextAddr recovered=0x{recovered:X} (msgId=0x{_currentMsgId:X})");
+                }
+            }
 
             // One-shot BMD scan per session — fires once after first msgId confirmation.
             if (_confirmedBfBase != 0 && _bmdBase == 0 && !_bmdScanDone)
