@@ -4175,3 +4175,41 @@ The current MemcpyText hook drops any copy where `src < HeapLow`. But dialogue t
 - Strategy 2 finds the destination (the render buffer the GPU reads from)
 
 Whichever fires first tells us the correct write target. Both bypass the session struct entirely.
+
+---
+
+## Chapter 57: Synchronous Inline Interception — The Right Architecture
+
+### Why Async Write Was Always Wrong
+
+Every previous attempt wrote the LLM text AFTER the LLM responded (3–30 seconds later). By then the game had already rendered the original text and the player was reading it. Even if we found the exact right memory address, the write was too late.
+
+### The Right Model: Hook the Copy, Own the Buffer
+
+The game's text pipeline is:
+```
+BMD file (mapped memory) → memcpy → render buffer → GPU → screen
+```
+
+Our memcpy hook fires DURING that copy, on the game thread, before the frame is drawn. If we overwrite the render buffer (`dst`) immediately after the copy completes, the GPU sees our text instead of the original.
+
+```csharp
+// Game copies: BMD → dst (render buffer)
+_memcpyHook!.OriginalFunction(dst, src, count);  // original text is in dst now
+// We immediately overwrite:
+MemoryCopy(cachedLlmText, dst, count, writeLen);  // our text is in dst now
+// Frame renders → player sees our text
+```
+
+### Cache Strategy
+
+LLM inference takes 3–30 seconds. We can't do it synchronously on the game thread. Instead:
+- When a msgId is confirmed, fire the LLM call async as before
+- When it responds, store the result in `_lastLlmText`
+- The inline memcpy interceptor uses `_lastLlmText` to overwrite any subsequent dialogue copy
+
+Result:
+- Message 1: original text (LLM warming up)  
+- Message 2+: LLM text (cache hit, instant inline write)
+
+This is the correct beta architecture. The LLM "looks ahead" one message, which is imperceptible in normal play.

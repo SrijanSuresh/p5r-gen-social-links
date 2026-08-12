@@ -78,6 +78,11 @@ public class Mod : IModV1
     private nuint _bmdTextPool;
     private bool  _bmdScanDoneV2;
 
+    // Most recent LLM response. Written on the async LLM thread; read volatilely on the
+    // game thread inside OnGameMemcpy so no lock is needed (reference read/write is
+    // atomic on x64, and we only need eventual visibility, not strict ordering).
+    private volatile string? _lastLlmText;
+
     // Large-copy log: OnGameMemcpy records the dst of every heap-to-heap copy
     // ≥ 500 bytes. TryFindBfBuffer probes these at session start to locate the
     // BF script buffer, which is loaded in one bulk copy before session detection.
@@ -297,6 +302,31 @@ public class Mod : IModV1
         }
         if (spaces < 2 || printable < 8) return;
 
+        // ── Synchronous inline write ─────────────────────────────────────────
+        // If src is from a mapped-file page (BMD lives below 4 GB) and we're inside
+        // a confirmed dialogue beat, overwrite dst with the cached LLM text right now.
+        // The game renderer reads dst AFTER this hook returns — the swap is invisible.
+        if (_currentMsgId != 0 && src < unchecked((nuint)0x100000000UL) && src >= (nuint)0x10000UL)
+        {
+            string? cached = _lastLlmText;
+            if (cached != null && Memory.MemoryGuard.IsWritable(dst, (int)count))
+            {
+                byte[] enc = System.Text.Encoding.ASCII.GetBytes(cached);
+                int wl = Math.Min(enc.Length, (int)count - 1);
+                if (wl > 0)
+                {
+                    fixed (byte* csrc = enc)
+                        System.Buffer.MemoryCopy(csrc, d, (long)count, wl);
+                    d[wl] = 0;
+                    _modLog!.Info(
+                        $"[BMD] InlineWrite dst=0x{dst:X} src=0x{src:X} n={count} wrote={wl}: " +
+                        $"\"{cached[..Math.Min(cached.Length, 60)]}\"");
+                    return;
+                }
+            }
+        }
+
+        // ── Diagnostic log (fires when inline write did not apply) ───────────
         var text = new System.Text.StringBuilder(200);
         for (nuint i = 0; i < count && text.Length < 200; i++)
             text.Append(d[i] >= 0x20 && d[i] <= 0x7E ? (char)d[i] : '·');
@@ -1020,6 +1050,8 @@ public class Mod : IModV1
             string text = await _llmClient!.GenerateAsync(req, cts.Token);
             if (string.IsNullOrWhiteSpace(text)) return;
 
+            // Cache immediately so OnGameMemcpy can use it on the next text copy.
+            _lastLlmText = text;
             _modLog!.Info($"[LLM] msgId=0x{msgId:X}: \"{text[..Math.Min(text.Length, 100)]}\"");
             bool wrote = TryWriteToBmd(msgId, text);
             _modLog!.Info(wrote
@@ -1153,6 +1185,7 @@ public class Mod : IModV1
                     _currentMsgTextAddr  = 0;
                     _bmdTextPool         = 0;
                     _bmdScanDoneV2       = false;
+                    _lastLlmText         = null;
                     lock (_largeCopyLock) _largeCopyDsts.Clear();
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
                 }
