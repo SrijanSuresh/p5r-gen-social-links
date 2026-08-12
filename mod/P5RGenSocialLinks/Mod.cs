@@ -820,8 +820,8 @@ public class Mod : IModV1
             return false;
         }
 
-        // Offset table immediately after the 4-byte header.
-        uint* offsets   = (uint*)(bmdBase + 4);
+        // Offset table starts at byte 8: [0D 00] version, [E4 04] count, [4 reserved bytes], then offsets[].
+        uint* offsets   = (uint*)(bmdBase + 8);
         uint  msgOffset = offsets[msgId];
         nuint msgAddr   = bmdBase + msgOffset;
 
