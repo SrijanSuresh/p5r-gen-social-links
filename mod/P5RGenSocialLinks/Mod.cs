@@ -983,7 +983,7 @@ public class Mod : IModV1
     /// </summary>
     private unsafe void SweepHeapForUtf16()
     {
-        if (_utf16SweepHits >= 12 || _heapSweepDone) return;
+        if (_utf16SweepHits >= 40 || _heapSweepDone) return;
 
         const long budget    = 24L * 1024 * 1024; // per tick
         const int  chunk     = 0x100000;          // 1 MB per read
@@ -1012,10 +1012,14 @@ public class Mod : IModV1
                     int len = (int)Math.Min((ulong)(regionEnd - from), (ulong)chunk);
                     if (len <= 0 || !MemoryGuard.IsReadable(from, len)) break;
 
-                    foreach (var (a, t) in FindUtf16English(from, len, 3))
+                    // 64 candidates per chunk, then filter: the sweep previously spent its
+                    // entire hit budget on Windows runtime strings in the low heap and
+                    // stopped before reaching any game data.
+                    foreach (var (a, t) in FindUtf16English(from, len, 64))
                     {
+                        if (IsSystemString(t)) continue;
                         _modLog!.Info($"[HEAPUTF16] 0x{a:X}: \"{t}\"");
-                        if (++_utf16SweepHits >= 12) { _heapSweepCursor = regionEnd; return; }
+                        if (++_utf16SweepHits >= 40) { _heapSweepCursor = regionEnd; return; }
                     }
                     from    += (nuint)len;
                     scanned += len;
@@ -1025,6 +1029,67 @@ public class Mod : IModV1
         }
 
         _heapSweepCursor = addr;
+    }
+
+    /// <summary>
+    /// Rejects Windows runtime strings. The heap sweep spent its whole budget reporting
+    /// DirectInput names, font copyright blocks and impersonation flags — all genuine
+    /// UTF-16, none of it game text.
+    /// </summary>
+    private static bool IsSystemString(string s) =>
+        s.Length == 0 ||
+        s.Contains("Microsoft") || s.Contains("Windows") || s.Contains("Corporation") ||
+        s.Contains("Copyright")  || s.Contains("http")    || s.Contains(".dll") ||
+        s.Contains("OpenType")   || s.Contains("License") || s.Contains("reserved") ||
+        s.Contains("Impersonation") || s.Contains("DirectInput") || s.Contains("Version");
+
+    /// <summary>
+    /// Walks session+0xD0 as a pointer array. The per-message dumps show it holding
+    /// 0x42... heap pointers whose values change on every single message, which makes it
+    /// the per-message context block — and unlike session+0xC8 it has been populated on
+    /// every run observed. It sits below HeapLow, which is precisely why the pointer
+    /// filters everywhere else discarded it.
+    ///
+    /// Each slot is tested for text, then one level deeper, since a character buffer is
+    /// usually reached through a wrapper object rather than referenced directly.
+    /// </summary>
+    private unsafe void ProbeD0Array(nuint session)
+    {
+        if (!MemoryGuard.IsReadable(session + 0xD0, 8)) return;
+        nuint arr = *(nuint*)(session + 0xD0);
+        if (arr < 0x10000 || arr > UserAddrMax) return;
+        if (!MemoryGuard.IsReadable(arr, 0x200)) return;
+
+        int logged = 0;
+
+        for (int i = 0; i < 0x200 && logged < 12; i += 8)
+        {
+            nuint p1 = *(nuint*)(arr + (nuint)i);
+            if (p1 < 0x10000 || p1 > UserAddrMax)      continue;
+            if (!MemoryGuard.IsReadable(p1, 256))      continue;
+
+            if (ReportText($"+0x{i:X2}", p1)) { logged++; continue; }
+
+            for (int j = 0; j < 0x40 && logged < 12; j += 8)
+            {
+                nuint p2 = *(nuint*)(p1 + (nuint)j);
+                if (p2 < 0x10000 || p2 > UserAddrMax)  continue;
+                if (!MemoryGuard.IsReadable(p2, 256))  continue;
+                if (ReportText($"+0x{i:X2}+0x{j:X2}", p2)) logged++;
+            }
+        }
+
+        if (logged == 0) _modLog!.Info($"[D0] array 0x{arr:X}: no text in 2 levels");
+
+        bool ReportText(string label, nuint at)
+        {
+            string ascii = AsciiPreview(at, 96);
+            var    wide  = FindUtf16English(at, 256, 1);
+            string utf16 = wide.Count > 0 ? wide[0].Text : "";
+            if (IsSystemString(ascii) && IsSystemString(utf16)) return false;
+            _modLog!.Info($"[D0] {label} 0x{at:X} ascii=\"{ascii}\" utf16=\"{utf16}\"");
+            return true;
+        }
     }
 
     private static bool IsVowel(byte c) =>
@@ -1352,6 +1417,10 @@ public class Mod : IModV1
                         // session+0xC8 is the live message object — follow it and sweep
                         // for UTF-16, which every earlier scanner was blind to.
                         ProbeMessageObject(session);
+
+                        // session+0xD0 holds a per-message pointer array; it has been
+                        // populated on every run, unlike +0xC8.
+                        ProbeD0Array(session);
 
                         // Dump first 48 bytes of each external heap target — shows structure
                         // layout. Gated: this emits a line per pointer and the session-chain
