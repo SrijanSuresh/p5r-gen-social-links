@@ -160,7 +160,9 @@ public class Mod : IModV1
         return result;
     }
 
-    // Follows the session+0xD0 → descriptor → descriptor+0x18 chain to the actual text address.
+    // Follows the full pointer chain to the actual character buffer:
+    //   session+0xD0 → descriptor → descriptor+0x18 → textObj → *(textObj) → char data
+    // textObj is a string-wrapper struct whose first 8 bytes are the char* pointer.
     // Returns 0 if any link in the chain is null or unreadable.
     private static unsafe nuint TryReadTextAddr(nuint session)
     {
@@ -168,8 +170,12 @@ public class Mod : IModV1
         nuint descriptor = *(nuint*)((byte*)session + 0xD0);
         if (descriptor == 0) return 0;
         if (!MemoryGuard.IsReadable(descriptor + 0x18, 8)) return 0;
-        nuint textAddr = *(nuint*)(descriptor + 0x18);
-        return textAddr;
+        nuint textObj = *(nuint*)(descriptor + 0x18);
+        if (textObj == 0) return 0;
+        // textObj[0] is the actual char* — the string-wrapper stores its data pointer first.
+        if (!MemoryGuard.IsReadable(textObj, 8)) return 0;
+        nuint charPtr = *(nuint*)textObj;
+        return charPtr;
     }
 
     private static unsafe string TryReadString(nuint addr)
@@ -605,26 +611,31 @@ public class Mod : IModV1
 
                 if (capturedTextAddr != 0)
                 {
-                    // Dump descriptor layout and text bytes to confirm encoding.
+                    // Dump all three chain levels to verify layout.
                     unsafe
                     {
                         nuint descriptor = *(nuint*)((byte*)session + 0xD0);
-                        if (MemoryGuard.IsReadable(descriptor, 64))
+                        nuint textObj    = (descriptor != 0 && MemoryGuard.IsReadable(descriptor + 0x18, 8))
+                                           ? *(nuint*)(descriptor + 0x18) : 0;
+
+                        // Level 2: textObj bytes (the string-wrapper struct)
+                        if (textObj != 0 && MemoryGuard.IsReadable(textObj, 32))
                         {
-                            byte* db = (byte*)descriptor;
-                            var dumpSb = new System.Text.StringBuilder("[MSG] Descriptor: ");
-                            for (int di = 0; di < 64; di++)
+                            byte* ob = (byte*)textObj;
+                            var objSb = new System.Text.StringBuilder($"[MSG] TextObj(0x{textObj:X}): ");
+                            for (int di = 0; di < 32; di++)
                             {
-                                if (di > 0 && di % 16 == 0) dumpSb.Append(" | ");
-                                dumpSb.Append($"{db[di]:X2} ");
+                                if (di > 0 && di % 16 == 0) objSb.Append(" | ");
+                                objSb.Append($"{ob[di]:X2} ");
                             }
-                            _modLog!.Info(dumpSb.ToString());
+                            _modLog!.Info(objSb.ToString());
                         }
 
+                        // Level 3: actual character bytes (capturedTextAddr = *(textObj))
                         if (MemoryGuard.IsReadable(capturedTextAddr, 64))
                         {
                             byte* tb = (byte*)capturedTextAddr;
-                            var txtSb = new System.Text.StringBuilder("[MSG] TextBytes: ");
+                            var txtSb = new System.Text.StringBuilder($"[MSG] CharBytes(0x{capturedTextAddr:X}): ");
                             for (int di = 0; di < 64; di++)
                             {
                                 if (di > 0 && di % 16 == 0) txtSb.Append(" | ");
