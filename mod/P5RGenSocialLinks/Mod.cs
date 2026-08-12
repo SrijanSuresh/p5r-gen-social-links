@@ -72,6 +72,12 @@ public class Mod : IModV1
     private nuint  _bfBufferBase;
     private int    _bfBufferOff;   // session struct offset where we found it (for logging)
 
+    // BMD text pool: the first page in the ±512KB bfBase vicinity that has ≥5 English
+    // dialogue strings (null-terminated, ≥2 spaces, ≥10 printable chars). Found once
+    // per session after bfBase is confirmed; written via VirtualProtect(PAGE_WRITECOPY).
+    private nuint _bmdTextPool;
+    private bool  _bmdScanDoneV2;
+
     // Large-copy log: OnGameMemcpy records the dst of every heap-to-heap copy
     // ≥ 500 bytes. TryFindBfBuffer probes these at session start to locate the
     // BF script buffer, which is loaded in one bulk copy before session detection.
@@ -266,12 +272,8 @@ public class Mod : IModV1
     {
         _memcpyHook!.OriginalFunction(dst, src, count);
 
-        if (dst < HeapLow || src < HeapLow) return;
-
-        // Record all large heap-to-heap copy destinations. The BF scene script is
-        // loaded in one bulk copy (several KB) before session detection. We store
-        // the dst here and probe it for BF content when the session is first seen.
-        if (count >= 500 && count <= 500_000)
+        // Large-copy tracking: heap-to-heap only, for BF script discovery.
+        if (dst >= HeapLow && src >= HeapLow && count >= 500 && count <= 500_000)
         {
             lock (_largeCopyLock)
             {
@@ -280,26 +282,27 @@ public class Mod : IModV1
             }
         }
 
-        // Small-copy vowel filter: IEEE 754 float data (>?@ABCfwD…) has zero
-        // lowercase vowels. English dialogue always has ≥3.
-        if (count < 10 || count > 150) return;
+        // Small-copy text detection: catches heap-to-heap AND mapped-file→anywhere.
+        // Requires ≥2 spaces (English sentences) — filters out binary/shader data that
+        // coincidentally contains vowel-valued bytes.
+        if (count < 10 || count > 200) return;
         if (!Memory.MemoryGuard.IsReadable(dst, (int)count)) return;
 
         byte* d = (byte*)dst;
-        int vowels = 0;
+        int spaces = 0, printable = 0;
         for (nuint i = 0; i < count; i++)
         {
             byte b = d[i];
-            if (b == 'a' || b == 'e' || b == 'i' || b == 'o' || b == 'u') vowels++;
+            if (b >= 0x20 && b <= 0x7E) { printable++; if (b == ' ') spaces++; }
         }
-        if (vowels < 3) return;
+        if (spaces < 2 || printable < 8) return;
 
-        var text = new System.Text.StringBuilder(160);
-        for (nuint i = 0; i < count && text.Length < 160; i++)
+        var text = new System.Text.StringBuilder(200);
+        for (nuint i = 0; i < count && text.Length < 200; i++)
             text.Append(d[i] >= 0x20 && d[i] <= 0x7E ? (char)d[i] : '·');
 
         _modLog!.Info(
-            $"[MemcpyText] src=0x{src:X} dst=0x{dst:X} n={count} vowels={vowels}: \"{text}\"");
+            $"[MemcpyText] src=0x{src:X} dst=0x{dst:X} n={count} sp={spaces}: \"{text}\"");
     }
 
     private void TryActivateHook()
@@ -580,6 +583,59 @@ public class Mod : IModV1
         _bfBufferBase = bestPtr;
         _bfBufferOff  = bestOff;
         _modLog!.Info($"[BFBuffer] SNAP-SELECTED sess+0x{bestOff:X3} → 0x{bestPtr:X} (strings={bestStrings})");
+    }
+
+    // Scans ±512KB around bfBase for a page whose string content looks like dialogue.
+    // Skips the first 0x100 bytes of each candidate (binary header). Counts strings
+    // that are null-terminated, ≥10 printable ASCII chars, ≥2 spaces. Caches the
+    // first page with ≥5 such strings as _bmdTextPool.
+    private unsafe void TryScanBmdVicinity()
+    {
+        if (_bmdTextPool != 0 || _bmdScanDoneV2) return;
+        _bmdScanDoneV2 = true;
+
+        nuint center = _confirmedBfBase != 0 ? _confirmedBfBase : _bfBufferBase;
+        if (center == 0) return;
+
+        const nuint window  = 0x80000; // ±512KB
+        const int   pageSize = 0x1000;
+        nuint start = center > window ? center - window : 0x1000;
+        nuint end   = center + window;
+
+        for (nuint addr = start; addr < end; addr += (nuint)pageSize)
+        {
+            if (!MemoryGuard.IsReadable(addr, pageSize)) continue;
+
+            // Skip first 0x100 bytes (possible binary header), scan the rest
+            nuint dataStart = addr + 0x100;
+            byte* p = (byte*)dataStart;
+            int scanLen = pageSize - 0x100;
+            int goodStrings = 0, pos = 0;
+
+            while (pos < scanLen && goodStrings < 5)
+            {
+                int start2 = pos, printable = 0, spaces = 0;
+                while (pos < scanLen && p[pos] != 0)
+                {
+                    byte c = p[pos++];
+                    if (c >= 0x20 && c <= 0x7E) { printable++; if (c == ' ') spaces++; }
+                }
+                if (printable >= 10 && spaces >= 2) goodStrings++;
+                if (pos < scanLen) pos++; // skip null
+            }
+
+            if (goodStrings < 5) continue;
+
+            // Preview first printable string past the header
+            var preview = new System.Text.StringBuilder(64);
+            for (int i = 0; i < scanLen && preview.Length < 64; i++)
+                if (p[i] >= 0x20 && p[i] <= 0x7E) preview.Append((char)p[i]);
+
+            _bmdTextPool = dataStart;
+            _modLog!.Info($"[BMD2] TextPool found at 0x{dataStart:X} (bfBase±512KB): \"{preview}\"");
+            return;
+        }
+        _modLog!.Info($"[BMD2] No text pool found in 0x{start:X}–0x{end:X}");
     }
 
     private static unsafe int CountNullTermStrings(byte* buf, int maxBytes, int minPrintable)
@@ -1095,6 +1151,8 @@ public class Mod : IModV1
                     _bmdBase             = 0;
                     _bmdScanDone         = false;
                     _currentMsgTextAddr  = 0;
+                    _bmdTextPool         = 0;
+                    _bmdScanDoneV2       = false;
                     lock (_largeCopyLock) _largeCopyDsts.Clear();
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
                 }
@@ -1149,6 +1207,10 @@ public class Mod : IModV1
                     _modLog!.Info($"[MSG] TextAddr recovered=0x{recovered:X} (msgId=0x{_currentMsgId:X})");
                 }
             }
+
+            // One-shot bfBase-vicinity scan: find the BMD dialogue string pool.
+            if (_confirmedBfBase != 0 && !_bmdScanDoneV2)
+                TryScanBmdVicinity();
 
             // One-shot BMD scan per session — fires once after first msgId confirmation.
             if (_confirmedBfBase != 0 && _bmdBase == 0 && !_bmdScanDone)

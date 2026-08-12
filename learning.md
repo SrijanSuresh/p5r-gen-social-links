@@ -4146,3 +4146,32 @@ If textAddr < HeapLow (mapped file), `IsWritable` returns false (it's PAGE_READO
 VirtualProtect(textAddr, MaxWrite, PAGE_WRITECOPY, out oldProtect)
 ```
 This makes the page copy-on-write. The write succeeds. The game's renderer, reading from this address, now sees our patched text instead of the original. No file on disk is modified.
+
+---
+
+## Chapter 56: Abandoning Pointer Chains — Content-Based Memory Discovery
+
+### Why Pointer Chains Failed
+
+The session struct has at least three C++ subclass variants in the wild. Each has the dialogue text pointer at a different offset, or not at all. Every fix for one variant breaks another. The session address itself can be in totally different memory regions (2GB vs 256TB) depending on game state. This is the wrong anchor.
+
+### The Right Anchor: bfBase
+
+`bfBase` is found reliably every single run via the large-copy hook. It's always in the `0x61...–0x62...` range (memory-mapped game data files). The dialogue BMD file for this scene is in the same mapped-file region — P5R loads paired `.bf` and `.bmd` assets from the same PAK archive, so they live close together in the virtual address space.
+
+### Strategy 1: bfBase-Vicinity Scan for Dialogue Strings
+
+Scan a ±512KB window around `bfBase` page-by-page. For each committed readable page, skip the first 0x100 bytes (possible binary header) and count null-terminated ASCII strings that have ≥2 spaces and ≥10 printable chars. A BMD file's string section will have many such strings (one per dialogue line). The first page that accumulates ≥5 such strings is the dialogue text pool.
+
+Once found, we cache it as `_bmdTextPool`. We write the LLM text there using `VirtualProtect(PAGE_WRITECOPY)`, overwriting the original dialogue bytes in the game's private copy of the mapped page.
+
+### Strategy 2: Cross-Region MemcpyText
+
+The current MemcpyText hook drops any copy where `src < HeapLow`. But dialogue text flows FROM the mapped BMD file (src ≈ 0x61...) TO the render pipeline buffer (dst anywhere). Dropping the HeapLow restriction and filtering by spaces instead of vowels catches exactly this transfer — giving us the render buffer destination address directly.
+
+### Why Both Strategies Together
+
+- Strategy 1 finds the source (the BMD string pool, writable via WRITECOPY)
+- Strategy 2 finds the destination (the render buffer the GPU reads from)
+
+Whichever fires first tells us the correct write target. Both bypass the session struct entirely.
