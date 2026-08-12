@@ -609,117 +609,79 @@ public class Mod : IModV1
 
     // Scans the entire lower-4GB mapped-file region for a committed, readable
     // region containing ≥5 English dialogue sentences (the BMD string table).
-    // Three-strategy BMD discovery:
+    // Diagnostic BMD hunt:
     //
-    // Strategy 1 — Session struct pointer scan:
-    //   Walk session+0x00..0xF8 in 8-byte steps. For each uint64 that looks like a
-    //   readable pointer, check its first 4 bytes for [0D 00 ?? ??] with 5 ≤ count ≤ 3000.
-    //   The game stores a BMD reference somewhere in its BF runtime context.
+    // Step 1 — session struct pointer map: log every readable pointer in
+    //   session+0x000..0x2F8 (96 uint64 slots) along with the first 4 bytes
+    //   at the target. Shows what the BF runtime context actually references.
     //
-    // Strategy 2 — Backward scan for BF file magic:
-    //   bfBase = session+0x18 = start of the in-memory TEXT section (instruction buffer).
-    //   The full BF file was memory-mapped before this; the file header with magic
-    //   "FLW\0" (0x00574C46 LE) lives at fileBase+0x0C. Scanning backward from bfBase
-    //   through the same VirtualQuery region finds the file header, after which we can
-    //   parse the section table to get section[3] = MessageScript (BMD).
+    // Step 2 — lower-4GB wide scan: walk ALL committed, non-guard pages
+    //   (any protection, not just PAGE_READONLY) for [0D 00] regions with
+    //   count >= 50, logging every hit. Finds BMDs in heap or writable mappings
+    //   that were previously excluded by the PAGE_READONLY filter.
     //
-    // Strategy 3 — Forward region scan fallback:
-    //   Scan the VirtualQuery region that contains bfBase for any [0D 00] with
-    //   reasonable msgCount. Catches cases where the BMD is beyond, not before, bfBase.
+    // Neither step locks _bmdBase; we read the log to identify the real BMD,
+    // then we'll add targeted logic to select it.
     private unsafe void TryScanForBmd()
     {
         nuint bfBase  = _confirmedBfBase;
         nuint session = _capturedSession;
         if (bfBase == 0) return;
 
-        // ── Strategy 1: session struct pointer scan ──────────────────────────
-        _modLog!.Info($"[BMD] S1: scanning session=0x{session:X} for BMD pointer");
-        if (session != 0 && MemoryGuard.IsReadable(session, 0x100))
+        _modLog!.Info($"[BMD] Diag: session=0x{session:X} bfBase=0x{bfBase:X}");
+
+        // ── Step 1: dump all readable pointers in the session struct ──────────
+        if (session != 0 && MemoryGuard.IsReadable(session, 0x300))
         {
-            for (int off = 0; off < 0x100; off += 8)
+            for (int off = 0; off < 0x300; off += 8)
             {
-                nuint candidate = *(nuint*)((byte*)session + off);
-                // Plausible pointer range: above 0x1000, fits in 4 or 8 GB
-                if (candidate < 0x1000UL || candidate > 0x0000_FFFF_FFFF_0000UL) continue;
-                if (!MemoryGuard.IsReadable(candidate, 8)) continue;
-                byte* h = (byte*)candidate;
-                if (h[0] != 0x0D || h[1] != 0x00) continue;
-                ushort cnt = (ushort)(h[2] | h[3] << 8);
-                if (cnt < 5 || cnt > 3000) continue;
-                _modLog!.Info($"[BMD] S1 hit sess+0x{off:X3}→0x{candidate:X} count={cnt} " +
-                              $"[{h[0]:X2} {h[1]:X2} {h[2]:X2} {h[3]:X2}]");
-                _bmdBase = candidate;
-                TryLogBmdStrings();
-                return;
+                nuint cand = *(nuint*)((byte*)session + off);
+                if (cand < 0x10000UL || !MemoryGuard.IsReadable(cand, 8)) continue;
+                byte* h = (byte*)cand;
+                // Always log the pointer; tag lines that begin with [0D 00] for easy grep
+                string tag = (h[0] == 0x0D && h[1] == 0x00) ? " ← [0D 00]" : "";
+                _modLog!.Info($"[SES] +0x{off:X3}→0x{cand:X} " +
+                              $"[{h[0]:X2} {h[1]:X2} {h[2]:X2} {h[3]:X2}]{tag}");
             }
-            _modLog!.Info("[BMD] S1: no BMD pointer in session struct");
         }
 
-        // ── Strategy 2: backward scan for BF file magic ──────────────────────
-        _modLog!.Info($"[BMD] S2: backward scan from bfBase=0x{bfBase:X} for FLW magic");
-        var (qok, regBase, regSize, _, _) = MemoryGuard.QueryRegion(bfBase);
-        if (qok && bfBase > regBase)
+        // ── Step 2: lower-4GB scan, any protection, log all [0D 00] hits ─────
+        _modLog!.Info("[BMD] Wide scan (any prot, lower 4GB) for [0D 00] count>=50...");
+        const uint MEM_COMMIT    = 0x1000;
+        const uint PAGE_NOACCESS = 0x01;
+        const uint PAGE_GUARD    = 0x100;
+        nuint probe   = (nuint)0x1000UL;
+        nuint scanEnd = (nuint)0xFFFF0000UL;
+        int   hits    = 0;
+
+        while (probe < scanEnd)
         {
-            int maxBack = (int)Math.Min((ulong)(bfBase - regBase), 8u * 1024 * 1024);
-            for (int back = 4; back < maxBack; back += 4)
+            var (ok, regBase, regSize, state, protect) = MemoryGuard.QueryRegion(probe);
+            if (!ok || regSize == 0) break;
+            nuint next = regBase + regSize;
+
+            if (state == MEM_COMMIT &&
+                (protect & PAGE_NOACCESS) == 0 &&
+                (protect & PAGE_GUARD)    == 0 &&
+                regSize >= 256 &&
+                MemoryGuard.IsReadable(regBase, 4))
             {
-                nuint addr = bfBase - (nuint)back;
-                if (!MemoryGuard.IsReadable(addr, 4)) continue;
-                uint val = *(uint*)addr;
-                // FLW\0 = 0x00574C46, FLF\0 = 0x00464C46, FLB\0 = 0x00424C46
-                if (val != 0x00574C46u && val != 0x00464C46u && val != 0x00424C46u) continue;
-
-                // Magic is at fileBase+0x0C
-                nuint fileBase = addr - 0x0Cu;
-                if (!MemoryGuard.IsReadable(fileBase, 0x20)) continue;
-                short secCount = *(short*)(fileBase + 0x10u);
-                if (secCount < 1 || secCount > 10) continue;
-                _modLog!.Info($"[BF] S2 magic=0x{val:X8} at 0x{addr:X} → fileBase=0x{fileBase:X} sections={secCount}");
-
-                for (int s = 0; s < secCount && s < 8; s++)
+                byte* hdr = (byte*)regBase;
+                if (hdr[0] == 0x0D && hdr[1] == 0x00)
                 {
-                    nuint shAddr = fileBase + 0x18u + (nuint)(s * 16);
-                    if (!MemoryGuard.IsReadable(shAddr, 16)) break;
-                    byte* sh       = (byte*)shAddr;
-                    int firstOff   = sh[0]|sh[1]<<8|sh[2]<<16|sh[3]<<24;
-                    int elemSize   = sh[4]|sh[5]<<8|sh[6]<<16|sh[7]<<24;
-                    int elemCount  = sh[8]|sh[9]<<8|sh[10]<<16|sh[11]<<24;
-                    _modLog!.Info($"[BF] S2 Section[{s}] off=0x{firstOff:X} elemSz={elemSize} count={elemCount}");
-                    if (s == 3 && elemSize == 1 && elemCount > 0)
+                    ushort cnt = (ushort)(hdr[2] | hdr[3] << 8);
+                    if (cnt >= 50 && cnt <= 20000)
                     {
-                        nuint bmdAddr = fileBase + (nuint)(uint)firstOff;
-                        if (!MemoryGuard.IsReadable(bmdAddr, 4)) continue;
-                        byte* bh = (byte*)bmdAddr;
-                        _modLog!.Info($"[BMD] S2 found at 0x{bmdAddr:X} hdr=[{bh[0]:X2} {bh[1]:X2} {bh[2]:X2} {bh[3]:X2}]");
-                        _bmdBase = bmdAddr;
-                        TryLogBmdStrings();
-                        return;
+                        _modLog!.Info($"[BMD] Hit 0x{regBase:X} prot=0x{protect:X} sz=0x{regSize:X} count={cnt}");
+                        hits++;
                     }
                 }
             }
-            _modLog!.Info("[BMD] S2: FLW magic not found");
-        }
 
-        // ── Strategy 3: forward scan of bfBase region for [0D 00] ────────────
-        _modLog!.Info("[BMD] S3: scanning region for [0D 00] magic");
-        if (qok && regSize > 0)
-        {
-            nuint scanLimit = Math.Min(regSize, 8u * 1024 * 1024);
-            for (nuint off = 0; off < scanLimit; off += 4)
-            {
-                nuint probe = regBase + off;
-                if (!MemoryGuard.IsReadable(probe, 4)) continue;
-                byte* hdr = (byte*)probe;
-                if (hdr[0] != 0x0D || hdr[1] != 0x00) continue;
-                ushort cnt = (ushort)(hdr[2] | hdr[3] << 8);
-                if (cnt < 5 || cnt > 3000) continue;
-                _modLog!.Info($"[BMD] S3 hit 0x{probe:X} count={cnt}");
-                _bmdBase = probe;
-                TryLogBmdStrings();
-                return;
-            }
+            if (next <= regBase) break;
+            probe = next;
         }
-        _modLog!.Warn("[BMD] All 3 strategies exhausted — no BMD found");
+        _modLog!.Info($"[BMD] Wide scan done: {hits} hit(s) — review [SES] and [BMD] Hit lines");
     }
 
     private static unsafe int CountPrintableRuns(nuint regionBase, int scanBytes)
