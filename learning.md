@@ -3685,3 +3685,814 @@ P5R `.bmd` (message) files start with a binary header: a magic word, string coun
 ### Diagnostic approach
 
 Instead of stopping at the first 10-sentence region, log EVERY committed readable region that has ≥1 qualifying sentence. Output its base, size, protect flags, first 4 raw bytes (to identify file magic), and sentence count. This gives a full map of what text regions exist in the window and why the threshold isn't being met.
+
+---
+
+## Chapter 48 — BMD Control Codes and Printable-Run Scanning
+
+### Why null-terminated scanning fails on BMD data
+
+P5R BMD dialogue strings are NOT simple null-terminated strings. They use embedded control codes where `\x00` followed by a non-zero byte is a formatting command (speaker label, line break, color change), not a string terminator. A single displayed line like:
+
+```
+"Strongest, most powerful Personas."
+```
+
+is stored in the BMD as something like:
+
+```
+53 74 72 6F 6E 67 65 73 74 2C  "Strongest,"
+00 01                           [control: line break?]
+6D 6F 73 74 20 70 6F 77 65 72 66 75 6C  "most powerful"
+00 02                           [control: next segment]
+50 65 72 73 6F 6E 61 73 2E     "Personas."
+00 00                           [true terminator]
+```
+
+Our null-terminated scanner stops at the first `\x00 01` and sees "Strongest," (10 chars) — too short to count as a sentence. The full string is never reconstructed.
+
+### The diagnostic signal: `[0D 00 xx xx]` regions
+
+Two PAGE_READONLY (prot=0x2) regions appeared with this magic:
+
+| Region | Magic | LE uint16[0] | LE uint16[1] |
+|--------|-------|------|------|
+| `0x190000` | `0D 00 E4 04` | 13 (version?) | 1252 (string count?) |
+| `0x1B0000` | `0D 00 B5 01` | 13 (version?) | 437 (string count?) |
+
+1252 strings in one file, 437 in another. msgId=840 < 1252 so it fits in the first file. These are the BMD files — but they scored `s=1` because the control-code nulls broke our scanner.
+
+### Printable-run scanning
+
+Instead of looking for null-terminated strings, scan for **contiguous runs of printable ASCII bytes** (0x20–0x7E), ignoring the intervening control code bytes:
+
+```
+Scan byte-by-byte.
+When byte is printable (0x20–0x7E): accumulate into run.
+When byte is non-printable (<0x20 or ≥0x7F): end run, evaluate.
+
+If run length ≥ 12 AND letters ≥ 60% AND spaces ≥ 1 → count it.
+```
+
+"Strongest," + control code + "most powerful" would produce TWO qualifying runs instead of being killed by the null. A BMD region would score 50–100+ runs vs. 0–3 for model/shader assets.
+
+---
+
+## Chapter 49 — BMD Offset Table Lookup and In-Place Write
+
+### The BMD binary layout
+
+Now that we have `_bmdBase = 0x190000`, we need to find exactly where msgId N's text lives inside the file. The BMD format is:
+
+```
+Offset 0x0000:  uint16  version    = 13  (0x0D 0x00)
+Offset 0x0002:  uint16  msgCount   = 1252 (0xE4 0x04)
+Offset 0x0004:  uint32[msgCount]   offset table
+                  Each entry is a byte offset FROM the start of the BMD
+                  to the beginning of that message's data.
+Offset 0x138C:  <string data>      Shift-JIS text + control codes
+```
+
+To get the bytes for msgId N:
+```
+uint* offsetTable = (uint*)(bmdBase + 4);
+uint  msgOffset   = offsetTable[N];          // e.g. 0x2A10
+byte* msgData     = (byte*)bmdBase + msgOffset;
+```
+
+`msgData` now points to the first byte of that dialogue entry.
+
+### Why the region is PAGE_READONLY and how to write to it
+
+The game's asset loader maps BMD files from disk with `CreateFileMapping` + `MapViewOfFile(FILE_MAP_READ)`, which gives PAGE_READONLY pages. You cannot write to them directly — the CPU raises an access violation.
+
+`VirtualProtect` changes the memory protection flags on a page range at runtime without unmapping the view:
+
+```
+VirtualProtect(addr, size, PAGE_READWRITE, out oldProtect)
+// ... write your bytes ...
+VirtualProtect(addr, size, oldProtect, out _)  // restore
+```
+
+This works because the OS kernel only checks protection flags on access — the underlying file mapping stays intact. After restoring PAGE_READONLY, any further writes AV again (good — prevents accidental corruption).
+
+### In-place length constraint
+
+The original string at `msgData` has a fixed byte length determined by the gap between consecutive offset table entries:
+
+```
+slotSize = offsetTable[N+1] - offsetTable[N]   (for N < msgCount - 1)
+```
+
+We can only overwrite up to `slotSize` bytes. If the LLM text is longer, we truncate. If shorter, we null-terminate and leave the trailing bytes as-is (the game reads until its own terminator).
+
+### Write strategy
+
+1. Encode LLM text as ASCII bytes (plain Latin fits; no Shift-JIS needed for our generated output)
+2. VirtualProtect → PAGE_READWRITE
+3. `Marshal.Copy` or a direct `byte*` loop to write bytes
+4. Write a null terminator at `min(llmLen, slotSize - 1)`
+5. VirtualProtect → restore original protect
+
+---
+
+## Chapter 50 — Why 0x190000 Was the Wrong BMD: Glyph Tables vs. Dialogue Scripts
+
+### The false positive
+
+Our scan locked on address 0x190000 because it matched three filters:
+1. Magic `[0D 00]` at byte 0
+2. `msgCount = 1252` ≥ our 1000-threshold
+3. PAGE_READONLY memory-mapped region
+
+But the reverse-anchor scan returned **zero hits** — values 0x0120, 0x013E, 0x0158 did not appear in the first 1024 bytes. This is the smoking gun.
+
+Then look at what TryLogBmdStrings found in the big 15837-byte block at +0x0223:
+
+```
+............................... !"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwx.
+```
+
+The leading dots are bytes ≥ 0x80 (Shift-JIS lead bytes). Then there's a space (0x20), followed by the entire ASCII printable sequence 0x21–0x7E. That IS the ASCII character table, ordered by code point. This region is a **glyph descriptor table** (probably font metrics or character-set mapping), not dialogue BMD. The count 1252 = number of glyphs, not messages.
+
+### Why the scan-all-memory approach breaks
+
+Scanning the full lower 4 GB for `[0D 00]` + large count was always fragile: the magic bytes and size threshold are coincidentally satisfied by non-BMD resources. The correct approach is to go directly to the source — the BF (FlowScript Binary) that the game loaded for this conversation.
+
+---
+
+## Chapter 51 — Parsing the BF Section Table to Find the Embedded BMD
+
+### BF binary format (P5R, little-endian, version 3)
+
+A BF file is a structured binary with a fixed header followed by a section table. Every field is little-endian:
+
+```
+Offset  Size  Field
+0x00    4     field00 (= 0)
+0x04    1     compressionFlag
+0x05    1     userId
+0x06    2     version (int16)
+0x08    4     fileSize
+0x0C    4     magic: "FLW\0" = 0x00574C46  ("FLF\0" for some variants)
+0x10    2     sectionCount (int16)
+0x12    2     localIntVariableCount
+0x14    2     localFloatVariableCount
+0x16    2     padding
+0x18    ...   SectionHeader[sectionCount], each 16 bytes
+```
+
+Each `SectionHeader` is 16 bytes:
+
+```
++0x00  int32  firstElementOffset   ← byte offset from BF buffer start to section data
++0x04  int32  elementSize          ← bytes per element
++0x08  int32  elementCount         ← number of elements (= section byte length when elementSize=1)
++0x0C  int32  reserved (= 0)
+```
+
+The sections appear in a fixed order by type:
+
+| Index | Type               | elementSize | Content                          |
+|-------|--------------------|-------------|----------------------------------|
+| 0     | ProcedureLabelTable| 0x20        | Procedure descriptor entries     |
+| 1     | JumpLabelTable     | 0x04        | Jump target offsets              |
+| 2     | Text (bytecode)    | 0x04        | BF instruction stream            |
+| 3     | MessageScript      | 0x01        | Embedded BMD (raw bytes)         |
+| 4     | StringTable        | 0x01        | Null-terminated C strings        |
+
+**Section 3 is the BMD.** Its data starts at `bfBase + sections[3].firstElementOffset`.
+
+### Why this is better than memory scanning
+
+The BF binary is the authoritative source. The game engine already knows where the BMD is — it loaded it from the same BF file. By reading the section table, we get the exact address with zero ambiguity, no false positives, and no dependence on magic-byte heuristics.
+
+### Implementation
+
+```csharp
+private unsafe void TryScanForBmd()
+{
+    nuint bfBase = _confirmedBfBase;
+    if (bfBase == 0) return;
+
+    byte* bf = (byte*)bfBase;
+    uint  magic        = *(uint*)(bf + 0x0C);
+    short sectionCount = *(short*)(bf + 0x10);
+
+    for (int s = 0; s < sectionCount && s < 8; s++)
+    {
+        byte* sh = bf + 0x18 + s * 16;
+        int firstOff  = *(int*)(sh + 0);
+        int elemSize  = *(int*)(sh + 4);
+        int elemCount = *(int*)(sh + 8);
+
+        // Section 3 = MessageScript, elementSize=1 means raw bytes
+        if (s == 3 && elemSize == 1 && elemCount > 0)
+        {
+            _bmdBase = bfBase + (nuint)(uint)firstOff;
+            // → now _bmdBase points to the real embedded BMD
+        }
+    }
+}
+```
+
+Once `_bmdBase` is set correctly, `TryWriteToBmd` can read the actual offset table and write LLM text to the right message slot.
+
+---
+
+## Chapter 52 — bfBase Points to the Instruction Buffer, Not the File Header
+
+### What the BF hex dump revealed
+
+Dumping 64 bytes at `bfBase=0x620F4FF8` showed a repeating 16-byte pattern:
+```
+08 00 02 04 33 00 C3 02 00 00 00 00 00 00 00 00
+08 00 02 05 3C 00 C3 02 00 00 00 00 00 00 00 00
+```
+
+This is NOT a BF file header — it's the **in-memory instruction buffer**. Each 16-byte record is one expanded BF instruction: [opcode][type][value][metadata][padding]. The game's BF runtime expands compact 4-byte file instructions to 16-byte in-memory structs for faster dispatch.
+
+`session+0x18` = bfBase = **start of the TEXT section** (instruction buffer), NOT the BF file start. So our section-walk code was parsing instruction data as section headers, producing garbage (magic=0x00000000, counts like 100 million).
+
+### Three-strategy discovery
+
+Since we can't use bfBase as a file header, we use three approaches in order:
+
+**Strategy 1 — Session struct scan**: The BF runtime likely stores a pointer to the BMD somewhere in the session struct (the object that holds all dialogue state). We walk session+0x00..0xF8 in 8-byte steps, and for each value that's a readable pointer, check the first 4 bytes for `[0D 00]` with a sane message count.
+
+**Strategy 2 — Backward FLW magic scan**: The BF file was memory-mapped as a contiguous block. The instruction buffer (`bfBase`) is the Text section inside that file. Scanning backward from `bfBase` through the same VirtualQuery region for `FLW\0` (magic=0x00574C46) at offset +0x0C finds the file base. From there, the standard 16-byte section table at fileBase+0x18 gives us section[3] = BMD.
+
+**Strategy 3 — Region forward scan**: Fallback — scan the entire VirtualQuery region containing bfBase for any `[0D 00]` pattern with 5 ≤ msgCount ≤ 3000.
+
+### Lesson: verify pointer provenance before parsing
+
+`session+0x18` is documented as "BF script base", but the BF system distinguishes between:
+- The FILE base (where the file mapping starts, contains the header)
+- The TEXT base (where the instruction bytecode lives, = what `session+0x18` holds)
+
+Always verify what a pointer actually points to by dumping a few bytes before assuming it's the start of a structured format.
+
+### The problem: offset table location is unknown
+
+We have a binary blob (`_bmdBase`, 0x11000 bytes). We know the first string of actual message text sits at `bmdBase+0x0120`. But reading `bmdBase+8+msgId×4` as a flat `uint32[]` offset table returns `0x3F3F3F3F` — four `3F` bytes, which is just the ASCII `?` character repeated. That region is not an offset table; it's literal content.
+
+The header hex gives us facts:
+```
+0x00: 0D 00        → version = 13 (LE uint16)
+0x02: E4 04        → count  = 1252 (LE uint16)
+0x04: 01 00        → unknown field = 1
+0x06–0x0D: 3F 00 × 4  → four LE uint16 = 63, not offsets
+0x0E–0x19: all 00
+0x1A: 03 01        → unknown
+0x1C+: 00 00, 01 00, 02 00, 03 00 ...  → sequential uint16 (index list?)
+```
+First real string text: `bmdBase+0x0120`. Next strings at `+0x013E`, `+0x0158`.
+
+### Reverse-anchor scan strategy
+
+Instead of guessing the table format, we exploit a known invariant:
+
+> **The offset table must contain the byte offsets of each message.** For message 0, that value is `0x0120`. For message 1, `0x013E`. For message 2, `0x0158`.
+
+So we scan the entire first 1024 bytes of the BMD looking for these exact values as both `uint16` and `uint32`. Wherever we find them clustered, that IS the offset table, and the position of the match tells us:
+- **Table base address** (e.g., `bmdBase + 0x??`)
+- **Entry size** (distance between consecutive hits for msg0 and msg1)
+- **Entry type** (uint16 or uint32)
+
+#### Why this is guaranteed to terminate
+
+The game engine has to look up each message by index to render dialogue. That means a data structure mapping `index → byte_offset` exists somewhere in the BMD or an adjacent table. The string at `+0x0120` is message zero; its offset (`0x0120 = 288`) is a concrete 2-byte or 4-byte value. The scan will find it.
+
+#### Code
+
+```csharp
+byte* scan = (byte*)_bmdBase;
+uint[] knownOffsets = { 0x0120u, 0x013Eu, 0x0158u };
+for (int pos = 4; pos < 1024; pos++)
+{
+    if (!Memory.MemoryGuard.IsReadable(_bmdBase + (nuint)pos, 4)) break;
+    byte* sp = (byte*)(_bmdBase + (nuint)pos);
+    uint v32 = (uint)(sp[0] | sp[1]<<8 | sp[2]<<16 | sp[3]<<24);
+    foreach (uint ko in knownOffsets)
+        if (v32 == ko)
+            _modLog!.Info($"[BMD] OffsetScan: 0x{ko:X} as uint32 at bmd+0x{pos:X}");
+    if (pos < 1023) {
+        ushort v16 = (ushort)(sp[0] | sp[1]<<8);
+        foreach (uint ko in knownOffsets)
+            if (v16 == ko)
+                _modLog!.Info($"[BMD] OffsetScan: 0x{ko:X} as uint16 at bmd+0x{pos:X}");
+    }
+}
+```
+
+#### What to do with the output
+
+Once we see lines like:
+```
+[BMD] OffsetScan: 0x120 as uint16 at bmd+0x1C
+[BMD] OffsetScan: 0x13E as uint16 at bmd+0x1E
+[BMD] OffsetScan: 0x158 as uint16 at bmd+0x20
+```
+That tells us:
+- Table starts at `bmdBase + 0x1C`
+- Entry size = 2 bytes (uint16), stride = 2
+- `msgId N` → `offset = *(uint16*)(bmdBase + 0x1C + N*2)`
+
+We then update `TryWriteToBmd` to read offsets using those discovered constants, and the SKIPPED log lines turn into successful writes.
+6. The game's renderer re-reads from the same address next frame → shows new text
+
+---
+
+## Chapter 53: Deferred Pointer Capture — Why "Not Yet Populated" Isn't the Same as "Doesn't Exist"
+
+### The Bug in One Sentence
+
+Our hook fires when the BF interpreter *advances the PC*. The game's C++ dialogue system populates `session+0xD0` (the message descriptor pointer) slightly *later*, when the renderer actually constructs the speech bubble. These are two separate code paths, and ours runs first.
+
+### Why This Happens
+
+The BF virtual machine and the rendering layer are **decoupled**. The BF interpreter runs ahead — it steps through opcodes, encounters a "SHOW MESSAGE" instruction, calls into the C++ dialogue manager, and then *blocks waiting for player input*. But that blocking happens at the C++ level, not at the BF level. Our poll loop samples the BF PC while the C++ layer is still in the middle of its own setup.
+
+Timeline:
+```
+t=0ms   BF interpreter hits SHOW_MSG opcode at pc=0x8B1
+t=0ms   ProbeBfLine fires (PC changed), starts 3-streak countdown
+t+~1s   3rd streak confirms: ProbeBfLine reads session+0xD0 → ZERO (not yet set)
+t+1.5s  C++ dialogue manager allocates text buffer, writes ptr to session+0xD0
+t+5s    LLM inference completes — TryWriteToBmd runs
+```
+
+On warm subsequent messages, the C++ setup happens faster (memory already allocated and reused), so the 3-streak window (≈1s at 500ms poll) overlaps with a populated +0xD0. On the very first message of a session (cold path), the allocation happens after our confirmation window closes.
+
+### The Fix: Poll-Loop Lazy Retry
+
+Instead of treating the captured-at-confirmation value as final, treat it as a *best-effort snapshot*. The poll loop runs every 500ms for the entire session. If we have a confirmed `_currentMsgId` but `_currentMsgTextAddr` is still 0, we re-probe `session+0xD0` every tick until it fills in.
+
+```
+Every 500ms tick:
+  if _currentMsgId != 0 AND _currentMsgTextAddr == 0:
+      attempt TryReadTextAddr(_capturedSession)
+      if non-zero: store it, log "[MSG] TextAddr recovered"
+```
+
+By the time the LLM inference returns (3–30 seconds), the game has had 6–60 additional ticks to populate the field. The lazy write in `TryWriteToBmd` is a final safety net for the case where the recovery tick fires just before the LLM response arrives.
+
+### Session Struct Dumps: The Debugging Tool
+
+When `textAddr == 0` after confirmation, we dump all pointer-shaped values (≥ `HeapLow = 0x4000000000`) in the readable portion of the session struct. This shows which offsets ARE populated and point into the game's heap — letting us locate the descriptor via exploration rather than just trial-and-error at fixed offsets.
+
+```
+[MSG] SessPointers: +0x18→0x61B7F5F8  (skip: below HeapLow)
+[MSG] SessPointers: +0x40→0x420A8B3C10  ← candidate
+[MSG] SessPointers: +0x58→0x41DCE9A000  ← candidate
+```
+
+Any pointer ≥ 0x4000000000 is heap-allocated dialogue data. We can dereference each one and look for text or for the descriptor layout (zeros + two heap pointers at +0x18/+0x20).
+
+### Why First-Message vs. Later-Message Timing Differs
+
+| Condition | C++ dialogue setup time | Our 3-streak window | Result |
+|---|---|---|---|
+| First message (cold path) | ~1.5s (allocates heap buffer) | 0–1s after PC change | Miss |
+| Later messages (warm path) | ~50ms (reuses existing buffer) | 0–1s after PC change | Hit |
+
+The poll-loop retry collapses this distinction: both paths converge to "populated within 2–3 ticks," which is well inside the LLM's inference window.
+
+---
+
+## Chapter 54: C++ Polymorphic Session Types and Adaptive Pointer Scanning
+
+### The Problem: Fixed Offsets Break Across Subclasses
+
+P5R's dialogue session is a C++ object. Like most game engine objects, it uses inheritance — the base class stores common fields (BF script base, PC, confidant data), and subclasses add dialogue-specific fields at higher offsets. The problem: **two runs of the same scene can land on different subclasses**.
+
+Why? Because the game reuses a pool of session objects. The previous run left a "full" session (which had +0xD0 populated) at address 0x424D8E1190. This run got a "lite" session at 0x4250321640 that ends or has a null pointer at +0xD0. Same scene, different C++ type from the pool.
+
+The `SessPointers` output shows this clearly — the current run has no pointer-shaped value at +0xD0, but does have a stable external heap pointer at +0x90.
+
+### The Fix: Adaptive Scan Instead of Fixed Offset
+
+Instead of hardcoding `session+0xD0`, we scan ALL pointer-sized slots in the readable portion of the session struct and test each external heap pointer as a potential descriptor:
+
+```
+For each offset in [0x00, 0xC8) step 8:
+    ptr = session[offset]
+    if ptr is external heap (≥ 0x4000000000) and not self-referential:
+        candidate = FollowTextObjChain(ptr)
+        if candidate != 0: return it
+```
+
+`FollowTextObjChain` applies the known 3-hop pattern:
+```
+descriptor → descriptor+0x18 → textObj → *(textObj) → charPtr
+```
+
+Only returns non-zero if every link is non-null, readable, and the final charPtr is in heap range. This is safe — a false positive (accidentally valid chain) is checked at write time by `IsWritable`.
+
+### Why the Scan Is Safe
+
+The scan doesn't write anything — it only reads. If a random pointer accidentally passes all three chain checks, the worst case is a spurious `[MSG] TextAddr recovered` log. The write gate (`IsWritable`) prevents actual corruption. And in practice, pointer chains with 4 valid heap dereferences are very rare by accident.
+
+### Boundary-Scan Logging
+
+We also add a targeted dump of session[0xB8..0xE0] — one 8-byte slot at a time, checking each independently — to show exactly which offsets are readable and what values they hold. This lets us see the exact VirtualQuery boundary and understand WHY +0xD0 fails even when +0xC0 passes.
+
+```
+[MSG] sess+0xB8: R 0x42503215A0
+[MSG] sess+0xC0: R 0x0000000000000000
+[MSG] sess+0xC8: F                     ← boundary here
+[MSG] sess+0xD0: F
+```
+
+If +0xC8 is the first unreadable slot, the struct is exactly 0xC8 bytes. If +0xD0 is unreadable but +0xC8 is readable-but-null, the struct exists but hasn't been populated yet at that offset.
+
+---
+
+## Chapter 55: Memory-Mapped Files vs. Heap — Two Totally Different Pointer Ranges
+
+### What We Missed
+
+We assumed dialogue text lives on the game heap (> 256 GB / `0x4000000000`). That was true for one type of session object. But `session+0xD0 = 0x610A3768` — that's in the **memory-mapped file region** (all `0x61...` addresses), the same range as `bfBase`. This is where P5R maps BMD dialogue files directly off disk into process memory via `MapViewOfFile`.
+
+### Memory-Mapped Files in Windows
+
+`MapViewOfFile` maps a file into the process address space. The OS picks an address in user space — typically in the 1–4 GB range for 32-bit compatible mappings, or wherever VirtualAlloc finds space. P5R uses `0x61...` for most of its game data files.
+
+Protection is `PAGE_READONLY` (0x02) by default — the CPU MMU enforces this; any write triggers an access violation. To write to a mapped region without modifying the file on disk, call `VirtualProtect` with `PAGE_WRITECOPY` (0x08). The OS switches that page to copy-on-write: your process gets a private writable copy, the on-disk file is untouched.
+
+### The False Positive Bug
+
+`0x65007300610062` decoded as UTF-16 LE is "base" — a fragment of a shader filename. It sneaked through because our `charPtr >= HeapLow` check only has a **lower** bound (256 GB) but no **upper** bound. Valid Windows user-mode addresses cap at `0x7FFFFFFFFFFF` (48-bit VA space, 128 TB). Any value above that is data being misread as a pointer. Adding `charPtr <= 0x7FFFFFFFFFFF` rejects all such garbage.
+
+### The Fix: Three-Path Text Discovery
+
+```
+Path A (primary heap path):
+  session+0xD0 → descriptor (heap) → descriptor+0x18 → textObj → *(textObj) → charPtr
+
+Path B (direct mapped-file path):  ← NEW
+  session+0xD0 → value < HeapLow → bytes there look like English? → return it directly
+
+Path C (fallback heap scan):
+  scan session[0x00..0xC8) for external heap ptrs (with 48-bit cap) → follow chain
+```
+
+Path B handles the mapped-file case. If `*(session+0xD0)` is in low memory (`0x1000 < val < HeapLow`) and the bytes at that address contain ≥8 printable ASCII chars with ≥1 space, we treat it as the dialogue text directly.
+
+### Writing to a Mapped Page
+
+If textAddr < HeapLow (mapped file), `IsWritable` returns false (it's PAGE_READONLY). Before writing, call:
+```csharp
+VirtualProtect(textAddr, MaxWrite, PAGE_WRITECOPY, out oldProtect)
+```
+This makes the page copy-on-write. The write succeeds. The game's renderer, reading from this address, now sees our patched text instead of the original. No file on disk is modified.
+
+---
+
+## Chapter 56: Abandoning Pointer Chains — Content-Based Memory Discovery
+
+### Why Pointer Chains Failed
+
+The session struct has at least three C++ subclass variants in the wild. Each has the dialogue text pointer at a different offset, or not at all. Every fix for one variant breaks another. The session address itself can be in totally different memory regions (2GB vs 256TB) depending on game state. This is the wrong anchor.
+
+### The Right Anchor: bfBase
+
+`bfBase` is found reliably every single run via the large-copy hook. It's always in the `0x61...–0x62...` range (memory-mapped game data files). The dialogue BMD file for this scene is in the same mapped-file region — P5R loads paired `.bf` and `.bmd` assets from the same PAK archive, so they live close together in the virtual address space.
+
+### Strategy 1: bfBase-Vicinity Scan for Dialogue Strings
+
+Scan a ±512KB window around `bfBase` page-by-page. For each committed readable page, skip the first 0x100 bytes (possible binary header) and count null-terminated ASCII strings that have ≥2 spaces and ≥10 printable chars. A BMD file's string section will have many such strings (one per dialogue line). The first page that accumulates ≥5 such strings is the dialogue text pool.
+
+Once found, we cache it as `_bmdTextPool`. We write the LLM text there using `VirtualProtect(PAGE_WRITECOPY)`, overwriting the original dialogue bytes in the game's private copy of the mapped page.
+
+### Strategy 2: Cross-Region MemcpyText
+
+The current MemcpyText hook drops any copy where `src < HeapLow`. But dialogue text flows FROM the mapped BMD file (src ≈ 0x61...) TO the render pipeline buffer (dst anywhere). Dropping the HeapLow restriction and filtering by spaces instead of vowels catches exactly this transfer — giving us the render buffer destination address directly.
+
+### Why Both Strategies Together
+
+- Strategy 1 finds the source (the BMD string pool, writable via WRITECOPY)
+- Strategy 2 finds the destination (the render buffer the GPU reads from)
+
+Whichever fires first tells us the correct write target. Both bypass the session struct entirely.
+
+---
+
+## Chapter 57: Synchronous Inline Interception — The Right Architecture
+
+### Why Async Write Was Always Wrong
+
+Every previous attempt wrote the LLM text AFTER the LLM responded (3–30 seconds later). By then the game had already rendered the original text and the player was reading it. Even if we found the exact right memory address, the write was too late.
+
+### The Right Model: Hook the Copy, Own the Buffer
+
+The game's text pipeline is:
+```
+BMD file (mapped memory) → memcpy → render buffer → GPU → screen
+```
+
+Our memcpy hook fires DURING that copy, on the game thread, before the frame is drawn. If we overwrite the render buffer (`dst`) immediately after the copy completes, the GPU sees our text instead of the original.
+
+```csharp
+// Game copies: BMD → dst (render buffer)
+_memcpyHook!.OriginalFunction(dst, src, count);  // original text is in dst now
+// We immediately overwrite:
+MemoryCopy(cachedLlmText, dst, count, writeLen);  // our text is in dst now
+// Frame renders → player sees our text
+```
+
+### Cache Strategy
+
+LLM inference takes 3–30 seconds. We can't do it synchronously on the game thread. Instead:
+- When a msgId is confirmed, fire the LLM call async as before
+- When it responds, store the result in `_lastLlmText`
+- The inline memcpy interceptor uses `_lastLlmText` to overwrite any subsequent dialogue copy
+
+Result:
+- Message 1: original text (LLM warming up)  
+- Message 2+: LLM text (cache hit, instant inline write)
+
+This is the correct beta architecture. The LLM "looks ahead" one message, which is imperceptible in normal play.
+
+---
+
+## Chapter 58: Writing the Pool, Not the Pointer
+
+### What the memcpy log ruled out
+
+Chapter 57's inline interception assumed dialogue text flows through the hooked
+`memcpy`. The log disproved it. Every capture with `sp>=2` looked like this:
+
+```
+[MemcpyText] src=0x134C6E8F0 dst=0x418F0BFE00 n=192 sp=3: "·S·D(5·D········$··D···D·······"
+```
+
+Those `·D` pairs are the high bytes of `0x...44......` heap pointers — this is an
+array of pointer structs, not a sentence. The space characters that passed the
+`sp>=2` filter were coincidental `0x20` bytes inside binary fields.
+
+Conclusion: P5R's text renderer does not bulk-copy dialogue. It walks the BMD
+glyph-by-glyph, dereferencing directly. There is no copy to intercept.
+
+### The remaining lever: mutate the source
+
+If the renderer reads the BMD in place, then the BMD *is* the render buffer. We
+don't need to find the render target — we need to edit the source before it's read.
+
+### Two properties that make this safe
+
+**1. Write within the original length.** Each entry is null-terminated and the
+BMD's offset table stores absolute byte offsets to each entry. If we write a
+shorter string and re-terminate in place, every offset in that table still points
+where it did. Overrun the original length and we'd clobber the next entry's first
+bytes, desynchronizing the table.
+
+```csharp
+int wl = Math.Min(enc.Length, len - 1);   // len - 1 leaves room for the terminator
+System.Buffer.MemoryCopy(src, p + off, len, wl);
+p[off + wl] = 0;
+```
+
+**2. Capture slot lengths once, before the first write.** This is the subtle one.
+If we re-measured entry lengths on each write pass, the second pass would measure
+the *shortened* string we just wrote:
+
+```
+original:  "So what do you want to do today?"   len = 32
+write #1:  "Hey there."                          len becomes 10
+write #2:  measures 10, can only write 9 bytes
+write #3:  measures 9, can only write 8 bytes ...
+```
+
+The usable space ratchets down to nothing. `CapturePoolSlots` snapshots
+`(offset, length)` at discovery time and every later write measures against those
+originals.
+
+### PAGE_WRITECOPY and why the .bmd on disk is safe
+
+BMD files are memory-mapped `PAGE_READONLY`. `VirtualProtect(..., PAGE_WRITECOPY)`
+flips the page to copy-on-write: the first write triggers the OS to allocate a
+private physical page, copy the contents, and point our process's page table entry
+at the copy. Every subsequent read in this process sees our text; the file on disk
+and every other mapping of it are untouched. This is the same mechanism that backs
+`fork()` semantics and DLL relocation.
+
+### Known limitation
+
+Every dialogue-looking slot in the pool gets the same text, so a scene will repeat
+one line. That is intentional for now — it proves the write reaches the renderer.
+Targeting the single entry for the current `msgId` requires parsing the BMD offset
+table, which is the next step once we have visual confirmation.
+
+---
+
+## Chapter 59: Stop Guessing From Content — Parse the Format
+
+### What the ranked scan actually proved
+
+Chapter 58's prose detector worked exactly as designed. It found real English:
+
+```
+cand#0 score=60: "The highest quality shoes! | Are you prepared if disaster strikes!?"
+cand#1 score=43: "Changed Shido's heart | Started Maruki's Palace"
+cand#2 score=32: "Which Persona will it be? | Select the base Persona."
+```
+
+Shoe shop ads, the journal, the Velvet Room fusion menu. All genuine game text,
+none of it from the scene on screen. The detector answered "is this English?"
+correctly and that turned out to be the wrong question — the address space holds
+dozens of loaded message files and prose-likeness cannot distinguish them.
+
+A heuristic that is working correctly and still gives you the wrong answer is a
+sign the question is wrong, not the thresholds.
+
+### The format has an answer built in
+
+Atlus message files carry a `MSG1` magic and a 32-byte header:
+
+```
++0x00  fileType(1)  format(1)  userId(2)
++0x04  fileSize(4)
++0x08  magic "MSG1"          <- the searchable anchor
++0x0C  extSize(4)
++0x10  relocationTable(4)   +0x14 relocationTableSize(4)
++0x18  messageCount(4)
++0x1C  isRelocated(2)  version(2)
+```
+
+The magic sits at +0x08, so a hit implies the header began 8 bytes earlier. That
+one subtraction converts a byte-pattern match into a structured record: declared
+file size, message count, and a validity check (`0x40 <= fileSize <= 4MB`,
+`0 < messageCount <= 20000`) that binary noise essentially cannot pass by accident.
+
+### Why bfBase is the right anchor
+
+In P5R the message script is normally *embedded inside* the `.bf` flowscript rather
+than shipped as a separate file. The script and its dialogue are one archive entry.
+So the first valid `MSG1` header at or after `bfBase` is this scene's dialogue —
+not the shoe shop's. `bfBase` is the one address this project resolves reliably on
+every single run, which makes it the right thing to anchor to.
+
+### Walking regions instead of probing pages
+
+Scanning 5 MB by probing each 4 KB page costs ~1280 `VirtualQuery` syscalls. Walking
+regions costs a handful:
+
+```csharp
+var (ok, regionBase, regionSize, state, protect) = MemoryGuard.QueryRegion(addr);
+// ... scan this region if committed ...
+addr = regionBase + regionSize;   // jump the whole region, mapped or not
+```
+
+`VirtualQuery` reports the extent of the *entire* run of pages sharing a state, so
+one call skips an unmapped span of any size. Region walking is the general pattern
+for "search a wide address range" — page probing is for "is this one pointer safe."
+
+### ReadableLen: never trust a declared size
+
+The header's `fileSize` describes the file on disk. Its tail pages may not be
+resident in memory. Reading the declared length would fault, so the length is
+resolved down in page steps until it is actually readable, and the scan uses that.
+Declared sizes are a claim about the format; `VirtualQuery` is the truth about
+this process.
+
+---
+
+## Chapter 60: The Encoding Was the Blind Spot
+
+### What 21 valid message files actually told us
+
+The MSG1 scan worked perfectly and every file scored well:
+
+```
+msgs=696  score=1188: "ARestores 20 HP to one ally. | AA new drug develop"
+msgs=1050 score=856:  "ALight Fire dmg to | one foe. Chance of"
+msgs=464  score=2081: "AThe greatest angel | legend. He is known"
+```
+
+Weapons, clothes, healing items, skills, Persona lore. Every one of the 21 files
+is a *global data table*. None is scene dialogue. The entry dump made it explicit:
+
+```
+[MSG1] entry[709] kind=0 offset=0xCBE4
+[MSG1] fileBase+off: "ABLANK·····skill_268···"
+```
+
+Message 709 is named `skill_268`. The `msgId` extracted from the BF instruction
+window indexes skills in that file, not conversation lines. Selecting the file by
+`msgCount > msgId` was therefore selecting on a coincidence — any table with
+enough rows would have matched.
+
+### The line that reframed everything
+
+The session's message object dumped this:
+
+```
+52 00 4F 00 52 00 00 00     ->  "R\0O\0R\0"
+```
+
+That is UTF-16LE. Every scanner written for this project so far — `LooksLikeText`,
+`ProbeForBfContent`, `IsEnglishSentence`, `CountEnglishSentences` — reads one byte
+per character. Against UTF-16 they do not merely score badly, they are
+*structurally incapable* of producing a hit:
+
+```
+UTF-16 "Hello":  48 00 65 00 6C 00 6C 00 6F 00
+ASCII run walk:  ^^ run ends here (0x00 is not printable)
+```
+
+Every run is exactly one character long, so `len < 12` rejects all of them. A
+UTF-16 dialogue buffer would look like empty space to all of this code. The text
+may have been sitting in a scanned region the whole time.
+
+The general lesson: when a detector finds nothing anywhere, suspect the
+representation before tuning the thresholds. Thresholds produce weak signals;
+a wrong representation produces exactly zero, which is what we kept seeing.
+
+### Reusing the test across encodings
+
+Rather than write the ratio test twice, decode first and share one predicate:
+
+```csharp
+IsEnglishString(string s)   // the ratio test, encoding-agnostic
+IsEnglishSentence(byte*, n) // ASCII: bytes are already characters
+FindUtf16English(...)       // decode even bytes, then IsEnglishString
+```
+
+The UTF-16 scan keys on the pattern "printable in even byte, 0x00 in odd byte",
+accumulates the run, then hands the decoded string to the same predicate.
+
+### session+0xC8 is the real handle
+
+Also new this run: `session+0xC8 = 0x41D6D21780`, a live heap object with a vtable
+at +0x00, and `session+0xD0 = 0x175E` — far too small for a pointer, so an offset
+or index. That object is the game's own handle on the displayed message, populated
+exactly while a message is on screen. Following it beats guessing at pool
+addresses, which is what `ProbeMessageObject` now does — dumping every heap pointer
+it holds and testing each target as both ASCII and UTF-16.
+
+---
+
+## Chapter 61: TOCTOU, and Why the Scan Killed the Game
+
+### The crash
+
+```
+Fatal error. System.AccessViolationException: Attempted to read or write protected memory.
+   at P5RGenSocialLinks.Mod.FindAsciiEnglish(UIntPtr, Int32, Int32)
+   at P5RGenSocialLinks.Mod.TryFindHeapDialoguePool()
+```
+
+The scan validated a region and then read it:
+
+```csharp
+if (MemoryGuard.IsReadable(regionBase, len))     // check
+    foreach (var hit in FindAsciiEnglish(regionBase, len, 8192))  // ...then use
+```
+
+That is a textbook time-of-check/time-of-use race. `IsReadable` is a single
+`VirtualQuery` describing the address space *at that instant*. The walk that follows
+covers up to 8 MB and takes real time, on a background poll thread, while the game's
+own threads continue allocating and freeing heap. Somewhere mid-scan the region was
+unmapped and the next dereference hit unmapped memory.
+
+The window scaled with exactly the thing that had been increased to improve coverage:
+larger regions meant longer scans meant a wider window to lose the memory.
+
+### Why this one is fatal rather than catchable
+
+`AccessViolationException` is a *corrupted-state exception*. Since .NET Core, it
+cannot be caught at all — not by `catch (Exception)`, not by
+`catch (AccessViolationException)`. The legacy
+`<LegacyCorruptedStateExceptionsPolicy>` escape hatch does not exist on modern
+runtimes. The process dies, taking the game with it.
+
+So this cannot be handled defensively after the fact. It has to be made impossible.
+
+### The fix: copy instead of dereference
+
+```csharp
+internal static bool TryRead(nuint addr, byte[] buffer, int len)
+    => ReadProcessMemory(GetCurrentProcess(), addr, buffer, (nuint)len, out var got)
+       && (int)got == len;
+```
+
+`ReadProcessMemory` against the current process performs the same validation the
+CPU would, but reports failure through a return value instead of a fault. If the
+region vanished, the call returns `false` and the scan skips that chunk.
+
+Reading 256 KB at a time is a deliberate balance: small enough that a chunk copy is
+effectively atomic against the game's allocator, large enough that scanning 2 GB
+costs roughly 8000 syscalls rather than millions.
+
+### The general rule
+
+Tightening the check does not fix a TOCTOU race — it only narrows the window.
+Checking every 4 KB instead of every 8 MB would have made the crash rarer and
+therefore harder to diagnose, not absent. The race is only eliminated by making the
+check and the use the *same operation*, which is precisely what `ReadProcessMemory`
+does: validation and copy happen together inside one kernel call.
+
+A corollary worth carrying: raw pointer walks over another subsystem's live memory
+are safe only for small, immediate reads. Anything that scans in bulk should copy
+first and parse the copy.

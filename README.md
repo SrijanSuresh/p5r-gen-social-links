@@ -96,12 +96,35 @@ Switched backend from auto-gptq to llama-cpp-python. Wired real Llama-3.1-8B-Ins
 - CI: GitHub Actions runs Python tests + .NET build on every push
 
 ### 🔄 Phase 3 — Dialogue write-back *(in progress)*
-The LLM response currently logs to the Reloaded-II console. Write-back — making it appear on screen — requires locating the pointer from the session struct to the pre-loaded script text pool. Cheat Engine found the pool at `~0x41DE9104BA`; Ghidra analysis needed to find the stable pointer chain.
 
-**What we know so far:**
-- Script text pool is pre-loaded at hang-out start (all lines in one contiguous heap block)
-- Line counter at `0x006FFC28`, written by `mov [rcx+18],eax` in a system DLL
-- `DialogueWriter.cs` is stubbed and ready — needs `bufferPtr` from the pointer chain
+#### 🏆 Milestone: mod-generated text rendered in-game, unaided
+
+The mod locates the dialogue buffer on its own at runtime and writes to it. Generated text renders in Ryuji's speech bubble, drawn by the game's own renderer, with no external tooling involved:
+
+> **Ryuji** — *"[MOCK rank 4] Dude, you're seriously the onl"*
+
+This closes the central open question of the project. The full path is confirmed: the mod finds the pool, writes to it, and the renderer picks it up — pipeline output reaching the screen without a debugger attached.
+
+An earlier checkpoint proved the mechanism by hand, freezing a Cheat Engine value to display `"Here we are... LLM WAS HERE!!!"`. The step above is the same result produced by the mod itself.
+
+**What the hunt established:**
+
+| Finding | Detail |
+|---|---|
+| Encoding | **ASCII**, single-byte — not UTF-16 |
+| Location | **Heap** (`0x41DD7F6389`, `0x42102CAAA9`) — not the mapped BMD file region |
+| Buffers | Two hold the live line; both accept writes |
+| Delivery | Renderer reads the buffer **in place** — the text is never `memcpy`'d, so there is no copy to intercept |
+
+Both facts in the first two rows were needed together, and searching either dimension alone finds nothing. Automated scans covered ASCII in the mapped-file region and UTF-16 in the heap, and so missed the text repeatedly; the address was ultimately pinned by a Cheat Engine string scan against the line visible on screen. Chapters 53–60 of `learning.md` document each wrong assumption and how it was ruled out.
+
+**How the pool is currently located:** heap regions between `0x4100000000` and `0x4400000000` are walked via `VirtualQuery`, copied through `ReadProcessMemory` (a direct pointer walk races the game's allocator and faults fatally — see `learning.md` Ch. 61), and scored by `DialogueScore`, which weights sentence punctuation and second-person address. Every scored region is armed, not just the highest — the scene's own dialogue consistently ranked below a top-8 cutoff and was discarded before the write.
+
+**Remaining for the phase:**
+
+- **Narrow the write target.** Writing all armed regions is a confirmation strategy, not a shipping one: it overwrites unrelated game text and depends on the scene ranking inside the cap. Identifying which region rendered lets the rest be dropped.
+- **Target the current line.** Every slot receives the same string, so all lines in a scene read alike. Lines are laid out sequentially in one allocation, so the live line is reachable by offset.
+- **Hook the accessing instruction.** The buffer address changes every launch, but the instruction that reads it sits at a fixed module offset. Hooking it yields the pointer directly and removes the scan entirely.
 
 ### ⏳ Phase 4 — Per-line contextual generation
 Use the `LineCounterMonitor` trigger and `SessionHistory` rolling buffer to generate dialogue that responds to the specific line the player just read — not just the hang-out metadata. Requires knowing which line index maps to which text entry in the script pool.

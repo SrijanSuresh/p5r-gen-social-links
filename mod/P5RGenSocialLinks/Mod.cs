@@ -72,6 +72,69 @@ public class Mod : IModV1
     private nuint  _bfBufferBase;
     private int    _bfBufferOff;   // session struct offset where we found it (for logging)
 
+    // BMD text pool: the first page in the ±512KB bfBase vicinity that has ≥5 English
+    // dialogue strings (null-terminated, ≥2 spaces, ≥10 printable chars). Found once
+    // per session after bfBase is confirmed; written via VirtualProtect(PAGE_WRITECOPY).
+    private nuint _bmdTextPool;
+    private bool  _bmdScanDoneV2;
+    private int   _bmdScanAttempts;
+
+    // (offset, original length) of every dialogue-looking string in _bmdTextPool.
+    // Captured once at discovery, BEFORE any write — see CapturePoolSlots for why.
+    private (int Off, int Len)[]? _poolSlots;
+
+    // Byte length of the pool region — the MSG1 file size when found via magic,
+    // otherwise a single page. Used to size the VirtualProtect call.
+    private int _bmdPoolLen = 0x1000;
+
+    // The MSG1 files reachable from bfBase are all global item/skill tables, so the pool
+    // write is now a one-shot probe of the write path rather than a per-message action:
+    // if skill descriptions in-game show the mock text, write→render is proven.
+    private bool _poolWriteDone;
+
+    // True when the pool is the heap dialogue allocation rather than a mapped MSG1 file.
+    // The heap pool is the correct target, so it is rewritten on every message; the
+    // one-shot guard applies only to the MSG1 item tables.
+    private bool _poolIsHeap;
+
+    // Every high-scoring heap region, not just the winner. Ranking by content picked a
+    // shader block first and, once fixed, still would not have found the live scene: the
+    // confirmed address 0x41DD7F6389 fell outside every region the scan surfaced. Writing
+    // to all strong candidates removes the need to guess correctly on the first try.
+    private readonly System.Collections.Generic.List<(nuint Base, int Len, (int Off, int Len)[] Slots)>
+        _heapPools = new();
+
+    // UTF-16 hunt state. _utf16CpyLogged caps the memcpy log; the sweep cursor lets a
+    // multi-GB heap scan resume across ticks instead of stalling one.
+    private int   _utf16CpyLogged;
+    private nuint _heapSweepCursor;
+    private int   _utf16SweepHits;
+    private bool  _heapSweepDone;
+
+    // Every game object pointer observed so far lands in 0x42xxxxxxxx, while the linear
+    // sweep starts at HeapLow (0x4000000000) and spends whole sessions crawling through
+    // DirectInput and font data around 0x4188xxxxxx without ever reaching game memory.
+    // Confirmed dialogue addresses were 0x41DD7F6389 and 0x42102CAAA9, so the sweep must
+    // start below 0x42 — the system-string filter handles the DirectInput and font data
+    // that sits around 0x4188xxxxxx.
+    private static readonly nuint GameHeapStart = unchecked((nuint)0x4100000000UL);
+
+    // Upper bound for the scan. Without one the walk continued into 0x7FF... DLL space and
+    // scored the CLR's own resource strings ("Cannot create an abstract class."), which
+    // wasted the region budget and armed writes against runtime memory that cannot hold
+    // dialogue and must not be modified.
+    private static readonly nuint GameHeapEnd = unchecked((nuint)0x4400000000UL);
+
+    // Pointers harvested from the per-message D0 array — swept before the linear scan,
+    // since they point at objects the game is using for the message on screen right now.
+    private readonly System.Collections.Generic.List<nuint> _sweepSeeds = new();
+    private readonly object _seedLock = new();
+
+    // Most recent LLM response. Written on the async LLM thread; read volatilely on the
+    // game thread inside OnGameMemcpy so no lock is needed (reference read/write is
+    // atomic on x64, and we only need eventual visibility, not strict ordering).
+    private volatile string? _lastLlmText;
+
     // Large-copy log: OnGameMemcpy records the dst of every heap-to-heap copy
     // ≥ 500 bytes. TryFindBfBuffer probes these at session start to locate the
     // BF script buffer, which is loaded in one bulk copy before session detection.
@@ -160,6 +223,77 @@ public class Mod : IModV1
         return result;
     }
 
+    // Windows x64 user-mode addresses are capped at 128 TB (bit 47).
+    // Values above this are data misread as pointers — reject them.
+    private static readonly nuint UserAddrMax = unchecked((nuint)0x7FFFFFFFFFFFUL);
+
+    // Applies the 3-hop chain: descriptor → descriptor+0x18 → textObj → *(textObj) → charPtr.
+    // Final gate: charPtr must be in valid heap range AND look like English dialogue text.
+    private static unsafe nuint FollowTextObjChain(nuint descriptor)
+    {
+        if (!MemoryGuard.IsReadable(descriptor + 0x18, 8)) return 0;
+        nuint textObj = *(nuint*)(descriptor + 0x18);
+        if (textObj == 0 || !MemoryGuard.IsReadable(textObj, 8)) return 0;
+        nuint charPtr = *(nuint*)textObj;
+        if (charPtr < HeapLow || charPtr > UserAddrMax) return 0;
+        return LooksLikeText(charPtr) ? charPtr : 0;
+    }
+
+    // Returns true if ≥8 printable ASCII bytes and ≥1 space in first 48 bytes — looks
+    // like English dialogue rather than binary data, a filepath, or a null region.
+    private static unsafe bool LooksLikeText(nuint addr)
+    {
+        if (!MemoryGuard.IsReadable(addr, 48)) return false;
+        byte* p = (byte*)addr;
+        int printable = 0, spaces = 0;
+        for (int i = 0; i < 48 && p[i] != 0; i++)
+        {
+            if (p[i] >= 0x20 && p[i] <= 0x7E) { printable++; if (p[i] == ' ') spaces++; }
+        }
+        return printable >= 8 && spaces >= 1;
+    }
+
+    // Finds the actual character buffer. Tries three paths in order:
+    //   A) session+0xD0 → heap descriptor chain (4-hop)
+    //   B) session+0xD0 value is a direct mapped-file pointer (< HeapLow, looks like text)
+    //   C) Fallback heap scan of session[0x00..0xC8) — external ptrs probed as descriptors
+    private static unsafe nuint TryReadTextAddr(nuint session)
+    {
+        if (MemoryGuard.IsReadable(session + 0xD0, 8))
+        {
+            nuint d = *(nuint*)((byte*)session + 0xD0);
+            if (d != 0)
+            {
+                // Path A: d is a heap descriptor → follow chain
+                if (d >= HeapLow && d <= UserAddrMax)
+                {
+                    nuint cp = FollowTextObjChain(d);
+                    if (cp != 0) return cp;
+                }
+                // Path B: d is a mapped-file address → treat as direct text pointer
+                else if (d >= 0x1000 && d < HeapLow && LooksLikeText(d))
+                {
+                    return d;
+                }
+            }
+        }
+
+        // Path C: scan session[0x00..0x100) per slot for external heap pointers.
+        // Per-slot IsReadable handles VirtualQuery region boundaries — the bulk check
+        // fails at 0xC8 but individual slots at 0xD8/0xE0 can still be readable.
+        for (int off = 0; off < 0x100; off += 8)
+        {
+            nuint slotAddr = session + (nuint)off;
+            if (!MemoryGuard.IsReadable(slotAddr, 8)) continue;
+            nuint ptr = *(nuint*)(byte*)slotAddr;
+            if (ptr < HeapLow || ptr > UserAddrMax) continue;
+            if (ptr >= session && ptr < session + 0x1000) continue; // self-referential
+            nuint cp = FollowTextObjChain(ptr);
+            if (cp != 0) return cp;
+        }
+        return 0;
+    }
+
     private static unsafe string TryReadString(nuint addr)
     {
         if (addr < unchecked((nuint)0x1000000UL)) return "";
@@ -195,12 +329,8 @@ public class Mod : IModV1
     {
         _memcpyHook!.OriginalFunction(dst, src, count);
 
-        if (dst < HeapLow || src < HeapLow) return;
-
-        // Record all large heap-to-heap copy destinations. The BF scene script is
-        // loaded in one bulk copy (several KB) before session detection. We store
-        // the dst here and probe it for BF content when the session is first seen.
-        if (count >= 500 && count <= 500_000)
+        // Large-copy tracking: heap-to-heap only, for BF script discovery.
+        if (dst >= HeapLow && src >= HeapLow && count >= 500 && count <= 500_000)
         {
             lock (_largeCopyLock)
             {
@@ -209,26 +339,27 @@ public class Mod : IModV1
             }
         }
 
-        // Small-copy vowel filter: IEEE 754 float data (>?@ABCfwD…) has zero
-        // lowercase vowels. English dialogue always has ≥3.
-        if (count < 10 || count > 150) return;
+        // UTF-16 dialogue detection. The earlier ASCII probe concluded dialogue never
+        // flows through this function, but it could not have seen wide-char text at all —
+        // interleaved nulls end every ASCII run after one character. This retries that
+        // question with the right encoding.
+        //
+        // The prefilter reads 8 bytes and rejects nearly every copy the game makes, so
+        // the expensive scan runs only on plausible wide strings. That matters: this is
+        // one of the hottest functions in the process.
+        if (_utf16CpyLogged >= 40 || count < 16 || count > 800) return;
         if (!Memory.MemoryGuard.IsReadable(dst, (int)count)) return;
 
         byte* d = (byte*)dst;
-        int vowels = 0;
-        for (nuint i = 0; i < count; i++)
-        {
-            byte b = d[i];
-            if (b == 'a' || b == 'e' || b == 'i' || b == 'o' || b == 'u') vowels++;
-        }
-        if (vowels < 3) return;
+        if (d[1] != 0 || d[3] != 0 || d[5] != 0 || d[7] != 0)      return;
+        if (!IsPrintable(d[0]) || !IsPrintable(d[2]) ||
+            !IsPrintable(d[4]) || !IsPrintable(d[6]))              return;
 
-        var text = new System.Text.StringBuilder(160);
-        for (nuint i = 0; i < count && text.Length < 160; i++)
-            text.Append(d[i] >= 0x20 && d[i] <= 0x7E ? (char)d[i] : '·');
+        var wide = FindUtf16English(dst, (int)count, 1);
+        if (wide.Count == 0) return;
 
-        _modLog!.Info(
-            $"[MemcpyText] src=0x{src:X} dst=0x{dst:X} n={count} vowels={vowels}: \"{text}\"");
+        _utf16CpyLogged++;
+        _modLog!.Info($"[UTF16cpy] src=0x{src:X} dst=0x{dst:X} n={count}: \"{wide[0].Text}\"");
     }
 
     private void TryActivateHook()
@@ -317,6 +448,7 @@ public class Mod : IModV1
     private nuint  _confirmedBfBase; // real BF script base (session+0x18, memory-mapped <4 GB)
     private nuint  _bmdBase;         // BMD text table found by TryScanForBmd(); 0 until found
     private bool   _bmdScanDone;     // true after the one-shot scan fires this session
+    private nuint  _currentMsgTextAddr; // session+0xD0 snapshot at msgId confirmation — direct write target
 
     /// <summary>
     /// Runs every poll tick while in a session. Scans the first 1024 bytes of the
@@ -510,6 +642,1002 @@ public class Mod : IModV1
         _modLog!.Info($"[BFBuffer] SNAP-SELECTED sess+0x{bestOff:X3} → 0x{bestPtr:X} (strings={bestStrings})");
     }
 
+    // Scans ±512KB around bfBase for a page whose string content looks like dialogue.
+    // Skips the first 0x100 bytes of each candidate (binary header). Counts strings
+    // that are null-terminated, ≥10 printable ASCII chars, ≥2 spaces. Caches the
+    // first page with ≥5 such strings as _bmdTextPool.
+    private unsafe void TryScanBmdVicinity()
+    {
+        // Retry across ticks rather than one-shot: the BMD is mapped lazily and may not
+        // be resident the first time bfBase is confirmed. 20 ticks ≈ 10s at the default
+        // 500 ms interval, which comfortably covers the load.
+        if (_bmdTextPool != 0 || _bmdScanDoneV2) return;
+        if (++_bmdScanAttempts >= 20) _bmdScanDoneV2 = true;
+
+        nuint center = _confirmedBfBase != 0 ? _confirmedBfBase : _bfBufferBase;
+        if (center == 0) return;
+
+        // Preferred path: locate the message script by its MSG1 magic. Content
+        // heuristics alone cannot tell shop text from conversation — they scored the
+        // shoe-shop and Velvet Room files above the scene's own dialogue.
+        if (TryFindMessageScript(center)) return;
+
+        // ±8 MB. The previous ±512KB window only reached compressed texture data;
+        // the BMD for a conversation is mapped from the same archive as its BF but
+        // not necessarily adjacent to it.
+        const nuint window   = 0x800000;
+        const int   pageSize = 0x1000;
+        nuint start = center > window ? center - window : 0x10000;
+        nuint end   = center + window;
+
+        nuint bfPage = center & ~(nuint)0xFFF; // page holding the BF script — skip it
+
+        // Rank every page and take the best, rather than the first page over a
+        // threshold. First-hit locked onto DXT texture data whose 0x20 bytes read as
+        // spaces; the real dialogue page scores far higher under IsEnglishSentence.
+        var ranked = new System.Collections.Generic.List<(int Score, nuint Addr)>();
+
+        for (nuint addr = start; addr < end; addr += (nuint)pageSize)
+        {
+            if (addr == bfPage) continue;
+            if (!MemoryGuard.IsReadable(addr, pageSize)) continue;
+
+            int score = CountEnglishSentences((byte*)addr, pageSize);
+            if (score >= 3) ranked.Add((score, addr));
+        }
+
+        if (ranked.Count == 0)
+        {
+            if (_bmdScanDoneV2)
+                _modLog!.Info($"[BMD2] No English text page in 0x{start:X}–0x{end:X} after {_bmdScanAttempts} attempts");
+            return;
+        }
+
+        ranked.Sort((a, b) => b.Score.CompareTo(a.Score));
+
+        // Log the top few so a wrong pick is visible in the log instead of silent.
+        for (int i = 0; i < Math.Min(5, ranked.Count); i++)
+        {
+            (int sc, nuint pa) = ranked[i];
+            _modLog!.Info($"[BMD2] cand#{i} 0x{pa:X} score={sc}: \"{PreviewSentences(pa, pageSize, 90)}\"");
+        }
+
+        nuint best = ranked[0].Addr;
+        _bmdTextPool = best;
+        _bmdPoolLen  = pageSize;
+        _poolSlots   = CapturePoolSlots(best, pageSize);
+        _modLog!.Info($"[BMD2] TextPool SELECTED 0x{best:X} score={ranked[0].Score} slots={_poolSlots.Length}");
+
+        // If the LLM already answered while we were still hunting for the pool,
+        // apply that text now rather than waiting for the next message.
+        string? pending = _lastLlmText;
+        if (pending != null) WritePoolStrings(pending);
+    }
+
+    /// <summary>
+    /// Locates the Atlus MessageScript that belongs to the running BF by scanning for
+    /// the "MSG1" magic. In P5R the message script is normally embedded in the .bf
+    /// flowscript, so the first valid header at or after bfBase is this scene's dialogue.
+    ///
+    /// MessageScript binary header (32 bytes):
+    ///   +0x00 fileType(1) format(1) userId(2)
+    ///   +0x04 fileSize(4)
+    ///   +0x08 magic "MSG1"
+    ///   +0x0C extSize(4)
+    ///   +0x10 relocationTable(4)   +0x14 relocationTableSize(4)
+    ///   +0x18 messageCount(4)
+    ///   +0x1C isRelocated(2) version(2)
+    /// The magic sits at +0x08, so a hit implies a header start 8 bytes earlier.
+    /// </summary>
+    private unsafe bool TryFindMessageScript(nuint center)
+    {
+        const nuint back = 0x100000; // 1 MB before bfBase
+        const nuint fwd  = 0x400000; // 4 MB after — embedded MSG1 trails the BF code
+        nuint start = center > back ? center - back : 0x10000;
+        nuint end   = center + fwd;
+
+        var hits = new System.Collections.Generic.List<(nuint Base, uint Size, uint Count, int Score)>();
+
+        // Walk committed regions rather than probing every page: VirtualQuery skips
+        // whole unmapped spans in one call, so 5 MB costs a handful of syscalls.
+        nuint addr = start;
+        while (addr < end && hits.Count < 32)
+        {
+            var (ok, regionBase, regionSize, state, protect) = MemoryGuard.QueryRegion(addr);
+            if (!ok) break;
+            nuint regionEnd = regionBase + regionSize;
+            if (regionEnd <= addr) break;
+
+            const uint MEM_COMMIT = 0x1000, PAGE_NOACCESS = 0x01, PAGE_GUARD = 0x100;
+            bool usable = state == MEM_COMMIT
+                          && (protect & PAGE_NOACCESS) == 0
+                          && (protect & PAGE_GUARD) == 0;
+
+            if (usable)
+            {
+                nuint scanFrom = addr > regionBase ? addr : regionBase;
+                nuint scanTo   = regionEnd < end ? regionEnd : end;
+
+                for (nuint q = scanFrom; q + 4 < scanTo; q++)
+                {
+                    byte* m = (byte*)q;
+                    if (m[0] != (byte)'M' || m[1] != (byte)'S' ||
+                        m[2] != (byte)'G' || m[3] != (byte)'1') continue;
+                    if (q < 8) continue;
+
+                    nuint hdr = q - 8;
+                    if (!MemoryGuard.IsReadable(hdr, 0x20)) continue;
+
+                    uint fileSize = *(uint*)(hdr + 4);
+                    uint msgCount = *(uint*)(hdr + 0x18);
+                    if (fileSize < 0x40 || fileSize > 0x400000) continue;
+                    if (msgCount == 0 || msgCount > 20000)      continue;
+
+                    int usableLen = ReadableLen(hdr, (int)Math.Min(fileSize, 0x40000u));
+                    if (usableLen < 0x100) continue;
+
+                    int score = CountEnglishSentences((byte*)hdr, usableLen);
+                    hits.Add((hdr, fileSize, msgCount, score));
+
+                    // Only list files that could actually hold the live index — the full
+                    // 21-file listing is noise now that these are known to be the global
+                    // item/skill tables rather than scene dialogue.
+                    if (_cfg.StructDiffEnabled || _currentMsgId == 0 || msgCount > _currentMsgId)
+                        _modLog!.Info(
+                            $"[MSG1] 0x{hdr:X} size={fileSize} msgs={msgCount} score={score} " +
+                            $"{(hdr >= center ? "after" : "before")}bf: \"{PreviewSentences(hdr, usableLen, 80)}\"");
+                }
+            }
+            addr = regionEnd;
+        }
+
+        if (hits.Count == 0) return false;
+
+        // Selection is driven by messageCount, not proximity to bfBase. The running
+        // script indexes message 0x348 (840), so any file declaring fewer entries than
+        // that cannot be the one being read — in the observed run exactly one of 21
+        // files qualified. Among qualifying files take the tightest fit: the smallest
+        // count that still covers the index, since a scene script sized just past the
+        // messages it uses is far likelier than a huge global table.
+        (nuint Base, uint Size, uint Count, int Score) pick = default;
+        bool found = false;
+
+        if (_currentMsgId != 0)
+        {
+            foreach (var h in hits)
+            {
+                if (h.Count <= _currentMsgId || h.Score <= 0) continue;
+                if (!found || h.Count < pick.Count) { pick = h; found = true; }
+            }
+        }
+
+        // No msgId yet, or nothing covers it: fall back to the most English-dense file.
+        if (!found)
+            foreach (var h in hits)
+                if (h.Score > 0 && (!found || h.Score > pick.Score)) { pick = h; found = true; }
+
+        if (!found) return false;
+
+        _bmdPoolLen  = ReadableLen(pick.Base, (int)Math.Min(pick.Size, 0x40000u));
+        _bmdTextPool = pick.Base;
+        _poolSlots   = CapturePoolSlots(pick.Base, _bmdPoolLen);
+        _modLog!.Info(
+            $"[MSG1] SELECTED 0x{pick.Base:X} size={pick.Size} msgs={pick.Count} " +
+            $"slots={_poolSlots.Length} (msgId=0x{_currentMsgId:X})");
+
+        DumpMessageTableEntry(pick.Base, pick.Count, _bmdPoolLen);
+
+        string? pending = _lastLlmText;
+        if (pending != null) WritePoolStrings(pending);
+        return true;
+    }
+
+    /// <summary>
+    /// Dumps the message-table entry for the current msgId so the addressing convention
+    /// can be confirmed from a real run rather than assumed. The table follows the 32-byte
+    /// header as (kind:int, offset:int) pairs. What is not yet established is what the
+    /// offset is relative to — the file start or the end of the table — and whether the
+    /// loader has already relocated it to an absolute pointer (the header carries an
+    /// isRelocated flag at +0x1C). Both candidate bases are dumped for comparison.
+    /// </summary>
+    private unsafe void DumpMessageTableEntry(nuint fileBase, uint msgCount, int usableLen)
+    {
+        if (_currentMsgId == 0 || _currentMsgId >= msgCount) return;
+
+        nuint entry = fileBase + 0x20 + (nuint)(_currentMsgId * 8);
+        if (!MemoryGuard.IsReadable(entry, 8)) return;
+
+        uint kind   = *(uint*)entry;
+        uint offset = *(uint*)(entry + 4);
+        _modLog!.Info($"[MSG1] entry[{_currentMsgId}] kind={kind} offset=0x{offset:X}");
+
+        nuint tableEnd = fileBase + 0x20 + (nuint)(msgCount * 8);
+        DumpAt("fileBase+off", fileBase + offset, usableLen, fileBase);
+        DumpAt("tableEnd+off", tableEnd + offset, usableLen, fileBase);
+
+        void DumpAt(string label, nuint at, int limit, nuint origin)
+        {
+            if (at < origin || at - origin >= (nuint)limit) return;
+            if (!MemoryGuard.IsReadable(at, 64)) return;
+            byte* q = (byte*)at;
+            var sb = new System.Text.StringBuilder($"[MSG1] {label} 0x{at:X}: ");
+            for (int i = 0; i < 48; i++) sb.Append($"{q[i]:X2} ");
+            sb.Append(" \"");
+            for (int i = 0; i < 48; i++) sb.Append(IsPrintable(q[i]) ? (char)q[i] : '·');
+            sb.Append('"');
+            _modLog!.Info(sb.ToString());
+        }
+    }
+
+    /// <summary>
+    /// Largest length up to <paramref name="want"/> that is fully readable from
+    /// <paramref name="addr"/>, resolved in page steps. A mapped file's tail pages may
+    /// not be resident, so committing to the header's declared size would fail the read.
+    /// </summary>
+    private static int ReadableLen(nuint addr, int want)
+    {
+        const int page = 0x1000;
+        if (MemoryGuard.IsReadable(addr, want)) return want;
+        int len = 0;
+        while (len + page <= want && MemoryGuard.IsReadable(addr, len + page)) len += page;
+        return len;
+    }
+
+    /// <summary>
+    /// Same ratio test as <see cref="IsEnglishSentence"/> but over a decoded string, so
+    /// UTF-16 runs can reuse it without duplicating the pointer walk.
+    /// </summary>
+    private static bool IsEnglishString(string s)
+    {
+        if (s.Length < 10 || s.Length > 400) return false;
+        int letters = 0, lower = 0, vowels = 0, digits = 0, spaces = 0, other = 0;
+        foreach (char ch in s)
+        {
+            if (ch >= 'a' && ch <= 'z')      { letters++; lower++; if (IsVowel((byte)ch)) vowels++; }
+            else if (ch >= 'A' && ch <= 'Z') { letters++; if (IsVowel((byte)(ch | 0x20))) vowels++; }
+            else if (ch == ' ')              spaces++;
+            else if (ch >= '0' && ch <= '9') digits++;
+            else if (ch == '.' || ch == ',' || ch == '!' || ch == '?' || ch == '\'' ||
+                     ch == '"' || ch == '-' || ch == ':' || ch == ';') { }
+            else other++;
+        }
+        if (spaces < 1)                       return false;
+        if (letters * 100 < s.Length * 55)    return false;
+        if (lower   * 100 < letters * 40)     return false;
+        if (vowels  * 100 < letters * 25)     return false;
+        if (vowels  * 100 > letters * 60)     return false;
+        if (digits  * 100 > s.Length * 10)    return false;
+        if (other   * 100 > s.Length * 5)     return false;
+        return true;
+    }
+
+    /// <summary>
+    /// Finds UTF-16LE English runs — printable ASCII in even bytes, 0x00 in odd bytes.
+    /// The session's message object holds "52 00 4F 00 52 00" (UTF-16 "ROR"), so the
+    /// live dialogue is very likely wide-char. Every scanner before this was single-byte
+    /// and would step over UTF-16 text without ever seeing a candidate: the interleaved
+    /// nulls break each run after one character.
+    /// </summary>
+    private static unsafe System.Collections.Generic.List<(nuint Addr, string Text)>
+        FindUtf16English(nuint region, int byteLen, int maxHits)
+    {
+        var hits = new System.Collections.Generic.List<(nuint, string)>();
+        byte* p = (byte*)region;
+        int i = 0;
+
+        while (i + 1 < byteLen && hits.Count < maxHits)
+        {
+            if (!(IsPrintable(p[i]) && p[i + 1] == 0)) { i++; continue; }
+
+            int begin = i;
+            var sb = new System.Text.StringBuilder(64);
+            while (i + 1 < byteLen && IsPrintable(p[i]) && p[i + 1] == 0 && sb.Length < 400)
+            {
+                sb.Append((char)p[i]);
+                i += 2;
+            }
+            string s = sb.ToString();
+            if (IsEnglishString(s)) hits.Add((region + (nuint)begin, s));
+        }
+        return hits;
+    }
+
+    /// <summary>
+    /// ASCII counterpart to <see cref="FindUtf16English"/>. Cheat Engine located the live
+    /// dialogue at 0x41DD7F6389 and 0x42102CAAA9 as single-byte text — in the heap, not
+    /// the mapped BMD region. Both halves of that were already implemented and never
+    /// combined: the ASCII scanners only ever ran over the bfBase vicinity, and the heap
+    /// sweep only ever looked for wide chars.
+    /// </summary>
+    private static unsafe System.Collections.Generic.List<(nuint Addr, string Text)>
+        FindAsciiEnglish(nuint region, int byteLen, int maxHits)
+    {
+        var hits = new System.Collections.Generic.List<(nuint, string)>();
+        byte* p = (byte*)region;
+        int i = 0;
+
+        while (i < byteLen && hits.Count < maxHits)
+        {
+            while (i < byteLen && !IsPrintable(p[i])) i++;
+            int begin = i;
+            while (i < byteLen && IsPrintable(p[i])) i++;
+
+            int len = i - begin;
+            if (len < 10 || len > 400) continue;
+
+            var sb = new System.Text.StringBuilder(len);
+            for (int k = begin; k < i; k++) sb.Append((char)p[k]);
+            string s = sb.ToString();
+            if (IsEnglishString(s)) hits.Add((region + (nuint)begin, s));
+        }
+        return hits;
+    }
+
+    // Reusable scan buffer — the heap sweep reads hundreds of megabytes per pass and
+    // must not allocate a fresh array per chunk.
+    private const int ScanChunk = 0x40000; // 256 KB
+    private readonly byte[] _scanBuf = new byte[ScanChunk];
+
+    /// <summary>
+    /// Allocation-free approximation of the letter/lowercase/space ratios in
+    /// <see cref="IsEnglishString"/>. Deliberately looser — it only has to reject the
+    /// obvious non-prose cheaply so the real test runs on a small remainder.
+    /// </summary>
+    private static bool QuickEnglishBytes(byte[] buf, int begin, int len)
+    {
+        int letters = 0, lower = 0, spaces = 0;
+        int end = begin + len;
+        for (int i = begin; i < end; i++)
+        {
+            byte c = buf[i];
+            if      (c >= 'a' && c <= 'z') { letters++; lower++; }
+            else if (c >= 'A' && c <= 'Z') letters++;
+            else if (c == ' ')             spaces++;
+        }
+        return spaces >= 1
+               && letters * 100 >= len * 55
+               && lower   * 100 >= letters * 40;
+    }
+
+    /// <summary>
+    /// Buffer-based counterpart to <see cref="FindAsciiEnglish"/>. Operates on a copy made
+    /// by <see cref="MemoryGuard.TryRead"/> so a region freed mid-scan cannot fault.
+    /// </summary>
+    private static System.Collections.Generic.List<(nuint Addr, string Text)>
+        FindAsciiEnglishBuf(byte[] buf, int len, nuint baseAddr, int maxHits)
+    {
+        var hits = new System.Collections.Generic.List<(nuint, string)>();
+        int i = 0;
+
+        while (i < len && hits.Count < maxHits)
+        {
+            while (i < len && !IsPrintable(buf[i])) i++;
+            int begin = i;
+            while (i < len && IsPrintable(buf[i])) i++;
+
+            int slen = i - begin;
+            if (slen < 10 || slen > 400) continue;
+
+            // Byte-level pre-check before allocating. A full scan covers ~1.5 GB, and
+            // materialising a string for every printable run produced millions of
+            // allocations per pass — enough GC pressure to visibly stutter the game.
+            if (!QuickEnglishBytes(buf, begin, slen)) continue;
+
+            string s = System.Text.Encoding.ASCII.GetString(buf, begin, slen);
+            if (IsEnglishString(s)) hits.Add((baseAddr + (nuint)begin, s));
+        }
+        return hits;
+    }
+
+    /// <summary>
+    /// Captures (offset, length) slots across a region using buffered reads. Strings that
+    /// straddle a chunk boundary are dropped rather than stitched — at 256 KB chunks that
+    /// is a negligible fraction, and it keeps every read bounds-checked.
+    /// </summary>
+    private (int Off, int Len)[] CapturePoolSlotsSafe(nuint poolBase, int scanLen)
+    {
+        var slots = new System.Collections.Generic.List<(int, int)>();
+
+        for (int chunkOff = 0; chunkOff < scanLen && slots.Count < 20000; chunkOff += ScanChunk)
+        {
+            int want = Math.Min(ScanChunk, scanLen - chunkOff);
+            if (!MemoryGuard.TryRead(poolBase + (nuint)chunkOff, _scanBuf, want)) continue;
+
+            foreach (var (addr, text) in FindAsciiEnglishBuf(_scanBuf, want, poolBase + (nuint)chunkOff, 20000))
+            {
+                slots.Add(((int)(addr - poolBase), text.Length));
+                if (slots.Count >= 20000) break;
+            }
+        }
+        return slots.ToArray();
+    }
+
+    private static unsafe string AsciiPreview(nuint addr, int maxChars)
+    {
+        if (!MemoryGuard.IsReadable(addr, maxChars)) return "";
+        byte* p = (byte*)addr;
+        int begin = 0;
+        while (begin < maxChars && !IsPrintable(p[begin])) begin++;
+        int end = begin;
+        while (end < maxChars && IsPrintable(p[end])) end++;
+        if (end - begin < 8) return "";
+        var sb = new System.Text.StringBuilder(end - begin);
+        for (int i = begin; i < end; i++) sb.Append((char)p[i]);
+        return IsEnglishString(sb.ToString()) ? sb.ToString() : "";
+    }
+
+    /// <summary>
+    /// Follows the message object at session+0xC8 — populated exactly while a message is
+    /// on screen — dumping every heap pointer it holds and testing each target for both
+    /// ASCII and UTF-16 text, then sweeping the heap around the object itself for UTF-16
+    /// dialogue. This replaces guessing at pool addresses: the object is the game's own
+    /// handle on the live message.
+    /// </summary>
+    private unsafe void ProbeMessageObject(nuint session)
+    {
+        if (!MemoryGuard.IsReadable(session + 0xC8, 8)) return;
+        nuint obj = *(nuint*)(session + 0xC8);
+        if (obj < HeapLow || obj > UserAddrMax) return;
+        if (!MemoryGuard.IsReadable(obj, 0x100)) return;
+
+        byte* o = (byte*)obj;
+        for (int off = 0; off + 8 <= 0x100; off += 8)
+        {
+            nuint val = *(nuint*)(o + off);
+            if (val < HeapLow || val > UserAddrMax) continue;
+            if (!MemoryGuard.IsReadable(val, 256)) continue;
+
+            string ascii = AsciiPreview(val, 96);
+            var wide = FindUtf16English(val, 256, 2);
+            if (ascii.Length == 0 && wide.Count == 0) continue;
+
+            _modLog!.Info($"[OBJ] +0x{off:X2}→0x{val:X} ascii=\"{ascii}\" " +
+                          $"utf16=\"{(wide.Count > 0 ? wide[0].Text : "")}\"");
+        }
+
+        // Sweep ±64 KB around the object for UTF-16 English, page by page so an
+        // unmapped page in the middle does not abort the whole sweep.
+        const int win = 0x10000, page = 0x1000;
+        nuint from = obj > (nuint)win ? obj - win : obj;
+        int reported = 0;
+        for (nuint a = from; a < obj + win && reported < 8; a += page)
+        {
+            if (!MemoryGuard.IsReadable(a, page)) continue;
+            foreach (var (addr, text) in FindUtf16English(a, page, 4))
+            {
+                _modLog!.Info($"[UTF16] 0x{addr:X}: \"{text}\"");
+                if (++reported >= 8) break;
+            }
+        }
+        if (reported == 0)
+            _modLog!.Info($"[UTF16] none within ±64KB of msgObj 0x{obj:X}");
+    }
+
+    /// <summary>
+    /// Resumable UTF-16 sweep of the game heap, independent of the session struct.
+    /// session+0xC8 held a live message object one run and the flag value 0x80004001 the
+    /// next, so anything gated on it runs only intermittently; this is anchored to the
+    /// heap itself instead.
+    ///
+    /// A budget of bytes per tick keeps a multi-GB heap from stalling the poll loop —
+    /// the cursor persists so each tick continues where the last stopped.
+    /// </summary>
+    private unsafe void SweepHeapForUtf16()
+    {
+        if (_utf16SweepHits >= 40 || _heapSweepDone) return;
+
+        const long budget    = 24L * 1024 * 1024; // per tick
+        const int  chunk     = 0x100000;          // 1 MB per read
+        const uint MEM_COMMIT = 0x1000, PAGE_NOACCESS = 0x01, PAGE_GUARD = 0x100;
+
+        // Seeded sweeps first — ±2 MB around pointers the game is using for the message
+        // currently on screen is far better odds than anywhere the linear scan has reached.
+        nuint[] seeds;
+        lock (_seedLock) { seeds = _sweepSeeds.ToArray(); _sweepSeeds.Clear(); }
+
+        foreach (nuint seed in seeds)
+        {
+            if (_utf16SweepHits >= 40) return;
+            const int span = 0x200000;
+            nuint sFrom = seed > (nuint)span ? seed - span : seed;
+            for (nuint a = sFrom; a < seed + span; a += chunk)
+            {
+                if (!MemoryGuard.IsReadable(a, chunk)) continue;
+                foreach (var (addr2, t) in FindAsciiEnglish(a, chunk, 64))
+                {
+                    if (IsSystemString(t)) continue;
+                    _modLog!.Info($"[SEEDASCII] 0x{addr2:X}: \"{t}\"");
+                    if (++_utf16SweepHits >= 40) return;
+                }
+                foreach (var (addr2, t) in FindUtf16English(a, chunk, 16))
+                {
+                    if (IsSystemString(t)) continue;
+                    _modLog!.Info($"[SEEDUTF16] 0x{addr2:X}: \"{t}\"");
+                    if (++_utf16SweepHits >= 40) return;
+                }
+            }
+        }
+
+        long  scanned = 0;
+        nuint addr    = _heapSweepCursor != 0 ? _heapSweepCursor : GameHeapStart;
+
+        while (scanned < budget)
+        {
+            var (ok, regionBase, regionSize, state, protect) = MemoryGuard.QueryRegion(addr);
+            if (!ok || regionSize == 0) { _heapSweepDone = true; break; }
+
+            nuint regionEnd = regionBase + regionSize;
+            if (regionEnd <= addr || regionEnd > UserAddrMax) { _heapSweepDone = true; break; }
+
+            bool usable = state == MEM_COMMIT
+                          && (protect & PAGE_NOACCESS) == 0
+                          && (protect & PAGE_GUARD) == 0;
+
+            if (usable)
+            {
+                nuint from = addr > regionBase ? addr : regionBase;
+                while (from < regionEnd && scanned < budget)
+                {
+                    int len = (int)Math.Min((ulong)(regionEnd - from), (ulong)chunk);
+                    if (len <= 0 || !MemoryGuard.IsReadable(from, len)) break;
+
+                    // 64 candidates per chunk, then filter: the sweep previously spent its
+                    // entire hit budget on Windows runtime strings in the low heap and
+                    // stopped before reaching any game data.
+                    foreach (var (a, t) in FindAsciiEnglish(from, len, 64))
+                    {
+                        if (IsSystemString(t)) continue;
+                        _modLog!.Info($"[HEAPASCII] 0x{a:X}: \"{t}\"");
+                        if (++_utf16SweepHits >= 40) { _heapSweepCursor = regionEnd; return; }
+                    }
+                    foreach (var (a, t) in FindUtf16English(from, len, 16))
+                    {
+                        if (IsSystemString(t)) continue;
+                        _modLog!.Info($"[HEAPUTF16] 0x{a:X}: \"{t}\"");
+                        if (++_utf16SweepHits >= 40) { _heapSweepCursor = regionEnd; return; }
+                    }
+                    from    += (nuint)len;
+                    scanned += len;
+                }
+            }
+            addr = regionEnd;
+        }
+
+        _heapSweepCursor = addr;
+    }
+
+    /// <summary>
+    /// Rejects Windows runtime strings. The heap sweep spent its whole budget reporting
+    /// DirectInput names, font copyright blocks and impersonation flags — all genuine
+    /// UTF-16, none of it game text.
+    /// </summary>
+    private static bool IsSystemString(string s) =>
+        s.Length == 0 ||
+        s.Contains("Microsoft") || s.Contains("Windows") || s.Contains("Corporation") ||
+        s.Contains("Copyright")  || s.Contains("http")    || s.Contains(".dll") ||
+        s.Contains("OpenType")   || s.Contains("License") || s.Contains("reserved") ||
+        s.Contains("Impersonation") || s.Contains("DirectInput") || s.Contains("Version") ||
+        // Shader and engine identifiers. The top-ranked region was full of "float3
+        // position" — valid English by every ratio test, and not remotely dialogue.
+        s.Contains("float")  || s.Contains("_")      || s.Contains("()") ||
+        s.Contains("vec")    || s.Contains("Matrix") || s.Contains("Buffer") ||
+        s.Contains("Shader") || s.Contains("Texture");
+
+    /// <summary>
+    /// Scores a string as conversational rather than merely English. Item names, skill
+    /// labels and shader identifiers all pass the ratio test; what separates dialogue is
+    /// sentence punctuation and second-person address.
+    ///
+    /// Weighted rather than boolean because P5R splits lines on embedded function codes,
+    /// so many genuine fragments ("? You got any big") end mid-sentence and would fail
+    /// any single hard requirement.
+    /// </summary>
+    private static int DialogueScore(string s)
+    {
+        if (!IsEnglishString(s) || IsSystemString(s)) return 0;
+
+        int score = 0;
+        char last = s[^1];
+        if (last == '.' || last == '!' || last == '?') score += 3;
+        else if (last == ',' || last == '"')           score += 1;
+
+        if (s.Contains(" you") || s.Contains("You ") || s.Contains(" I ") ||
+            s.Contains("I'm")  || s.Contains(" me")   || s.Contains(" we ") ||
+            s.Contains("Ryuji"))                       score += 3;
+
+        if (s.Contains('\'')) score += 1;   // contractions
+        if (s.Contains(' '))  score += 1;
+
+        return score;
+    }
+
+    /// <summary>
+    /// Walks session+0xD0 as a pointer array. The per-message dumps show it holding
+    /// 0x42... heap pointers whose values change on every single message, which makes it
+    /// the per-message context block — and unlike session+0xC8 it has been populated on
+    /// every run observed. It sits below HeapLow, which is precisely why the pointer
+    /// filters everywhere else discarded it.
+    ///
+    /// Each slot is tested for text, then one level deeper, since a character buffer is
+    /// usually reached through a wrapper object rather than referenced directly.
+    /// </summary>
+    private unsafe void ProbeD0Array(nuint session)
+    {
+        if (!MemoryGuard.IsReadable(session + 0xD0, 8)) return;
+        nuint arr = *(nuint*)(session + 0xD0);
+        if (arr < 0x10000 || arr > UserAddrMax) return;
+        if (!MemoryGuard.IsReadable(arr, 0x200)) return;
+
+        int logged = 0;
+
+        for (int i = 0; i < 0x200 && logged < 12; i += 8)
+        {
+            nuint p1 = *(nuint*)(arr + (nuint)i);
+            if (p1 < 0x10000 || p1 > UserAddrMax)      continue;
+            if (!MemoryGuard.IsReadable(p1, 256))      continue;
+
+            // Seed the sweep even when this slot holds no text itself: it points into the
+            // region the game is actively using for this message.
+            if (p1 >= HeapLow)
+                lock (_seedLock) { if (_sweepSeeds.Count < 32) _sweepSeeds.Add(p1); }
+
+            if (ReportText($"+0x{i:X2}", p1)) { logged++; continue; }
+
+            for (int j = 0; j < 0x40 && logged < 12; j += 8)
+            {
+                nuint p2 = *(nuint*)(p1 + (nuint)j);
+                if (p2 < 0x10000 || p2 > UserAddrMax)  continue;
+                if (!MemoryGuard.IsReadable(p2, 256))  continue;
+                if (ReportText($"+0x{i:X2}+0x{j:X2}", p2)) logged++;
+            }
+        }
+
+        if (logged == 0) _modLog!.Info($"[D0] array 0x{arr:X}: no text in 2 levels");
+
+        bool ReportText(string label, nuint at)
+        {
+            string ascii = AsciiPreview(at, 96);
+            var    wide  = FindUtf16English(at, 256, 1);
+            string utf16 = wide.Count > 0 ? wide[0].Text : "";
+            if (IsSystemString(ascii) && IsSystemString(utf16)) return false;
+            _modLog!.Info($"[D0] {label} 0x{at:X} ascii=\"{ascii}\" utf16=\"{utf16}\"");
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Locates the scene's dialogue pool on the heap and captures its slots.
+    ///
+    /// Cheat Engine established the layout: consecutive lines land in the same regions at
+    /// increasing offsets — "Protein Lovers gym!" at 0x41DD7F6389, the next line 0x56A
+    /// later at 0x41DD7F68F3, with a second region advancing by exactly the same delta.
+    /// The scene's lines therefore sit sequentially in one allocation rather than being
+    /// reallocated per line, which makes the containing region a stable write target for
+    /// the whole conversation.
+    ///
+    /// Regions are ranked by how many non-system English sentences they hold and the top
+    /// candidates are logged, so a wrong pick is visible rather than silent — the same
+    /// mistake the mapped-file scan made when it locked onto the shoe shop.
+    /// </summary>
+    private unsafe void TryFindHeapDialoguePool()
+    {
+        const uint MEM_COMMIT = 0x1000, PAGE_NOACCESS = 0x01, PAGE_GUARD = 0x100;
+        // 8 MB per region, not 256 KB. Sampling only a region's start is what hid the live
+        // dialogue: the confirmed address 0x41DD7F6389 sits ~12 MB past the base of the
+        // nearest region the scan reported, so it was never read.
+        const int  maxScan     = 0x800000;
+        const int  maxRegions  = 4096;
+        // 2 GB, not 512 MB. At 8 MB per region the old budget stopped after 64 regions —
+        // far short of the game's heap — so the scan could exhaust itself before ever
+        // reaching the allocation holding the live scene.
+        const long totalBudget = 2048L * 1024 * 1024;
+
+        var ranked = new System.Collections.Generic.List<(int Score, nuint Base, int Len, string Sample)>();
+        nuint addr = GameHeapStart;
+        int   seen = 0;
+        long  totalScanned = 0;
+
+        while (addr < GameHeapEnd && seen < maxRegions && totalScanned < totalBudget)
+        {
+            var (ok, regionBase, regionSize, state, protect) = MemoryGuard.QueryRegion(addr);
+            if (!ok || regionSize == 0) break;
+            nuint regionEnd = regionBase + regionSize;
+            if (regionEnd <= addr) break;
+            seen++;
+
+            bool usable = state == MEM_COMMIT
+                          && (protect & PAGE_NOACCESS) == 0
+                          && (protect & PAGE_GUARD) == 0;
+
+            if (usable && regionSize >= 0x1000 && regionSize <= 0x4000000)
+            {
+                int len = (int)Math.Min((ulong)regionSize, (ulong)maxScan);
+
+                // Read through TryRead in chunks rather than dereferencing the region
+                // directly: the game frees heap on its own threads and a raw walk over
+                // megabytes will eventually fault on memory that vanished mid-scan.
+                int    score  = 0;
+                int    matches = 0;
+                string sample = "";
+                int    read   = 0;
+
+                for (int chunkOff = 0; chunkOff < len; chunkOff += ScanChunk)
+                {
+                    int want = Math.Min(ScanChunk, len - chunkOff);
+                    if (!MemoryGuard.TryRead(regionBase + (nuint)chunkOff, _scanBuf, want)) break;
+                    read += want;
+
+                    foreach (var (a, t) in FindAsciiEnglishBuf(_scanBuf, want,
+                                                              regionBase + (nuint)chunkOff, 8192))
+                    {
+                        int s = DialogueScore(t);
+                        if (s == 0) continue;
+                        if (sample.Length == 0) sample = t;
+                        score += s;
+                        matches++;
+                    }
+                }
+
+                // Rank by average score per matched line, not the sum. A summed score is
+                // really a measure of size: a 2MB item-description table outscores a
+                // 400KB conversation pool on volume alone, which is how the region that
+                // actually renders ended up ranked #14. Per-line, casual speech (ends in
+                // punctuation, second-person, contractions) separates cleanly from
+                // "Restores 20 HP to one ally."
+                if (matches >= 30)
+                {
+                    int avg = score * 100 / matches;
+                    ranked.Add((avg, regionBase, len, sample));
+                }
+                totalScanned += read;
+            }
+            addr = regionEnd;
+        }
+
+        // Coverage matters as much as the ranking: if the budget ran out, the right region
+        // may simply never have been read, which looks identical to a bad ranking.
+        _modLog!.Info($"[POOL] scanned {seen} regions, {totalScanned / (1024 * 1024)} MB, " +
+                      $"{ranked.Count} scored" +
+                      $"{(totalScanned >= totalBudget ? " (BUDGET EXHAUSTED — coverage incomplete)" : "")}");
+
+        if (ranked.Count == 0) return;
+        ranked.Sort((a, b) => b.Score.CompareTo(a.Score));
+
+        // Average-per-line ranking put the live scene at #0 ("Here we are... Protein
+        // Lovers gym!", avg 4.72, 36 slots) with item tables at 3.18 and shader source at
+        // 1.00, so the shotgun is no longer needed. Three rather than one: the top few
+        // averages sit close together (4.72 / 4.44 / 4.41) and a miss costs a whole play
+        // session to notice, while two extra regions cost almost nothing.
+        int take = Math.Min(3, ranked.Count);
+        _heapPools.Clear();
+
+        // List more than are armed. If the ranking ever shifts and the scene stops
+        // landing near the top, the runners-up are the evidence needed to see why.
+        for (int i = take; i < Math.Min(10, ranked.Count); i++)
+            _modLog!.Info($"[POOL] alt #{i} 0x{ranked[i].Base:X} avg={ranked[i].Score / 100.0:F2}: " +
+                          $"\"{ranked[i].Sample}\"");
+
+        for (int i = 0; i < take; i++)
+        {
+            var c = ranked[i];
+            var slots = CapturePoolSlotsSafe(c.Base, c.Len);
+            if (slots.Length == 0) continue;
+            _heapPools.Add((c.Base, c.Len, slots));
+            _modLog!.Info(
+                $"[POOL] ARM #{i} 0x{c.Base:X} len={c.Len} avg={c.Score / 100.0:F2} " +
+                $"slots={slots.Length}: \"{c.Sample}\"");
+        }
+
+        if (_heapPools.Count == 0) return;
+        _poolIsHeap = true;
+        _modLog!.Info($"[POOL] {_heapPools.Count} regions armed for write");
+
+        string? pending = _lastLlmText;
+        if (pending != null) WriteAllHeapPools(pending);
+    }
+
+    /// <summary>
+    /// Writes <paramref name="text"/> into every armed heap region. Same in-place rules as
+    /// the single-pool writer: never exceed a slot's original run length, and pad with
+    /// spaces rather than a NUL so the surrounding function codes stay intact.
+    /// </summary>
+    private unsafe int WriteAllHeapPools(string text)
+    {
+        if (_heapPools.Count == 0) return 0;
+
+        int totalSlots = 0, regions = 0;
+
+        for (int r = 0; r < _heapPools.Count; r++)
+        {
+            var (poolBase, poolLen, slots) = _heapPools[r];
+
+            // Tag each region with its index so the one that actually reaches the screen
+            // is identifiable by eye. Seeing "[R3] ..." in the bubble collapses the
+            // shotgun to a single target — no ranking heuristic can tell us this.
+            byte[] enc = System.Text.Encoding.ASCII.GetBytes($"[R{r}] {text}");
+
+            // Validate the whole range, not just the first bytes. The region was captured
+            // on an earlier tick and the game may have freed it since; writing through a
+            // stale base would fault fatally the same way the scan did.
+            if (!MemoryGuard.IsWritable(poolBase, poolLen)) continue;
+
+            byte* p = (byte*)poolBase;
+            int wrote = 0;
+            foreach ((int off, int len) in slots)
+            {
+                int wl = Math.Min(enc.Length, len);
+                if (wl <= 0) continue;
+                fixed (byte* src = enc)
+                    System.Buffer.MemoryCopy(src, p + off, len, wl);
+                for (int i = wl; i < len; i++) p[off + i] = (byte)' ';
+                wrote++;
+            }
+            if (wrote > 0) { totalSlots += wrote; regions++; }
+        }
+
+        _modLog!.Info($"[POOL] wrote {totalSlots} slots across {regions} regions ← " +
+                      $"\"{text[..Math.Min(text.Length, 50)]}\"");
+        return totalSlots;
+    }
+
+    private static bool IsVowel(byte c) =>
+        c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u';
+
+    /// <summary>
+    /// True only for a byte run that reads as an English sentence. The earlier
+    /// "≥10 printable, ≥2 spaces" test passed compressed texture data — binary is full
+    /// of 0x20 bytes. These ratios encode what actually separates prose from binary:
+    /// mostly letters, mostly lowercase, a plausible vowel share, few digits, almost
+    /// no symbol junk.
+    /// </summary>
+    private static unsafe bool IsEnglishSentence(byte* p, int len)
+    {
+        if (len < 12 || len > 400) return false;
+
+        int letters = 0, lower = 0, vowels = 0, digits = 0, spaces = 0, other = 0;
+        for (int i = 0; i < len; i++)
+        {
+            byte c = p[i];
+            if (c >= 'a' && c <= 'z')      { letters++; lower++; if (IsVowel(c)) vowels++; }
+            else if (c >= 'A' && c <= 'Z') { letters++; if (IsVowel((byte)(c | 0x20))) vowels++; }
+            else if (c == ' ')             spaces++;
+            else if (c >= '0' && c <= '9') digits++;
+            else if (c == '.' || c == ',' || c == '!' || c == '?' || c == '\'' ||
+                     c == '"' || c == '-' || c == ':' || c == ';') { /* sentence punctuation */ }
+            else other++;
+        }
+
+        if (spaces < 2)                     return false;
+        if (letters * 100 < len * 55)       return false; // ≥55% letters
+        if (lower   * 100 < letters * 40)   return false; // ≥40% of letters lowercase
+        if (vowels  * 100 < letters * 25)   return false; // English runs ~38% vowels
+        if (vowels  * 100 > letters * 60)   return false;
+        if (digits  * 100 > len * 10)       return false; // ≤10% digits
+        if (other   * 100 > len * 5)        return false; // ≤5% symbol junk
+        return true;
+    }
+
+    private static bool IsPrintable(byte c) => c >= 0x20 && c <= 0x7E;
+
+    /// <summary>
+    /// Counts maximal runs of printable ASCII that read as English. Runs are delimited by
+    /// ANY non-printable byte, not just NUL. BMD text carries embedded function codes —
+    /// voice cues, speaker-name substitution, line breaks — as control and high bytes, so
+    /// walking only to the next NUL yielded one enormous run per file, which failed the
+    /// len>400 check and scored every message file zero.
+    /// </summary>
+    private static unsafe int CountEnglishSentences(byte* buf, int maxBytes)
+    {
+        int count = 0, pos = 0;
+        while (pos < maxBytes)
+        {
+            while (pos < maxBytes && !IsPrintable(buf[pos])) pos++;
+            int begin = pos;
+            while (pos < maxBytes && IsPrintable(buf[pos])) pos++;
+            if (pos > begin && IsEnglishSentence(buf + begin, pos - begin)) count++;
+        }
+        return count;
+    }
+
+    private static unsafe string PreviewSentences(nuint page, int maxBytes, int maxChars)
+    {
+        var sb = new System.Text.StringBuilder(maxChars + 8);
+        byte* buf = (byte*)page;
+        int pos = 0;
+        while (pos < maxBytes && sb.Length < maxChars)
+        {
+            while (pos < maxBytes && !IsPrintable(buf[pos])) pos++;
+            int begin = pos;
+            while (pos < maxBytes && IsPrintable(buf[pos])) pos++;
+            if (pos > begin && IsEnglishSentence(buf + begin, pos - begin))
+            {
+                if (sb.Length > 0) sb.Append(" | ");
+                for (int i = begin; i < pos && sb.Length < maxChars; i++) sb.Append((char)buf[i]);
+            }
+        }
+        return sb.ToString();
+    }
+
+    // Records (offset, original length) for every English entry in the pool.
+    // Captured once, before any write, so every later write measures against the
+    // ORIGINAL entry lengths. Without this, each pass would re-measure the shortened
+    // string it wrote last time and the usable space would ratchet down to nothing.
+    private static unsafe (int Off, int Len)[] CapturePoolSlots(nuint poolBase, int scanLen)
+    {
+        var slots = new System.Collections.Generic.List<(int, int)>();
+        byte* p = (byte*)poolBase;
+        int pos = 0;
+
+        // 20000, not 512. Slots are captured from the region base outward, so a low cap
+        // covered only the first sliver of a multi-megabyte region — text deeper in was
+        // scored but never made writable, which defeated the whole point of scanning it.
+        while (pos < scanLen && slots.Count < 20000)
+        {
+            while (pos < scanLen && !IsPrintable(p[pos])) pos++;
+            int begin = pos;
+            while (pos < scanLen && IsPrintable(p[pos])) pos++;
+            if (pos > begin && IsEnglishSentence(p + begin, pos - begin))
+                slots.Add((begin, pos - begin));
+        }
+        return slots.ToArray();
+    }
+
+    // Overwrites every captured dialogue slot in the BMD text pool with <paramref name="text"/>.
+    // Writes at most (origLen - 1) bytes per slot and re-terminates in place, so entry
+    // boundaries — and therefore the BMD's internal offset table — stay valid; the renderer
+    // still finds each entry exactly where it expects, just with our characters in it.
+    // Mapped-file pages are PAGE_READONLY, so the page is first upgraded to PAGE_WRITECOPY:
+    // the OS hands back a private copy and the .bmd on disk is never modified.
+    private unsafe int WritePoolStrings(string text)
+    {
+        if (_bmdTextPool == 0 || _poolSlots is null || _poolSlots.Length == 0) return 0;
+
+        // One shot per session. These are the item/skill tables, not scene dialogue, so
+        // rewriting them on every message corrupts more descriptions for no new
+        // information — a single write still answers whether the renderer picks it up.
+        if (!_poolIsHeap)
+        {
+            if (_poolWriteDone) return 0;
+            _poolWriteDone = true;
+        }
+
+        const uint PAGE_WRITECOPY = 0x08;
+        nuint pageBase = _bmdTextPool;
+
+        // VirtualProtect rounds the range out to page boundaries, so an unaligned base
+        // is fine — but the length must cover the whole pool, which for an MSG1 file
+        // spans many pages.
+        if (!MemoryGuard.IsWritable(_bmdTextPool, 16) &&
+            !MemoryGuard.VirtualProtect(pageBase, (nuint)_bmdPoolLen, PAGE_WRITECOPY, out _))
+        {
+            _modLog!.Warn($"[BMD2] VirtualProtect WRITECOPY failed for page 0x{pageBase:X}");
+            return 0;
+        }
+
+        byte[] enc = System.Text.Encoding.ASCII.GetBytes(text);
+        byte*  p   = (byte*)_bmdTextPool;
+        int written = 0;
+
+        foreach ((int off, int len) in _poolSlots)
+        {
+            int wl = Math.Min(enc.Length, len);
+            if (wl <= 0) continue;
+            fixed (byte* src = enc)
+                System.Buffer.MemoryCopy(src, p + off, len, wl);
+            // Pad with spaces rather than writing a NUL. The run is delimited by the
+            // surrounding control bytes (function codes, line breaks) which the message
+            // parser relies on — injecting a terminator inside the run would truncate
+            // the entry as far as the parser is concerned and could desync the page.
+            for (int i = wl; i < len; i++) p[off + i] = (byte)' ';
+            written++;
+        }
+
+        _modLog!.Info(
+            $"[BMD2] Pool write: {written}/{_poolSlots.Length} slots at 0x{_bmdTextPool:X} " +
+            $"← \"{text[..Math.Min(text.Length, 60)]}\"");
+        return written;
+    }
+
     private static unsafe int CountNullTermStrings(byte* buf, int maxBytes, int minPrintable)
     {
         int count = 0, pos = 0;
@@ -585,7 +1713,133 @@ public class Mod : IModV1
                 _currentMsgId    = best;
                 _capturedSession = session;
                 if (_confirmedBfBase == 0) _confirmedBfBase = bfBase;
-                _modLog!.Info($"[MSG] pc=0x{pc:X} msgId=0x{best:X} ({best}) bfBase=0x{bfBase:X}");
+
+                // session+0xD0 → descriptor struct → descriptor+0x18 → actual text bytes.
+                // TryReadTextAddr follows all three hops; returns 0 if any link is not yet set.
+                nuint capturedTextAddr = TryReadTextAddr(session);
+
+                if (capturedTextAddr != 0)
+                {
+                    // Dump all three chain levels to verify layout.
+                    unsafe
+                    {
+                        nuint descriptor = *(nuint*)((byte*)session + 0xD0);
+                        nuint textObj    = (descriptor != 0 && MemoryGuard.IsReadable(descriptor + 0x18, 8))
+                                           ? *(nuint*)(descriptor + 0x18) : 0;
+
+                        // Level 2: textObj bytes (the string-wrapper struct)
+                        if (textObj != 0 && MemoryGuard.IsReadable(textObj, 32))
+                        {
+                            byte* ob = (byte*)textObj;
+                            var objSb = new System.Text.StringBuilder($"[MSG] TextObj(0x{textObj:X}): ");
+                            for (int di = 0; di < 32; di++)
+                            {
+                                if (di > 0 && di % 16 == 0) objSb.Append(" | ");
+                                objSb.Append($"{ob[di]:X2} ");
+                            }
+                            _modLog!.Info(objSb.ToString());
+                        }
+
+                        // Level 3: actual character bytes (capturedTextAddr = *(textObj))
+                        if (MemoryGuard.IsReadable(capturedTextAddr, 64))
+                        {
+                            byte* tb = (byte*)capturedTextAddr;
+                            var txtSb = new System.Text.StringBuilder($"[MSG] CharBytes(0x{capturedTextAddr:X}): ");
+                            for (int di = 0; di < 64; di++)
+                            {
+                                if (di > 0 && di % 16 == 0) txtSb.Append(" | ");
+                                txtSb.Append($"{tb[di]:X2} ");
+                            }
+                            _modLog!.Info(txtSb.ToString());
+                        }
+                    }
+                }
+                else
+                {
+                    // textAddr=0: dump readable/unreadable status for offsets around the
+                    // known boundary (+0xB8..+0xE0) to pinpoint the struct end,
+                    // plus all external heap pointers in [0x00..0xC8) for fallback probing.
+                    // Gated: these fire on every message and the pool write path no longer
+                    // depends on any of them.
+                    unsafe
+                    {
+                        if (!_cfg.StructDiffEnabled) goto skipDiag;
+                        // Boundary scan: individual IsReadable per slot
+                        var bndSb = new System.Text.StringBuilder("[MSG] BndScan: ");
+                        for (int di = 0xB8; di <= 0xE0; di += 8)
+                        {
+                            nuint addr = session + (nuint)di;
+                            if (MemoryGuard.IsReadable(addr, 8))
+                            {
+                                nuint val = *(nuint*)(byte*)addr;
+                                bndSb.Append($"+0x{di:X2}=0x{val:X} ");
+                            }
+                            else
+                            {
+                                bndSb.Append($"+0x{di:X2}=NR ");
+                            }
+                        }
+                        _modLog!.Info(bndSb.ToString());
+
+                        // Dump raw bytes at the session+0xD0 value when it's a low-memory
+                        // (mapped-file) address — shows whether it's BMD text or BF script.
+                        if (MemoryGuard.IsReadable(session + 0xD0, 8))
+                        {
+                            nuint d0val = *(nuint*)((byte*)session + 0xD0);
+                            if (d0val >= 0x1000 && d0val < HeapLow && MemoryGuard.IsReadable(d0val, 48))
+                            {
+                                byte* tb = (byte*)d0val;
+                                var dSb = new System.Text.StringBuilder($"[MSG] D0Direct(0x{d0val:X}): ");
+                                for (int di = 0; di < 48; di++) dSb.Append($"{tb[di]:X2} ");
+                                _modLog!.Info(dSb.ToString());
+                            }
+                        }
+
+                        // Heap pointer scan over [0x00..0x100) per slot — catches ptrs
+                        // beyond VirtualQuery region boundary (e.g. session+0xE0).
+                        var ptrSb = new System.Text.StringBuilder("[MSG] SessHeapPtrs: ");
+                        for (int di = 0; di < 0x100; di += 8)
+                        {
+                            nuint slotAddr = session + (nuint)di;
+                            if (!MemoryGuard.IsReadable(slotAddr, 8)) continue;
+                            nuint val = *(nuint*)(byte*)slotAddr;
+                            if (val >= HeapLow && val <= UserAddrMax &&
+                                !(val >= session && val < session + 0x1000))
+                                ptrSb.Append($"+0x{di:X2}→0x{val:X} ");
+                        }
+                        _modLog!.Info(ptrSb.ToString());
+
+                        // session+0xC8 is the live message object — follow it and sweep
+                        // for UTF-16, which every earlier scanner was blind to.
+                        ProbeMessageObject(session);
+
+                        // session+0xD0 holds a per-message pointer array; it has been
+                        // populated on every run, unlike +0xC8.
+                        ProbeD0Array(session);
+
+                        // Dump first 48 bytes of each external heap target — shows structure
+                        // layout. Gated: this emits a line per pointer and the session-chain
+                        // approach it was built for is no longer the primary strategy.
+                        for (int di = 0; _cfg.StructDiffEnabled && di < 0x100; di += 8)
+                        {
+                            nuint slotAddr = session + (nuint)di;
+                            if (!MemoryGuard.IsReadable(slotAddr, 8)) continue;
+                            nuint val = *(nuint*)(byte*)slotAddr;
+                            if (val < HeapLow || val > UserAddrMax) continue;
+                            if (val >= session && val < session + 0x1000) continue;
+                            if (!MemoryGuard.IsReadable(val, 48)) continue;
+                            byte* ep = (byte*)val;
+                            var epSb = new System.Text.StringBuilder($"[MSG] ExtObj+0x{di:X2}(0x{val:X}): ");
+                            for (int ei = 0; ei < 48; ei++) epSb.Append($"{ep[ei]:X2} ");
+                            _modLog!.Info(epSb.ToString());
+                        }
+
+                        skipDiag: ;
+                    }
+                }
+                _currentMsgTextAddr = capturedTextAddr;
+
+                _modLog!.Info($"[MSG] pc=0x{pc:X} msgId=0x{best:X} ({best}) bfBase=0x{bfBase:X} textAddr=0x{_currentMsgTextAddr:X}");
 
                 // Fire-and-forget LLM call; write result to session+0x9B0 on response.
                 // Cannot await inside unsafe — call the async method and discard the Task.
@@ -609,73 +1863,71 @@ public class Mod : IModV1
 
     // Scans the entire lower-4GB mapped-file region for a committed, readable
     // region containing ≥5 English dialogue sentences (the BMD string table).
-    // Uses an absolute range because bfBase shifts by 200+ MB between runs,
-    // making a relative window unreliable.
-    // Fires once per session (_bmdScanDone gate in caller).
+    // BMD is heap-allocated; found via session struct pointer map:
+    //   session+0xC8 = BMD base address (heap, above 4 GB, not caught by lower-4GB scan)
+    //   session+0xD0 = pointer to current message text inside BMD
+    //
+    // Confirmed: session+0xD0 - session+0xC8 = byte offset of current msgId's text.
+    // Header magic is [20 00 0A 00], NOT [0D 00] — that's why all previous scans missed it.
+    //
+    // This method locks _bmdBase from session+0xC8, dumps the header, and
+    // reverse-scans the first 8 KB for the current-message offset so we can
+    // identify the offset table location and entry size.
     private unsafe void TryScanForBmd()
     {
-        nuint bfBase = _confirmedBfBase;
-        if (bfBase == 0) return;
+        nuint session = _capturedSession;
+        if (session == 0) return;
 
-        const uint  MEM_COMMIT    = 0x1000;
-        const uint  PAGE_READONLY = 0x02;
-        const uint  PAGE_GUARD    = 0x100;
-        // All P5R mapped-file assets observed in [0x60000000, 0xFFFF0000].
-        // Scan the full lower-4GB so the window never misses due to bfBase drift.
-        nuint scanStart = (nuint)0x1000UL;
-        nuint scanEnd   = (nuint)0xFFFF0000UL;
-
-        _modLog!.Info($"[BMD] Scan start: bfBase=0x{bfBase:X} (full lower-4GB scan)");
-
-        int regionsChecked = 0;
-        nuint probe = scanStart;
-        while (probe < scanEnd)
+        if (!MemoryGuard.IsReadable(session + 0xC8, 16))
         {
-            var (ok, regBase, regSize, state, protect) = MemoryGuard.QueryRegion(probe);
-            if (!ok || regSize == 0) break;
-
-            nuint next = regBase + regSize;
-
-            if (state == MEM_COMMIT &&
-                protect == PAGE_READONLY &&           // BMD files are memory-mapped read-only
-                (protect & PAGE_GUARD) == 0 &&
-                regSize >= 1024 &&
-                regSize <= 64u * 1024u * 1024u)
-            {
-                bool isBfPage = bfBase >= regBase && bfBase < regBase + regSize;
-                if (!isBfPage)
-                {
-                    if (MemoryGuard.IsReadable(regBase, 4))
-                    {
-                        // BMD header: [uint16 version=13][uint16 msgCount]
-                        byte* hdr = (byte*)regBase;
-                        if (hdr[0] != 0x0D || hdr[1] != 0x00) goto nextRegion;
-
-                        ushort msgCount = (ushort)(hdr[2] | (hdr[3] << 8));
-                        regionsChecked++;
-                        _modLog!.Info(
-                            $"[BMD] Region 0x{regBase:X} sz=0x{regSize:X} count={msgCount}" +
-                            $" [{hdr[0]:X2} {hdr[1]:X2} {hdr[2]:X2} {hdr[3]:X2}]");
-
-                        // Lock on the largest dialogue BMD (count ≥ 1000).
-                        // Small BMDs (tips, UI) have count < 500; main dialogue has 1252.
-                        if (msgCount >= 1000)
-                        {
-                            _bmdBase = regBase;
-                            _modLog!.Info($"[BMD] Locked: 0x{regBase:X} msgCount={msgCount}");
-                            TryLogBmdStrings();
-                            return;
-                        }
-                        nextRegion:;
-                    }
-                }
-            }
-
-            if (next <= regBase) break; // overflow guard
-            probe = next;
+            _modLog!.Warn($"[BMD] session+0xC8 not readable");
+            return;
         }
 
-        _modLog!.Info($"[BMD] Scan done — {regionsChecked} text regions, none hit ≥10 sentences.");
+        nuint bmdBase = *(nuint*)((byte*)session + 0xC8);
+        nuint msgPtr  = *(nuint*)((byte*)session + 0xD0);
+
+        if (!MemoryGuard.IsReadable(bmdBase, 64))
+        {
+            _modLog!.Warn($"[BMD] bmdBase=0x{bmdBase:X} (session+0xC8) not readable");
+            return;
+        }
+
+        _bmdBase = bmdBase;
+        _modLog!.Info($"[BMD] base=0x{bmdBase:X} msgPtr=0x{msgPtr:X} msgId={_currentMsgId}");
+
+        // Dump first 64 bytes of the BMD header
+        byte* hdr = (byte*)bmdBase;
+        var hexSb = new System.Text.StringBuilder("[BMD] Header: ");
+        for (int i = 0; i < 64; i++)
+        {
+            if (i > 0 && i % 16 == 0) hexSb.Append(" | ");
+            hexSb.Append($"{hdr[i]:X2} ");
+        }
+        _modLog!.Info(hexSb.ToString());
+
+        // Compute confirmed offset for the current msgId
+        if (msgPtr <= bmdBase) return;
+        nuint currentOff = msgPtr - bmdBase;
+        _modLog!.Info($"[BMD] msgId={_currentMsgId} confirmed offset=0x{currentOff:X}");
+
+        // Reverse scan first 8 KB for the offset value — tells us the table base and entry size
+        uint   t32 = (uint)currentOff;
+        ushort t16 = (ushort)currentOff;
+        for (int pos = 0; pos < 8192 - 1; pos++)
+        {
+            if (!MemoryGuard.IsReadable(bmdBase + (nuint)pos, 4)) break;
+            byte* sp = (byte*)(bmdBase + (nuint)pos);
+            ushort v16 = (ushort)(sp[0] | sp[1] << 8);
+            if (v16 == t16)
+                _modLog!.Info($"[BMD] offset as uint16 @ bmd+0x{pos:X}");
+            if (pos + 3 < 8192)
+            {
+                uint v32 = (uint)(sp[0] | sp[1]<<8 | sp[2]<<16 | sp[3]<<24);
+                if (v32 == t32)
+                    _modLog!.Info($"[BMD] offset as uint32 @ bmd+0x{pos:X}");
+            }
+        }
     }
 
     private static unsafe int CountPrintableRuns(nuint regionBase, int scanBytes)
@@ -739,6 +1991,29 @@ public class Mod : IModV1
         }
 
         _modLog!.Info($"[BMD] Logged {count} strings from 0x{_bmdBase:X}.");
+
+        // Reverse-scan: find WHERE in the BMD the known string offsets (0x0120, 0x013E, 0x0158)
+        // are stored, to identify the offset table location and entry size.
+        nuint bmdBase = _bmdBase;
+        uint[] knownOffsets = { 0x0120u, 0x013Eu, 0x0158u };
+        for (int pos = 4; pos < 1024; pos++)
+        {
+            if (!Memory.MemoryGuard.IsReadable(bmdBase + (nuint)pos, 4)) break;
+            byte* sp = (byte*)(bmdBase + (nuint)pos);
+
+            uint v32 = (uint)(sp[0] | (sp[1] << 8) | (sp[2] << 16) | (sp[3] << 24));
+            foreach (uint ko in knownOffsets)
+                if (v32 == ko)
+                    _modLog!.Info($"[BMD] OffsetScan: known=0x{ko:X} found as uint32 at bmd+0x{pos:X}");
+
+            if (pos < 1023)
+            {
+                ushort v16 = (ushort)(sp[0] | (sp[1] << 8));
+                foreach (uint ko in knownOffsets)
+                    if (v16 == ko)
+                        _modLog!.Info($"[BMD] OffsetScan: known=0x{ko:X} found as uint16 at bmd+0x{pos:X}");
+            }
+        }
     }
 
     private async System.Threading.Tasks.Task DispatchMsgLlmAsync(
@@ -760,11 +2035,14 @@ public class Mod : IModV1
             string text = await _llmClient!.GenerateAsync(req, cts.Token);
             if (string.IsNullOrWhiteSpace(text)) return;
 
+            // Cache immediately so OnGameMemcpy can use it on the next text copy.
+            _lastLlmText = text;
             _modLog!.Info($"[LLM] msgId=0x{msgId:X}: \"{text[..Math.Min(text.Length, 100)]}\"");
-            bool wrote = TryWriteToSessionDesc(session, text);
-            _modLog!.Info(wrote
-                ? $"[LLM] Wrote {text.Length} chars to session+0x9B0."
-                : "[LLM] Write-back SKIPPED (session gone or slot too small).");
+            bool wrote      = TryWriteToBmd(msgId, text);
+            int  poolWrites = WritePoolStrings(text);
+            int  heapWrites = WriteAllHeapPools(text);
+            _modLog!.Info($"[LLM] msgId=0x{msgId:X} — ptrWrite={(wrote ? "OK" : "skip")} " +
+                          $"poolWrites={poolWrites} heapWrites={heapWrites}");
         }
         catch (Server.InferenceInFlightException)  { /* server busy, ignore */ }
         catch (OperationCanceledException)
@@ -798,6 +2076,69 @@ public class Mod : IModV1
         return true;
     }
 
+    // Write LLM text directly to the address captured from session+0xD0 at msgId
+    // confirmation time. The game pauses BF execution while a message is displayed,
+    // so that address remains valid for the duration of the player's reading window.
+    // The heap allocation is PAGE_READWRITE — no VirtualProtect needed.
+    private unsafe bool TryWriteToBmd(ushort msgId, string text)
+    {
+        nuint textAddr = _currentMsgTextAddr;
+
+        // Final-chance lazy recovery: if still 0, re-read the chain now.
+        // This catches the race where the LLM responds in the same tick that
+        // the poll loop's retry would have fired.
+        if (textAddr == 0 && _capturedSession != 0)
+        {
+            textAddr = TryReadTextAddr(_capturedSession);
+            if (textAddr != 0)
+            {
+                _currentMsgTextAddr = textAddr;
+                _modLog!.Info($"[BMD] TextAddr lazy-recovered in write path: 0x{textAddr:X}");
+            }
+        }
+
+        if (textAddr == 0)
+        {
+            _modLog!.Warn("[BMD] Write: no textAddr captured yet");
+            return false;
+        }
+
+        const int MaxWrite = 200;
+        if (!Memory.MemoryGuard.IsWritable(textAddr, MaxWrite))
+        {
+            // Mapped-file pages are PAGE_READONLY — upgrade to PAGE_WRITECOPY so the
+            // OS gives us a private writable copy without touching the file on disk.
+            if (textAddr < HeapLow)
+            {
+                const uint PAGE_WRITECOPY = 0x08;
+                if (!Memory.MemoryGuard.VirtualProtect(textAddr, (nuint)MaxWrite, PAGE_WRITECOPY, out _))
+                {
+                    _modLog!.Warn($"[BMD] VirtualProtect WRITECOPY failed for 0x{textAddr:X}");
+                    return false;
+                }
+                _modLog!.Info($"[BMD] VirtualProtect WRITECOPY applied to mapped page 0x{textAddr:X}");
+            }
+            else
+            {
+                _modLog!.Warn($"[BMD] Write: 0x{textAddr:X} not writable (sz={MaxWrite})");
+                return false;
+            }
+        }
+
+        // Encode as ASCII — Latin characters are valid single-byte Shift-JIS values,
+        // so the game's text renderer will display them without corruption.
+        byte[] encoded = System.Text.Encoding.ASCII.GetBytes(text);
+        int writeLen   = Math.Min(encoded.Length, MaxWrite - 1);
+
+        byte* dst = (byte*)textAddr;
+        fixed (byte* src = encoded)
+            System.Buffer.MemoryCopy(src, dst, MaxWrite, writeLen);
+        dst[writeLen] = 0;
+
+        _modLog!.Info($"[BMD] Wrote {writeLen}b to textAddr=0x{textAddr:X} (msgId=0x{msgId:X})");
+        return true;
+    }
+
     private void StartPollLoop()
     {
         _cts      = new CancellationTokenSource();
@@ -825,8 +2166,22 @@ public class Mod : IModV1
                     _msgIdStreak     = 0;
                     _capturedSession = 0;
                     _confirmedBfBase = 0;
-                    _bmdBase         = 0;
-                    _bmdScanDone     = false;
+                    _bmdBase             = 0;
+                    _bmdScanDone         = false;
+                    _currentMsgTextAddr  = 0;
+                    _bmdTextPool         = 0;
+                    _bmdScanDoneV2       = false;
+                    _bmdScanAttempts     = 0;
+                    _poolSlots           = null;
+                    _bmdPoolLen          = 0x1000;
+                    _poolWriteDone       = false;
+                    _poolIsHeap          = false;
+                    _heapPools.Clear();
+                    _utf16CpyLogged      = 0;
+                    _heapSweepCursor     = 0;
+                    _utf16SweepHits      = 0;
+                    _heapSweepDone       = false;
+                    _lastLlmText         = null;
                     lock (_largeCopyLock) _largeCopyDsts.Clear();
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
                 }
@@ -868,6 +2223,32 @@ public class Mod : IModV1
 
             // BF line probe: read current dialogue text from bfBase+pc on every tick.
             ProbeBfLine(session);
+
+            // Lazy textAddr re-probe: session+0xD0 may not be populated at BF-PC detection
+            // time (cold first-message path). Retry every tick until the C++ dialogue
+            // system catches up; the LLM latency (3-30s) gives us plenty of cycles.
+            if (_currentMsgId != 0 && _currentMsgTextAddr == 0 && _capturedSession != 0)
+            {
+                nuint recovered = TryReadTextAddr(_capturedSession);
+                if (recovered != 0)
+                {
+                    _currentMsgTextAddr = recovered;
+                    _modLog!.Info($"[MSG] TextAddr recovered=0x{recovered:X} (msgId=0x{_currentMsgId:X})");
+                }
+            }
+
+            // Primary target: the heap dialogue pool. The mapped-file scans below reach
+            // only the global item/skill tables — the live conversation is on the heap,
+            // as ASCII, confirmed at 0x41DD7F6389 / 0x42102CAAA9.
+            if (_currentMsgId != 0 && _heapPools.Count == 0)
+                TryFindHeapDialoguePool();
+
+            // Diagnostic sweeps, off by default now that the pool location is known.
+            if (_cfg.StructDiffEnabled)
+            {
+                if (_confirmedBfBase != 0 && !_bmdScanDoneV2) TryScanBmdVicinity();
+                if (_currentMsgId != 0)                       SweepHeapForUtf16();
+            }
 
             // One-shot BMD scan per session — fires once after first msgId confirmation.
             if (_confirmedBfBase != 0 && _bmdBase == 0 && !_bmdScanDone)
