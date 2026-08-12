@@ -1124,7 +1124,40 @@ public class Mod : IModV1
         s.Contains("Microsoft") || s.Contains("Windows") || s.Contains("Corporation") ||
         s.Contains("Copyright")  || s.Contains("http")    || s.Contains(".dll") ||
         s.Contains("OpenType")   || s.Contains("License") || s.Contains("reserved") ||
-        s.Contains("Impersonation") || s.Contains("DirectInput") || s.Contains("Version");
+        s.Contains("Impersonation") || s.Contains("DirectInput") || s.Contains("Version") ||
+        // Shader and engine identifiers. The top-ranked region was full of "float3
+        // position" — valid English by every ratio test, and not remotely dialogue.
+        s.Contains("float")  || s.Contains("_")      || s.Contains("()") ||
+        s.Contains("vec")    || s.Contains("Matrix") || s.Contains("Buffer") ||
+        s.Contains("Shader") || s.Contains("Texture");
+
+    /// <summary>
+    /// Scores a string as conversational rather than merely English. Item names, skill
+    /// labels and shader identifiers all pass the ratio test; what separates dialogue is
+    /// sentence punctuation and second-person address.
+    ///
+    /// Weighted rather than boolean because P5R splits lines on embedded function codes,
+    /// so many genuine fragments ("? You got any big") end mid-sentence and would fail
+    /// any single hard requirement.
+    /// </summary>
+    private static int DialogueScore(string s)
+    {
+        if (!IsEnglishString(s) || IsSystemString(s)) return 0;
+
+        int score = 0;
+        char last = s[^1];
+        if (last == '.' || last == '!' || last == '?') score += 3;
+        else if (last == ',' || last == '"')           score += 1;
+
+        if (s.Contains(" you") || s.Contains("You ") || s.Contains(" I ") ||
+            s.Contains("I'm")  || s.Contains(" me")   || s.Contains(" we ") ||
+            s.Contains("Ryuji"))                       score += 3;
+
+        if (s.Contains('\'')) score += 1;   // contractions
+        if (s.Contains(' '))  score += 1;
+
+        return score;
+    }
 
     /// <summary>
     /// Walks session+0xD0 as a pointer array. The per-message dumps show it holding
@@ -1197,14 +1230,16 @@ public class Mod : IModV1
     private unsafe void TryFindHeapDialoguePool()
     {
         const uint MEM_COMMIT = 0x1000, PAGE_NOACCESS = 0x01, PAGE_GUARD = 0x100;
-        const int  maxScan     = 0x40000;   // 256 KB sampled per region
+        const int  maxScan     = 0x100000;        // 1 MB sampled per region
         const int  maxRegions  = 4096;
+        const long totalBudget = 192L * 1024 * 1024;
 
         var ranked = new System.Collections.Generic.List<(int Score, nuint Base, int Len, string Sample)>();
         nuint addr = GameHeapStart;
         int   seen = 0;
+        long  totalScanned = 0;
 
-        while (addr < UserAddrMax && seen < maxRegions)
+        while (addr < UserAddrMax && seen < maxRegions && totalScanned < totalBudget)
         {
             var (ok, regionBase, regionSize, state, protect) = MemoryGuard.QueryRegion(addr);
             if (!ok || regionSize == 0) break;
@@ -1216,20 +1251,25 @@ public class Mod : IModV1
                           && (protect & PAGE_NOACCESS) == 0
                           && (protect & PAGE_GUARD) == 0;
 
-            if (usable && regionSize >= 0x1000 && regionSize <= 0x400000)
+            if (usable && regionSize >= 0x1000 && regionSize <= 0x1000000)
             {
                 int len = (int)Math.Min((ulong)regionSize, (ulong)maxScan);
                 if (MemoryGuard.IsReadable(regionBase, len))
                 {
+                    // 8192, not 256: at 256 every text-heavy region saturated the cap and
+                    // scored identically, so the sort was a no-op and the lowest address —
+                    // a shader string block — won by default.
                     int    score  = 0;
                     string sample = "";
-                    foreach (var (a, t) in FindAsciiEnglish(regionBase, len, 256))
+                    foreach (var (a, t) in FindAsciiEnglish(regionBase, len, 8192))
                     {
-                        if (IsSystemString(t)) continue;
-                        if (score == 0) sample = t;
-                        score++;
+                        int s = DialogueScore(t);
+                        if (s == 0) continue;
+                        if (sample.Length == 0) sample = t;
+                        score += s;
                     }
-                    if (score >= 5) ranked.Add((score, regionBase, len, sample));
+                    if (score >= 20) ranked.Add((score, regionBase, len, sample));
+                    totalScanned += len;
                 }
             }
             addr = regionEnd;
