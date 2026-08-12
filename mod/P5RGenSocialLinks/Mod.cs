@@ -595,60 +595,129 @@ public class Mod : IModV1
         nuint center = _confirmedBfBase != 0 ? _confirmedBfBase : _bfBufferBase;
         if (center == 0) return;
 
-        const nuint window  = 0x80000; // ±512KB
+        // ±8 MB. The previous ±512KB window only reached compressed texture data;
+        // the BMD for a conversation is mapped from the same archive as its BF but
+        // not necessarily adjacent to it.
+        const nuint window   = 0x800000;
         const int   pageSize = 0x1000;
-        nuint start = center > window ? center - window : 0x1000;
+        nuint start = center > window ? center - window : 0x10000;
         nuint end   = center + window;
 
-        nuint bfPage = center & ~(nuint)0xFFF; // page that contains bfBase — skip it
+        nuint bfPage = center & ~(nuint)0xFFF; // page holding the BF script — skip it
+
+        // Rank every page and take the best, rather than the first page over a
+        // threshold. First-hit locked onto DXT texture data whose 0x20 bytes read as
+        // spaces; the real dialogue page scores far higher under IsEnglishSentence.
+        var ranked = new System.Collections.Generic.List<(int Score, nuint Addr)>();
 
         for (nuint addr = start; addr < end; addr += (nuint)pageSize)
         {
-            if (addr == bfPage) continue;          // don't confuse BF script with BMD
+            if (addr == bfPage) continue;
             if (!MemoryGuard.IsReadable(addr, pageSize)) continue;
 
-            // Skip first 0x100 bytes (possible binary header), scan the rest
-            nuint dataStart = addr + 0x100;
-            byte* p = (byte*)dataStart;
-            int scanLen = pageSize - 0x100;
-            int goodStrings = 0, pos = 0;
+            int score = CountEnglishSentences((byte*)addr, pageSize);
+            if (score >= 3) ranked.Add((score, addr));
+        }
 
-            while (pos < scanLen && goodStrings < 5)
-            {
-                int start2 = pos, printable = 0, spaces = 0;
-                while (pos < scanLen && p[pos] != 0)
-                {
-                    byte c = p[pos++];
-                    if (c >= 0x20 && c <= 0x7E) { printable++; if (c == ' ') spaces++; }
-                }
-                if (printable >= 10 && spaces >= 2) goodStrings++;
-                if (pos < scanLen) pos++; // skip null
-            }
-
-            if (goodStrings < 5) continue;
-
-            // Preview first printable string past the header
-            var preview = new System.Text.StringBuilder(64);
-            for (int i = 0; i < scanLen && preview.Length < 64; i++)
-                if (p[i] >= 0x20 && p[i] <= 0x7E) preview.Append((char)p[i]);
-
-            _bmdTextPool = dataStart;
-            _poolSlots   = CapturePoolSlots(dataStart, scanLen);
-            _modLog!.Info(
-                $"[BMD2] TextPool found at 0x{dataStart:X} slots={_poolSlots.Length} (bfBase±512KB): \"{preview}\"");
-
-            // If the LLM already answered while we were still hunting for the pool,
-            // apply that text right now rather than waiting for the next message.
-            string? pending = _lastLlmText;
-            if (pending != null) WritePoolStrings(pending);
+        if (ranked.Count == 0)
+        {
+            if (_bmdScanDoneV2)
+                _modLog!.Info($"[BMD2] No English text page in 0x{start:X}–0x{end:X} after {_bmdScanAttempts} attempts");
             return;
         }
-        // Only report on the final attempt — otherwise this spams once per tick.
-        if (_bmdScanDoneV2)
-            _modLog!.Info($"[BMD2] No text pool found in 0x{start:X}–0x{end:X} after {_bmdScanAttempts} attempts");
+
+        ranked.Sort((a, b) => b.Score.CompareTo(a.Score));
+
+        // Log the top few so a wrong pick is visible in the log instead of silent.
+        for (int i = 0; i < Math.Min(5, ranked.Count); i++)
+        {
+            (int sc, nuint pa) = ranked[i];
+            _modLog!.Info($"[BMD2] cand#{i} 0x{pa:X} score={sc}: \"{PreviewSentences(pa, pageSize, 90)}\"");
+        }
+
+        nuint best = ranked[0].Addr;
+        _bmdTextPool = best;
+        _poolSlots   = CapturePoolSlots(best, pageSize);
+        _modLog!.Info($"[BMD2] TextPool SELECTED 0x{best:X} score={ranked[0].Score} slots={_poolSlots.Length}");
+
+        // If the LLM already answered while we were still hunting for the pool,
+        // apply that text now rather than waiting for the next message.
+        string? pending = _lastLlmText;
+        if (pending != null) WritePoolStrings(pending);
     }
 
-    // Records (offset, original length) for every dialogue-looking string in the pool.
+    private static bool IsVowel(byte c) =>
+        c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u';
+
+    /// <summary>
+    /// True only for a byte run that reads as an English sentence. The earlier
+    /// "≥10 printable, ≥2 spaces" test passed compressed texture data — binary is full
+    /// of 0x20 bytes. These ratios encode what actually separates prose from binary:
+    /// mostly letters, mostly lowercase, a plausible vowel share, few digits, almost
+    /// no symbol junk.
+    /// </summary>
+    private static unsafe bool IsEnglishSentence(byte* p, int len)
+    {
+        if (len < 12 || len > 400) return false;
+
+        int letters = 0, lower = 0, vowels = 0, digits = 0, spaces = 0, other = 0;
+        for (int i = 0; i < len; i++)
+        {
+            byte c = p[i];
+            if (c >= 'a' && c <= 'z')      { letters++; lower++; if (IsVowel(c)) vowels++; }
+            else if (c >= 'A' && c <= 'Z') { letters++; if (IsVowel((byte)(c | 0x20))) vowels++; }
+            else if (c == ' ')             spaces++;
+            else if (c >= '0' && c <= '9') digits++;
+            else if (c == '.' || c == ',' || c == '!' || c == '?' || c == '\'' ||
+                     c == '"' || c == '-' || c == ':' || c == ';') { /* sentence punctuation */ }
+            else other++;
+        }
+
+        if (spaces < 2)                     return false;
+        if (letters * 100 < len * 55)       return false; // ≥55% letters
+        if (lower   * 100 < letters * 40)   return false; // ≥40% of letters lowercase
+        if (vowels  * 100 < letters * 25)   return false; // English runs ~38% vowels
+        if (vowels  * 100 > letters * 60)   return false;
+        if (digits  * 100 > len * 10)       return false; // ≤10% digits
+        if (other   * 100 > len * 5)        return false; // ≤5% symbol junk
+        return true;
+    }
+
+    private static unsafe int CountEnglishSentences(byte* buf, int maxBytes)
+    {
+        int count = 0, pos = 0;
+        while (pos < maxBytes)
+        {
+            int begin = pos;
+            while (pos < maxBytes && buf[pos] != 0) pos++;
+            if (IsEnglishSentence(buf + begin, pos - begin)) count++;
+            if (pos >= maxBytes) break;
+            pos++; // skip '\0'
+        }
+        return count;
+    }
+
+    private static unsafe string PreviewSentences(nuint page, int maxBytes, int maxChars)
+    {
+        var sb = new System.Text.StringBuilder(maxChars + 8);
+        byte* buf = (byte*)page;
+        int pos = 0;
+        while (pos < maxBytes && sb.Length < maxChars)
+        {
+            int begin = pos;
+            while (pos < maxBytes && buf[pos] != 0) pos++;
+            if (IsEnglishSentence(buf + begin, pos - begin))
+            {
+                if (sb.Length > 0) sb.Append(" | ");
+                for (int i = begin; i < pos && sb.Length < maxChars; i++) sb.Append((char)buf[i]);
+            }
+            if (pos >= maxBytes) break;
+            pos++;
+        }
+        return sb.ToString();
+    }
+
+    // Records (offset, original length) for every English entry in the pool.
     // Captured once, before any write, so every later write measures against the
     // ORIGINAL entry lengths. Without this, each pass would re-measure the shortened
     // string it wrote last time and the usable space would ratchet down to nothing.
@@ -660,14 +729,11 @@ public class Mod : IModV1
 
         while (pos < scanLen && slots.Count < 64)
         {
-            int start = pos, printable = 0, spaces = 0;
-            while (pos < scanLen && p[pos] != 0)
-            {
-                byte c = p[pos++];
-                if (c >= 0x20 && c <= 0x7E) { printable++; if (c == ' ') spaces++; }
-            }
-            if (printable >= 10 && spaces >= 2) slots.Add((start, pos - start));
-            if (pos < scanLen) pos++; // skip null
+            int begin = pos;
+            while (pos < scanLen && p[pos] != 0) pos++;
+            if (IsEnglishSentence(p + begin, pos - begin)) slots.Add((begin, pos - begin));
+            if (pos >= scanLen) break;
+            pos++; // skip '\0'
         }
         return slots.ToArray();
     }
@@ -684,7 +750,7 @@ public class Mod : IModV1
 
         const int  pageSize       = 0x1000;
         const uint PAGE_WRITECOPY = 0x08;
-        nuint pageBase = _bmdTextPool - 0x100;
+        nuint pageBase = _bmdTextPool; // pool base is page-aligned since the ranked scan
 
         if (!MemoryGuard.IsWritable(_bmdTextPool, 16) &&
             !MemoryGuard.VirtualProtect(pageBase, (nuint)pageSize, PAGE_WRITECOPY, out _))
