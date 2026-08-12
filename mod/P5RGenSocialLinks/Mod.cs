@@ -317,6 +317,7 @@ public class Mod : IModV1
     private nuint  _confirmedBfBase; // real BF script base (session+0x18, memory-mapped <4 GB)
     private nuint  _bmdBase;         // BMD text table found by TryScanForBmd(); 0 until found
     private bool   _bmdScanDone;     // true after the one-shot scan fires this session
+    private nuint  _currentMsgTextAddr; // session+0xD0 snapshot at msgId confirmation — direct write target
 
     /// <summary>
     /// Runs every poll tick while in a session. Scans the first 1024 bytes of the
@@ -585,7 +586,33 @@ public class Mod : IModV1
                 _currentMsgId    = best;
                 _capturedSession = session;
                 if (_confirmedBfBase == 0) _confirmedBfBase = bfBase;
-                _modLog!.Info($"[MSG] pc=0x{pc:X} msgId=0x{best:X} ({best}) bfBase=0x{bfBase:X}");
+
+                // Capture the current message text pointer from session+0xD0.
+                // This is the address the game is actively displaying from — valid
+                // while BF execution is paused waiting for player input.
+                unsafe
+                {
+                    if (MemoryGuard.IsReadable(session + 0xD0, 8))
+                    {
+                        nuint txtAddr = *(nuint*)((byte*)session + 0xD0);
+                        _currentMsgTextAddr = txtAddr;
+
+                        // Dump first 64 bytes so we can see the message encoding
+                        if (txtAddr != 0 && MemoryGuard.IsReadable(txtAddr, 64))
+                        {
+                            byte* tb = (byte*)txtAddr;
+                            var dumpSb = new System.Text.StringBuilder("[MSG] TextBytes: ");
+                            for (int di = 0; di < 64; di++)
+                            {
+                                if (di > 0 && di % 16 == 0) dumpSb.Append(" | ");
+                                dumpSb.Append($"{tb[di]:X2} ");
+                            }
+                            _modLog!.Info(dumpSb.ToString());
+                        }
+                    }
+                }
+
+                _modLog!.Info($"[MSG] pc=0x{pc:X} msgId=0x{best:X} ({best}) bfBase=0x{bfBase:X} textAddr=0x{_currentMsgTextAddr:X}");
 
                 // Fire-and-forget LLM call; write result to session+0x9B0 on response.
                 // Cannot await inside unsafe — call the async method and discard the Task.
@@ -819,68 +846,37 @@ public class Mod : IModV1
         return true;
     }
 
+    // Write LLM text directly to the address captured from session+0xD0 at msgId
+    // confirmation time. The game pauses BF execution while a message is displayed,
+    // so that address remains valid for the duration of the player's reading window.
+    // The heap allocation is PAGE_READWRITE — no VirtualProtect needed.
     private unsafe bool TryWriteToBmd(ushort msgId, string text)
     {
-        nuint bmdBase = _bmdBase;
-        if (bmdBase == 0)
+        nuint textAddr = _currentMsgTextAddr;
+        if (textAddr == 0)
         {
-            _modLog!.Warn("[BMD] Write: bmdBase=0 (scan not complete yet)");
-            return false;
-        }
-        if (!Memory.MemoryGuard.IsReadable(bmdBase, 4))
-        {
-            _modLog!.Warn($"[BMD] Write: 0x{bmdBase:X} not readable");
+            _modLog!.Warn("[BMD] Write: no textAddr captured yet");
             return false;
         }
 
-        byte* hdr       = (byte*)bmdBase;
-        ushort msgCount = (ushort)(hdr[2] | (hdr[3] << 8));
-        if (msgId >= msgCount)
+        const int MaxWrite = 200;
+        if (!Memory.MemoryGuard.IsWritable(textAddr, MaxWrite))
         {
-            _modLog!.Warn($"[BMD] Write: msgId={msgId} >= msgCount={msgCount}");
+            _modLog!.Warn($"[BMD] Write: 0x{textAddr:X} not writable (sz={MaxWrite})");
             return false;
         }
 
-        // Offset table starts at byte 8: [0D 00] version, [E4 04] count, [4 reserved bytes], then offsets[].
-        uint* offsets   = (uint*)(bmdBase + 8);
-        uint  msgOffset = offsets[msgId];
-        nuint msgAddr   = bmdBase + msgOffset;
-
-        // Slot size = distance to next entry (or end of region for the last entry).
-        uint nextOffset = msgId + 1 < msgCount ? offsets[msgId + 1] : (uint)0x11000;
-        int  slotSize   = (int)(nextOffset - msgOffset);
-
-        // Dump the 8 raw bytes we actually read so we can verify the format.
-        byte* raw = (byte*)(offsets + msgId);
-        _modLog!.Info($"[BMD] Write probe: msgId={msgId} off=0x{msgOffset:X} next=0x{nextOffset:X} slot={slotSize} addr=0x{msgAddr:X} rawBytes=[{raw[0]:X2} {raw[1]:X2} {raw[2]:X2} {raw[3]:X2} | {raw[4]:X2} {raw[5]:X2} {raw[6]:X2} {raw[7]:X2}]");
-
-        if (slotSize <= 1)
-        {
-            _modLog!.Warn($"[BMD] Write: slotSize={slotSize} invalid");
-            return false;
-        }
-
+        // Encode as ASCII — Latin characters are valid single-byte Shift-JIS values,
+        // so the game's text renderer will display them without corruption.
         byte[] encoded = System.Text.Encoding.ASCII.GetBytes(text);
-        int writeLen   = Math.Min(encoded.Length, slotSize - 1);
+        int writeLen   = Math.Min(encoded.Length, MaxWrite - 1);
 
-        // PAGE_WRITECOPY (0x08): required for file-mapped read-only pages.
-        // PAGE_READWRITE fails on MapViewOfFile(FILE_MAP_READ) mappings.
-        // WRITECOPY gives this process a private dirty copy; the on-disk file is untouched.
-        const uint PAGE_WRITECOPY = 0x08;
-        if (!Memory.MemoryGuard.VirtualProtect(msgAddr, (nuint)slotSize, PAGE_WRITECOPY, out uint oldProtect))
-        {
-            int err = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
-            _modLog!.Warn($"[BMD] VirtualProtect failed: err=0x{err:X} addr=0x{msgAddr:X} sz={slotSize}");
-            return false;
-        }
-
-        byte* dst = (byte*)msgAddr;
+        byte* dst = (byte*)textAddr;
         fixed (byte* src = encoded)
-            System.Buffer.MemoryCopy(src, dst, slotSize, writeLen);
+            System.Buffer.MemoryCopy(src, dst, MaxWrite, writeLen);
         dst[writeLen] = 0;
 
-        Memory.MemoryGuard.VirtualProtect(msgAddr, (nuint)slotSize, oldProtect, out _);
-        _modLog!.Info($"[BMD] Wrote {writeLen} bytes to msgId=0x{msgId:X} @ 0x{msgAddr:X}");
+        _modLog!.Info($"[BMD] Wrote {writeLen}b to textAddr=0x{textAddr:X} (msgId=0x{msgId:X})");
         return true;
     }
 
@@ -911,8 +907,9 @@ public class Mod : IModV1
                     _msgIdStreak     = 0;
                     _capturedSession = 0;
                     _confirmedBfBase = 0;
-                    _bmdBase         = 0;
-                    _bmdScanDone     = false;
+                    _bmdBase             = 0;
+                    _bmdScanDone         = false;
+                    _currentMsgTextAddr  = 0;
                     lock (_largeCopyLock) _largeCopyDsts.Clear();
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
                 }
