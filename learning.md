@@ -3793,4 +3793,76 @@ We can only overwrite up to `slotSize` bytes. If the LLM text is longer, we trun
 3. `Marshal.Copy` or a direct `byte*` loop to write bytes
 4. Write a null terminator at `min(llmLen, slotSize - 1)`
 5. VirtualProtect → restore original protect
+
+---
+
+## Chapter 50 — Reverse-Engineering the BMD Offset Table via Known-Anchor Scan
+
+### The problem: offset table location is unknown
+
+We have a binary blob (`_bmdBase`, 0x11000 bytes). We know the first string of actual message text sits at `bmdBase+0x0120`. But reading `bmdBase+8+msgId×4` as a flat `uint32[]` offset table returns `0x3F3F3F3F` — four `3F` bytes, which is just the ASCII `?` character repeated. That region is not an offset table; it's literal content.
+
+The header hex gives us facts:
+```
+0x00: 0D 00        → version = 13 (LE uint16)
+0x02: E4 04        → count  = 1252 (LE uint16)
+0x04: 01 00        → unknown field = 1
+0x06–0x0D: 3F 00 × 4  → four LE uint16 = 63, not offsets
+0x0E–0x19: all 00
+0x1A: 03 01        → unknown
+0x1C+: 00 00, 01 00, 02 00, 03 00 ...  → sequential uint16 (index list?)
+```
+First real string text: `bmdBase+0x0120`. Next strings at `+0x013E`, `+0x0158`.
+
+### Reverse-anchor scan strategy
+
+Instead of guessing the table format, we exploit a known invariant:
+
+> **The offset table must contain the byte offsets of each message.** For message 0, that value is `0x0120`. For message 1, `0x013E`. For message 2, `0x0158`.
+
+So we scan the entire first 1024 bytes of the BMD looking for these exact values as both `uint16` and `uint32`. Wherever we find them clustered, that IS the offset table, and the position of the match tells us:
+- **Table base address** (e.g., `bmdBase + 0x??`)
+- **Entry size** (distance between consecutive hits for msg0 and msg1)
+- **Entry type** (uint16 or uint32)
+
+#### Why this is guaranteed to terminate
+
+The game engine has to look up each message by index to render dialogue. That means a data structure mapping `index → byte_offset` exists somewhere in the BMD or an adjacent table. The string at `+0x0120` is message zero; its offset (`0x0120 = 288`) is a concrete 2-byte or 4-byte value. The scan will find it.
+
+#### Code
+
+```csharp
+byte* scan = (byte*)_bmdBase;
+uint[] knownOffsets = { 0x0120u, 0x013Eu, 0x0158u };
+for (int pos = 4; pos < 1024; pos++)
+{
+    if (!Memory.MemoryGuard.IsReadable(_bmdBase + (nuint)pos, 4)) break;
+    byte* sp = (byte*)(_bmdBase + (nuint)pos);
+    uint v32 = (uint)(sp[0] | sp[1]<<8 | sp[2]<<16 | sp[3]<<24);
+    foreach (uint ko in knownOffsets)
+        if (v32 == ko)
+            _modLog!.Info($"[BMD] OffsetScan: 0x{ko:X} as uint32 at bmd+0x{pos:X}");
+    if (pos < 1023) {
+        ushort v16 = (ushort)(sp[0] | sp[1]<<8);
+        foreach (uint ko in knownOffsets)
+            if (v16 == ko)
+                _modLog!.Info($"[BMD] OffsetScan: 0x{ko:X} as uint16 at bmd+0x{pos:X}");
+    }
+}
+```
+
+#### What to do with the output
+
+Once we see lines like:
+```
+[BMD] OffsetScan: 0x120 as uint16 at bmd+0x1C
+[BMD] OffsetScan: 0x13E as uint16 at bmd+0x1E
+[BMD] OffsetScan: 0x158 as uint16 at bmd+0x20
+```
+That tells us:
+- Table starts at `bmdBase + 0x1C`
+- Entry size = 2 bytes (uint16), stride = 2
+- `msgId N` → `offset = *(uint16*)(bmdBase + 0x1C + N*2)`
+
+We then update `TryWriteToBmd` to read offsets using those discovered constants, and the SKIPPED log lines turn into successful writes.
 6. The game's renderer re-reads from the same address next frame → shows new text

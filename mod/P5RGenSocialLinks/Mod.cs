@@ -750,6 +750,29 @@ public class Mod : IModV1
         }
 
         _modLog!.Info($"[BMD] Logged {count} strings from 0x{_bmdBase:X}.");
+
+        // Reverse-scan: find WHERE in the BMD the known string offsets (0x0120, 0x013E, 0x0158)
+        // are stored, to identify the offset table location and entry size.
+        nuint bmdBase = _bmdBase;
+        uint[] knownOffsets = { 0x0120u, 0x013Eu, 0x0158u };
+        for (int pos = 4; pos < 1024; pos++)
+        {
+            if (!Memory.MemoryGuard.IsReadable(bmdBase + (nuint)pos, 4)) break;
+            byte* sp = (byte*)(bmdBase + (nuint)pos);
+
+            uint v32 = (uint)(sp[0] | (sp[1] << 8) | (sp[2] << 16) | (sp[3] << 24));
+            foreach (uint ko in knownOffsets)
+                if (v32 == ko)
+                    _modLog!.Info($"[BMD] OffsetScan: known=0x{ko:X} found as uint32 at bmd+0x{pos:X}");
+
+            if (pos < 1023)
+            {
+                ushort v16 = (ushort)(sp[0] | (sp[1] << 8));
+                foreach (uint ko in knownOffsets)
+                    if (v16 == ko)
+                        _modLog!.Info($"[BMD] OffsetScan: known=0x{ko:X} found as uint16 at bmd+0x{pos:X}");
+            }
+        }
     }
 
     private async System.Threading.Tasks.Task DispatchMsgLlmAsync(
