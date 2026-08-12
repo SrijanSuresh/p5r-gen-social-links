@@ -165,14 +165,15 @@ public class Mod : IModV1
     private static readonly nuint UserAddrMax = unchecked((nuint)0x7FFFFFFFFFFFUL);
 
     // Applies the 3-hop chain: descriptor → descriptor+0x18 → textObj → *(textObj) → charPtr.
-    // Returns 0 if any link is null, unreadable, below HeapLow, or above the 48-bit VA cap.
+    // Final gate: charPtr must be in valid heap range AND look like English dialogue text.
     private static unsafe nuint FollowTextObjChain(nuint descriptor)
     {
         if (!MemoryGuard.IsReadable(descriptor + 0x18, 8)) return 0;
         nuint textObj = *(nuint*)(descriptor + 0x18);
         if (textObj == 0 || !MemoryGuard.IsReadable(textObj, 8)) return 0;
         nuint charPtr = *(nuint*)textObj;
-        return (charPtr >= HeapLow && charPtr <= UserAddrMax) ? charPtr : 0;
+        if (charPtr < HeapLow || charPtr > UserAddrMax) return 0;
+        return LooksLikeText(charPtr) ? charPtr : 0;
     }
 
     // Returns true if ≥8 printable ASCII bytes and ≥1 space in first 48 bytes — looks
@@ -214,13 +215,14 @@ public class Mod : IModV1
             }
         }
 
-        // Path C: scan session[0x00..0xC8) for external heap pointers
-        const int scanLen = 0xC8;
-        if (!MemoryGuard.IsReadable(session, scanLen)) return 0;
-        byte* sp = (byte*)session;
-        for (int off = 0; off + 8 <= scanLen; off += 8)
+        // Path C: scan session[0x00..0x100) per slot for external heap pointers.
+        // Per-slot IsReadable handles VirtualQuery region boundaries — the bulk check
+        // fails at 0xC8 but individual slots at 0xD8/0xE0 can still be readable.
+        for (int off = 0; off < 0x100; off += 8)
         {
-            nuint ptr = *(nuint*)(sp + off);
+            nuint slotAddr = session + (nuint)off;
+            if (!MemoryGuard.IsReadable(slotAddr, 8)) continue;
+            nuint ptr = *(nuint*)(byte*)slotAddr;
             if (ptr < HeapLow || ptr > UserAddrMax) continue;
             if (ptr >= session && ptr < session + 0x1000) continue; // self-referential
             nuint cp = FollowTextObjChain(ptr);
@@ -734,18 +736,33 @@ public class Mod : IModV1
                             }
                         }
 
-                        // Heap pointer scan: shows fallback descriptor candidates
-                        if (MemoryGuard.IsReadable(session, 0xC8))
+                        // Heap pointer scan over [0x00..0x100) per slot — catches ptrs
+                        // beyond VirtualQuery region boundary (e.g. session+0xE0).
+                        var ptrSb = new System.Text.StringBuilder("[MSG] SessHeapPtrs: ");
+                        for (int di = 0; di < 0x100; di += 8)
                         {
-                            byte* sp = (byte*)session;
-                            var ptrSb = new System.Text.StringBuilder("[MSG] SessHeapPtrs: ");
-                            for (int di = 0; di + 8 <= 0xC8; di += 8)
-                            {
-                                nuint val = *(nuint*)(sp + di);
-                                if (val >= HeapLow && !(val >= session && val < session + 0x1000))
-                                    ptrSb.Append($"+0x{di:X2}→0x{val:X} ");
-                            }
-                            _modLog!.Info(ptrSb.ToString());
+                            nuint slotAddr = session + (nuint)di;
+                            if (!MemoryGuard.IsReadable(slotAddr, 8)) continue;
+                            nuint val = *(nuint*)(byte*)slotAddr;
+                            if (val >= HeapLow && val <= UserAddrMax &&
+                                !(val >= session && val < session + 0x1000))
+                                ptrSb.Append($"+0x{di:X2}→0x{val:X} ");
+                        }
+                        _modLog!.Info(ptrSb.ToString());
+
+                        // Dump first 48 bytes of each external heap target — shows structure layout.
+                        for (int di = 0; di < 0x100; di += 8)
+                        {
+                            nuint slotAddr = session + (nuint)di;
+                            if (!MemoryGuard.IsReadable(slotAddr, 8)) continue;
+                            nuint val = *(nuint*)(byte*)slotAddr;
+                            if (val < HeapLow || val > UserAddrMax) continue;
+                            if (val >= session && val < session + 0x1000) continue;
+                            if (!MemoryGuard.IsReadable(val, 48)) continue;
+                            byte* ep = (byte*)val;
+                            var epSb = new System.Text.StringBuilder($"[MSG] ExtObj+0x{di:X2}(0x{val:X}): ");
+                            for (int ei = 0; ei < 48; ei++) epSb.Append($"{ep[ei]:X2} ");
+                            _modLog!.Info(epSb.ToString());
                         }
                     }
                 }
