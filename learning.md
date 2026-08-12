@@ -3503,3 +3503,185 @@ The confirmed BF buffer (`0x4178E79D48`) and the session struct are in different
 heap arenas — the session struct has NO reachable pointer to the BF buffer within
 any scan window. The copy-log approach bypasses this completely: it records the BF
 buffer address directly at the moment it's written, without needing a pointer chain.
+
+
+---
+
+## Chapter 44 — Reading the BF Script: base pointer, PC, and extracting a msg_id
+
+### The two offsets that matter
+
+We confirmed two fields in the social-link session struct:
+
+| Offset | Width | Meaning |
+|--------|-------|---------|
+| `+0x18` | 8 bytes (pointer) | Base address of the compiled BF script in memory |
+| `+0x20` | 4 bytes (uint32) | PC — byte offset from that base to the *current* instruction |
+
+`bfBase = *(nuint*)(session + 0x18)` is **constant** for the entire hang-out; it is the load address of the `.bf` scene file.  
+`pc = *(uint*)(session + 0x20)` is written by `mov [rbx+20], eax` (confirmed by CE hardware write-trap) and advances with every BF opcode dispatch.
+
+Reading `bfBase + pc` gives us the raw bytes of the instruction the interpreter paused at **after each dialogue box advance**.
+
+### Why `bfBase` appears "below the heap"
+
+Our earlier `HeapLow` filter (`> 0x4000000000`) silently rejected `bfBase` because the BF file is mapped into a non-heap region (~`0x700D7038` range).  Removing the HeapLow guard and accepting any non-zero value was the fix.
+
+### The 32-byte instruction window
+
+Each pause captures a 32-byte snapshot starting at `bfBase + pc`.  
+Empirical data from a Ryuji gym hang-out (msgId = 0x0348 = 840):
+
+```
+pc=0x109: 00 00 00 00 00 00 00 09 00 01 03 05 01 [48 03] 00 ...
+pc=0x139: 00 00 00 00 00 00 00 09 00 01 06 05 01 [48 03] 00 ...
+pc=0x16A: 00 00 00 00 00 00 09 00 01 09 05 01    [48 03] 00 ...
+pc=0x2D9: 00 00 00 00 00 00 00 0A 00 01 03 5B 00 [48 03] 00 ...
+```
+
+`48 03` in little-endian = **0x0348 = 840** — the BMD message index for this scene.  
+The varying bytes (`03`, `06`, `09`) are the sub-line index within the same message.
+
+### The msg_id extraction heuristic
+
+Scanning the 32-byte window for the **last** little-endian uint16 in the range `[0x0200, 0x07FF]` robustly identifies the msg_id:
+
+- Sub-line indices (`03`, `06`, `09` read as `0x0003`, `0x0006`, `0x0009`) are below 0x0200 — filtered out.
+- Opcode bytes (`09`, `0A`, `05`) interpreted as LE pairs (`0x0009`, `0x000A`, `0x0005`) are also below 0x0200 — filtered out.
+- The actual msg_id (`0x0348`, `0x02D6`, `0x02C5`) is always in the 0x0200–0x07FF band.
+
+Taking the **last** occurrence in the 32-byte window avoids the varying sub-line bytes that appear *before* the stable msg_id.
+
+**Confirmation threshold = 3 consecutive windows** with the same value.  This eliminates false positives (values that appear in 1–2 instruction windows but are not real msg_ids).
+
+### The full scene break-down (Ryuji gym, rank-1)
+
+| PC range     | Confirmed msg_id | Interpretation |
+|---|---|---|
+| 0x109–0x16A  | 0x0348 = 840   | Ryuji's gym invite speech (3 sub-lines) |
+| 0x1C1–0x21E  | 0x02D6 = 726   | Follow-up / response segment (4 sub-lines) |
+| 0x360–0x3BE  | 0x02C5 = 709   | Third dialogue segment |
+
+### What comes next: BMD lookup and write-back
+
+The BMD file (Binary Message Data) is the static string table that maps msg_id → null-terminated dialogue text.  The game computes `bmd_base + offset_table[msg_id]` — it never stores a raw string pointer, which is why CE write-breakpoints on the text address found nothing.
+
+To inject LLM text we must:
+1. Find `bmd_base` in memory (the loaded BMD file).
+2. Read `offset_table[msg_id]` to get the string offset.
+3. Write LLM text in-place at `bmd_base + offset`.
+
+**Short-term beta path**: The social-link description text is written *inline* in the session struct at `session+0x9B0` and is readable/writable.  Writing LLM text there lets us display generated content in the hang-out UI while the full BMD injection is wired up.
+
+---
+
+## Chapter 45 — P5R Memory Layout and Finding the BMD
+
+### Two distinct memory regions
+
+P5R uses two address-space zones for runtime data:
+
+| Zone | Address range | What lives here |
+|------|---------------|-----------------|
+| **Lower 4 GB** (memory-mapped) | `0x0–0xFFFF_FFFF` | PAK-file assets loaded by the game's resource manager. Non-heap. VirtualQuery shows `MEM_MAPPED`. |
+| **Upper heap** | `> 0x4000_0000_0000` (HeapLow) | CLR runtime, game-engine objects, session structs, dialogue string pools. `VirtualQuery` shows `MEM_PRIVATE`. |
+
+The BF script is at **`0x702594D8`** (≈ 1.8 GB) — solidly in the mapped-file region.  
+The BMD for the same scene is loaded from the same PAK archive, so it **must be nearby** in the same 4 GB window.
+
+Our earlier `HeapLow` filter silently rejected `bfBase` because we assumed all game data is in the upper heap. It isn't.
+
+### The BF instruction format (confirmed from 32-byte windows)
+
+Every BF dialogue instruction is exactly **12 bytes**:
+
+```
+Offset │ Size │ Field
+───────┼──────┼──────────────────────
+   0   │ 2 B  │ opcode (LE uint16) — 0x0009, 0x000A, 0x000B … increments per exchange
+   2   │ 2 B  │ arg1   (LE uint16) — low byte = 0x01 (const), high byte = line_idx
+   4   │ 2 B  │ arg2   (LE uint16) — varies (speaker param / sub-message index)
+   6   │ 2 B  │ msgId  (LE uint16) — BMD message index (0x0348, 0x02C7, …)
+   8   │ 4 B  │ trailing zeros
+```
+
+The 32-byte window captures **two complete instructions** back-to-back, confirming the 12-byte stride.
+
+### BMD search strategy
+
+The BMD file is somewhere near `bfBase` (±32 MB) in the mapped-file region.  
+Characteristics that distinguish BMD from the BF script (binary bytecode):
+
+| Property | BF script | BMD |
+|---|---|---|
+| Printable ratio | Low (binary opcodes) | High (>60% — all text) |
+| Null-separated strings | 0–5 | 20–200+ |
+| Content | opcode bytes | English dialogue sentences |
+
+Scan using `VirtualQuery` to walk committed regions near `bfBase`.  
+For each region: compute printable%, count English sentences (≥8 chars, ≥2 spaces, ≥3 vowels).  
+The region with the highest sentence count that is NOT the BF script itself is the BMD.
+
+Once found, log the first 30 null-separated strings to:
+1. Confirm it's the right BMD (contains rank-specific dialogue).
+2. Reverse-engineer the offset table format (likely `uint32 count` + `uint32 offsets[count]` + strings).
+
+---
+
+## Chapter 46 — False Positive Analysis and Heuristic Refinement
+
+### What went wrong
+
+The scanner found `0x6FE52000` (size 0x11000, 68 KB) and declared it the BMD with 34 "sentences".  
+The logged strings were 3D skeleton bone names:
+
+```
+"b l b seifuk02"   (len 14)
+"Bip01 R Toe0"     (len 12)
+"b r Blur_asi01"   (len 14)
+```
+
+Why they passed the old filter (`len >= 8`, `spaces >= 2`, `vowels >= 3`, `ascii >= 90%`):
+
+| Check | Bone name "b l b seifuk02" | Verdict |
+|---|---|---|
+| len >= 8 | len = 14 ✓ | passes |
+| spaces >= 2 | 3 spaces ✓ | passes |
+| vowels >= 3 | e,i,u in "seifuk" ✓ | passes |
+| ascii >= 90% | fully ASCII ✓ | passes |
+
+Result: every bone name with an underscore prefix counted as a "sentence".
+
+### The discriminating property: average word length
+
+| Content type | Example | Average word length |
+|---|---|---|
+| Bone names | "b l b seifuk02" | 14 / 4 = 3.5 (padded by 3 single-char tokens) |
+| Real dialogue | "Dude, you're seriously the only one" | 34 / 6 ≈ 5.7 |
+| Labels, filenames | "Bip01 R Toe0" | 12 / 3 = 4 |
+
+The correct discriminators for dialogue:
+1. **Minimum string length 25** — bone names top out around 20 chars.
+2. **Average word length ≥ 4** — `len / (spaces + 1) >= 4` eliminates "b l b …" style token sequences.
+3. **Vowel count ≥ 4** — raised from 3 to reduce borderline passes.
+
+Also noted: `bfBase` is NOT static — it changed from `0x702594D8` to `0x6FFC1258` between two game sessions. It must always be read live from `session+0x18`, not cached across sessions. The current code already does this correctly.
+
+---
+
+## Chapter 47 — Diagnostic Scan: Why the BMD Is Still Hidden
+
+### Two root causes from the ±32 MB scan failure
+
+**Cause 1 — Scan fires every poll tick.**  
+The gate `if (_confirmedBfBase != 0 && _bmdBase == 0)` fires once per poll interval (~500 ms) because `_bmdBase` stays 0. Walking ±32 MB of address space on every tick is wasteful and produces log spam. Fix: add a `_bmdScanDone` bool that flips true on first attempt.
+
+**Cause 2 — BMD header precedes strings.**  
+P5R `.bmd` (message) files start with a binary header: a magic word, string count, then an offset table (4 bytes per string). That header section can be several KB. If the BMD region is, say, 68 KB and the offset table takes the first 10 KB, scanning only the first 8 KB of the region will hit zero real sentences. Fix: scan 32 KB per region.
+
+**Cause 3 — Window may be too narrow.**  
+`bfBase` shifts between `0x6FAA35F8` and `0x702594D8` across runs — the BF script is not at a fixed address. The BMD for the same event is usually in the same CPK archive, but after decompression it may land in a different VirtualAlloc range. Expanding to ±128 MB covers almost the entire lower-4 GB mapped-file zone.
+
+### Diagnostic approach
+
+Instead of stopping at the first 10-sentence region, log EVERY committed readable region that has ≥1 qualifying sentence. Output its base, size, protect flags, first 4 raw bytes (to identify file magic), and sentence count. This gives a full map of what text regions exist in the window and why the threshold isn't being met.

@@ -56,9 +56,11 @@ public class Mod : IModV1
     // Called for every BF instruction. RCX=channel(0x2B), RDX=opcode type byte,
     // R8=opcode_struct[+0x08], R9=opcode_struct[+0x10].
     // When RDX==5 this is a dialogue instruction — log R8/R9 to find the text pointer.
+    // Return type is nuint (not void) — the dispatcher may return a status value
+    // that callers (e.g. FUN_141844f20) check. Declaring void leaves RAX garbage.
     [Function(CallingConventions.Microsoft)]
-    private delegate void BfOpcodeDispatchDelegate(nuint channel, nuint typeAndFlags,
-                                                    nuint arg2, nuint arg3);
+    private delegate nuint BfOpcodeDispatchDelegate(nuint channel, nuint typeAndFlags,
+                                                     nuint arg2, nuint arg3);
 
     private IHook<BfOpcodeDispatchDelegate>? _bfDispatchHook;
 
@@ -90,51 +92,72 @@ public class Mod : IModV1
 
         _llmClient = new LLMClient(_cfg.ServerUrl);
         ServerHealthChecker.CheckAsync(_cfg.ServerUrl, msg => _logger.WriteLine(msg));
+        _logger.WriteLine("[P5RGenSocialLinks] Post-health — entering setup.");
 
-        nuint moduleBase = (nuint)Process.GetCurrentProcess().MainModule!.BaseAddress;
-        _logger.WriteLine($"[P5RGenSocialLinks] Base: 0x{moduleBase:X}");
+        try
+        {
+            nuint moduleBase = (nuint)Process.GetCurrentProcess().MainModule!.BaseAddress;
+            _logger.WriteLine($"[P5RGenSocialLinks] Base: 0x{moduleBase:X}");
 
-        _reader = new SocialLinkReader(moduleBase, _cfg.VerboseChain,
-            msg => _logger!.WriteLine(msg));
-        _bridge = new DialogueBridge(_llmClient!, new LoggerAdapter(_logger!), _cfg);
+            _reader = new SocialLinkReader(moduleBase, _cfg.VerboseChain,
+                msg => _logger!.WriteLine(msg));
+            _logger.WriteLine("[P5RGenSocialLinks] SocialLinkReader OK.");
 
-        loader.GetController<IReloadedHooks>()?.TryGetTarget(out _hooks);
+            _bridge = new DialogueBridge(_llmClient!, new LoggerAdapter(_logger!), _cfg);
+            _logger.WriteLine("[P5RGenSocialLinks] DialogueBridge OK.");
 
-        TryActivateHook();
-        SetupMemcpyHook();
-        SetupBfDispatchHook();
-        StartPollLoop();
+            loader.GetController<IReloadedHooks>()?.TryGetTarget(out _hooks);
+            _logger.WriteLine($"[P5RGenSocialLinks] IReloadedHooks: {(_hooks is not null ? "OK" : "null")}");
 
-        _logger.WriteLine($"[P5RGenSocialLinks] Started — hook:{(_hookActive ? "ON" : "OFF")} poll:ON");
+            TryActivateHook();
+            SetupMemcpyHook();
+            // BfDispatch hook crashes regardless of handler — abandoned, hunting text ptr via CE instead
+            StartPollLoop();
+
+            _logger.WriteLine($"[P5RGenSocialLinks] Started — hook:{(_hookActive ? "ON" : "OFF")} poll:ON");
+        }
+        catch (Exception ex)
+        {
+            _logger.WriteLine($"[P5RGenSocialLinks] STARTUP CRASH: {ex.GetType().Name}: {ex.Message}");
+            _logger.WriteLine(ex.StackTrace ?? "(no stack trace)");
+        }
     }
 
     private bool _hookActive;
 
-    private void SetupBfDispatchHook()
+    private unsafe void SetupBfDispatchHook()
     {
         if (_hooks is null) return;
-        nuint moduleBase = (nuint)Process.GetCurrentProcess().MainModule!.BaseAddress;
-        nuint addr = moduleBase + 0x24EE00;
-        _bfDispatchHook = _hooks.CreateHook<BfOpcodeDispatchDelegate>(
-            OnBfOpcodeDispatch, (long)addr).Activate();
-        _logger!.WriteLine($"[P5RGenSocialLinks] BfDispatch hook ACTIVE at 0x{addr:X}");
+        try
+        {
+            nuint moduleBase = (nuint)Process.GetCurrentProcess().MainModule!.BaseAddress;
+            nuint addr = moduleBase + 0x24EE00;
+
+            // Sanity-check: log first 8 bytes so we can verify this is a real function
+            // prologue and not a data section or already-patched trampoline.
+            byte* p = (byte*)addr;
+            string byteDump = $"{p[0]:X2} {p[1]:X2} {p[2]:X2} {p[3]:X2} {p[4]:X2} {p[5]:X2} {p[6]:X2} {p[7]:X2}";
+            _logger!.WriteLine($"[P5RGenSocialLinks] BfDispatch target 0x{addr:X} bytes: {byteDump}");
+
+            _bfDispatchHook = _hooks.CreateHook<BfOpcodeDispatchDelegate>(
+                OnBfOpcodeDispatch, (long)addr).Activate();
+            _logger!.WriteLine($"[P5RGenSocialLinks] BfDispatch hook ACTIVE at 0x{addr:X}");
+        }
+        catch (Exception ex)
+        {
+            _logger!.WriteLine($"[P5RGenSocialLinks] BfDispatch hook FAILED: {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
-    private unsafe void OnBfOpcodeDispatch(nuint channel, nuint typeAndFlags,
-                                            nuint arg2, nuint arg3)
+    // Diagnostic: bare pass-through — if this crashes, the hook address/convention is wrong.
+    // If this is stable, the crash is in our logging/memory-read code above.
+    private static int _bfCallCount;
+    private unsafe nuint OnBfOpcodeDispatch(nuint channel, nuint typeAndFlags,
+                                             nuint arg2, nuint arg3)
     {
-        _bfDispatchHook!.OriginalFunction(channel, typeAndFlags, arg2, arg3);
-
-        byte opType = (byte)(typeAndFlags & 0xFF);
-        if (opType != 5) return;
-
-        // arg2 (R8) and arg3 (R9) are fields from the opcode struct.
-        // One of them points to the dialogue text in the BF script buffer.
-        // Log both so we can identify the text pointer from the output.
-        string preview2 = TryReadString(arg2);
-        string preview3 = TryReadString(arg3);
-        _modLog!.Info(
-            $"[BFOp5] ch=0x{channel:X} R8=0x{arg2:X}\"{preview2}\" R9=0x{arg3:X}\"{preview3}\"");
+        nuint result = _bfDispatchHook!.OriginalFunction(channel, typeAndFlags, arg2, arg3);
+        System.Threading.Interlocked.Increment(ref _bfCallCount);
+        return result;
     }
 
     private static unsafe string TryReadString(nuint addr)
@@ -155,13 +178,17 @@ public class Mod : IModV1
             _logger!.WriteLine("[P5RGenSocialLinks] Memcpy inner hook skipped — IReloadedHooks null.");
             return;
         }
-        nuint moduleBase = (nuint)Process.GetCurrentProcess().MainModule!.BaseAddress;
-        // Hook the REP MOVSB inner function directly (not the outer dispatcher).
-        // The dialogue system reaches FUN_1405a8570 via a function pointer, bypassing
-        // FUN_1405a8590, so hooking the inner function catches all paths.
-        nuint addr = moduleBase + 0x5A8570;
-        _memcpyHook = _hooks.CreateHook<MemcpyInnerDelegate>(OnGameMemcpy, (long)addr).Activate();
-        _logger!.WriteLine($"[P5RGenSocialLinks] Memcpy inner hook ACTIVE at 0x{addr:X}");
+        try
+        {
+            nuint moduleBase = (nuint)Process.GetCurrentProcess().MainModule!.BaseAddress;
+            nuint addr = moduleBase + 0x5A8570;
+            _memcpyHook = _hooks.CreateHook<MemcpyInnerDelegate>(OnGameMemcpy, (long)addr).Activate();
+            _logger!.WriteLine($"[P5RGenSocialLinks] Memcpy inner hook ACTIVE at 0x{addr:X}");
+        }
+        catch (Exception ex)
+        {
+            _logger!.WriteLine($"[P5RGenSocialLinks] Memcpy hook FAILED: {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
     private unsafe void OnGameMemcpy(nuint dst, nuint src, nuint count)
@@ -282,7 +309,14 @@ public class Mod : IModV1
     // ── Poll loop — session lifecycle + text pool discovery ───────────────
 
     private readonly StructDiffScanner _diffScanner = new();
-    private ushort _lastBfPc;       // change-detection: fires only when PC moves
+    private uint   _lastBfPc;        // change-detection: fires only when PC moves (32-bit per mov [rbx+20],eax)
+    private ushort _msgIdCandidate;  // current candidate from the last BF instruction window
+    private int    _msgIdStreak;     // consecutive windows with the same candidate
+    private ushort _currentMsgId;    // last confirmed msg_id (3+ consecutive windows)
+    private nuint  _capturedSession; // session address when _currentMsgId was last confirmed
+    private nuint  _confirmedBfBase; // real BF script base (session+0x18, memory-mapped <4 GB)
+    private nuint  _bmdBase;         // BMD text table found by TryScanForBmd(); 0 until found
+    private bool   _bmdScanDone;     // true after the one-shot scan fires this session
 
     /// <summary>
     /// Runs every poll tick while in a session. Scans the first 1024 bytes of the
@@ -496,30 +530,272 @@ public class Mod : IModV1
     }
 
     /// <summary>
-    /// Logs one line per dialogue advance using the cached BF buffer + BF PC.
+    /// Fires on every BF PC change. Reads 32 bytes at bfBase+pc (session+0x18 base,
+    /// session+0x20 offset). Extracts msg_id by taking the last LE uint16 in
+    /// [0x0200, 0x07FF] — sub-line indices and opcodes are smaller, unrelated code
+    /// values are larger. Requires 3 consecutive windows with the same value before
+    /// confirming, eliminating one-off code values as false positives.
+    /// When a new msg_id is confirmed, dispatches an LLM request and writes the
+    /// response to session+0x9B0 (social-link description slot, confirmed writable).
     /// </summary>
     private unsafe void ProbeBfLine(nuint session)
     {
-        if (_bfBufferBase == 0) return;   // buffer not found yet
-
-        if (!Memory.MemoryGuard.IsReadable(session + 0x20, 2)) return;
-        ushort pc = *(ushort*)((byte*)session + 0x20);
+        if (!Memory.MemoryGuard.IsReadable(session + 0x18, 12)) return;
+        uint pc = *(uint*)((byte*)session + 0x20);
         if (pc == _lastBfPc) return;
         _lastBfPc = pc;
 
-        nuint lineAddr = _bfBufferBase + pc;
-        if (!Memory.MemoryGuard.IsReadable(lineAddr, 64)) return;
-        byte* b = (byte*)lineAddr;
+        nuint bfBase = *(nuint*)((byte*)session + 0x18);
+        if (bfBase == 0) return;
 
-        var hex  = new System.Text.StringBuilder(24);
-        for (int i = 0; i < 8; i++) hex.Append($"{b[i]:X2} ");
+        nuint instrAddr = bfBase + pc;
+        const int readLen = 32;
+        if (!Memory.MemoryGuard.IsReadable(instrAddr, readLen)) return;
 
-        var text = new System.Text.StringBuilder(128);
-        for (int i = 0; i < 64; i++)
-            if (b[i] >= 0x20 && b[i] <= 0x7E) text.Append((char)b[i]);
+        byte* b = (byte*)instrAddr;
 
-        _modLog!.Info(
-            $"[BFLine] pc=0x{pc:X4} @0x{lineAddr:X} [0x{_bfBufferOff:X3}+pc] [{hex}]: \"{text}\"");
+        // Verbose raw-bytes dump — gated so it doesn't spam the log by default.
+        if (_cfg.StructDiffEnabled)
+        {
+            var hex = new System.Text.StringBuilder(96);
+            for (int i = 0; i < readLen; i++) hex.Append($"{b[i]:X2} ");
+            _modLog!.Info($"[BFInstr] pc=0x{pc:X}: {hex}");
+        }
+
+        // Scan for msg_id: take the LAST LE uint16 in [0x0200, 0x07FF].
+        // Sub-line indices (3,6,9 → 0x0003-0x0009) and opcodes (0x09, 0x0A → <0x0200)
+        // are below the band; large code constants are above it.
+        ushort best = 0;
+        for (int i = 0; i + 1 < readLen; i++)
+        {
+            ushort v = (ushort)(b[i] | (b[i + 1] << 8));
+            if (v >= 0x0200 && v <= 0x07FF) best = v;
+        }
+
+        // Require 3 consecutive windows with the same value before confirming.
+        if (best == 0)
+        {
+            _msgIdStreak = 0;
+        }
+        else if (best == _msgIdCandidate)
+        {
+            _msgIdStreak++;
+            if (_msgIdStreak == 3 && best != _currentMsgId)
+            {
+                _currentMsgId    = best;
+                _capturedSession = session;
+                if (_confirmedBfBase == 0) _confirmedBfBase = bfBase;
+                _modLog!.Info($"[MSG] pc=0x{pc:X} msgId=0x{best:X} ({best}) bfBase=0x{bfBase:X}");
+
+                // Fire-and-forget LLM call; write result to session+0x9B0 on response.
+                // Cannot await inside unsafe — call the async method and discard the Task.
+                SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
+                if (snap is not null)
+                {
+                    nuint  capturedSess = session;
+                    ushort capturedId   = best;
+                    _ = DispatchMsgLlmAsync(snap, capturedId, capturedSess);
+                }
+            }
+        }
+        else
+        {
+            _msgIdCandidate = best;
+            _msgIdStreak    = 1;
+        }
+    }
+
+    // ── BMD scanner ───────────────────────────────────────────────────────
+
+    // Scans the entire lower-4GB mapped-file region for a committed, readable
+    // region containing ≥5 English dialogue sentences (the BMD string table).
+    // Uses an absolute range because bfBase shifts by 200+ MB between runs,
+    // making a relative window unreliable.
+    // Fires once per session (_bmdScanDone gate in caller).
+    private unsafe void TryScanForBmd()
+    {
+        nuint bfBase = _confirmedBfBase;
+        if (bfBase == 0) return;
+
+        const uint  MEM_COMMIT    = 0x1000;
+        const uint  PAGE_READONLY = 0x02;
+        const uint  PAGE_GUARD    = 0x100;
+        // All P5R mapped-file assets observed in [0x60000000, 0xFFFF0000].
+        // Scan the full lower-4GB so the window never misses due to bfBase drift.
+        nuint scanStart = (nuint)0x1000UL;
+        nuint scanEnd   = (nuint)0xFFFF0000UL;
+
+        _modLog!.Info($"[BMD] Scan start: bfBase=0x{bfBase:X} (full lower-4GB scan)");
+
+        int regionsChecked = 0;
+        nuint probe = scanStart;
+        while (probe < scanEnd)
+        {
+            var (ok, regBase, regSize, state, protect) = MemoryGuard.QueryRegion(probe);
+            if (!ok || regSize == 0) break;
+
+            nuint next = regBase + regSize;
+
+            if (state == MEM_COMMIT &&
+                protect == PAGE_READONLY &&           // BMD files are memory-mapped read-only
+                (protect & PAGE_GUARD) == 0 &&
+                regSize >= 1024 &&
+                regSize <= 64u * 1024u * 1024u)
+            {
+                bool isBfPage = bfBase >= regBase && bfBase < regBase + regSize;
+                if (!isBfPage)
+                {
+                    if (MemoryGuard.IsReadable(regBase, 4))
+                    {
+                        // BMD header: [uint16 version=13][uint16 msgCount]
+                        byte* hdr = (byte*)regBase;
+                        if (hdr[0] != 0x0D || hdr[1] != 0x00) goto nextRegion;
+
+                        ushort msgCount = (ushort)(hdr[2] | (hdr[3] << 8));
+                        regionsChecked++;
+                        _modLog!.Info(
+                            $"[BMD] Region 0x{regBase:X} sz=0x{regSize:X} count={msgCount}" +
+                            $" [{hdr[0]:X2} {hdr[1]:X2} {hdr[2]:X2} {hdr[3]:X2}]");
+
+                        // Lock on the largest dialogue BMD (count ≥ 1000).
+                        // Small BMDs (tips, UI) have count < 500; main dialogue has 1252.
+                        if (msgCount >= 1000)
+                        {
+                            _bmdBase = regBase;
+                            _modLog!.Info($"[BMD] Locked: 0x{regBase:X} msgCount={msgCount}");
+                            TryLogBmdStrings();
+                            return;
+                        }
+                        nextRegion:;
+                    }
+                }
+            }
+
+            if (next <= regBase) break; // overflow guard
+            probe = next;
+        }
+
+        _modLog!.Info($"[BMD] Scan done — {regionsChecked} text regions, none hit ≥10 sentences.");
+    }
+
+    private static unsafe int CountPrintableRuns(nuint regionBase, int scanBytes)
+    {
+        byte* p = (byte*)regionBase;
+        int runs = 0;
+        int i = 0;
+
+        while (i < scanBytes)
+        {
+            byte c = p[i];
+            if (c < 0x20 || c >= 0x7F) { i++; continue; }
+
+            int start = i;
+            int letters = 0, spaces = 0;
+            while (i < scanBytes)
+            {
+                c = p[i];
+                if (c < 0x20 || c >= 0x7F) break;
+                if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) letters++;
+                if (c == ' ') spaces++;
+                i++;
+            }
+            int runLen = i - start;
+            if (runLen >= 12 && spaces >= 1 && letters * 10 >= runLen * 6)
+                runs++;
+        }
+
+        return runs;
+    }
+
+    private unsafe void TryLogBmdStrings()
+    {
+        const int MaxScan  = 16384;
+        const int MaxPrint = 30;
+
+        byte* p = (byte*)_bmdBase;
+        int count = 0;
+        int i = 0;
+
+        while (i < MaxScan && count < MaxPrint)
+        {
+            if (p[i] == 0) { i++; continue; }
+
+            int start = i;
+            while (i < MaxScan && p[i] != 0) i++;
+            int len = i - start;
+            if (len < 4) continue;
+
+            var sb = new System.Text.StringBuilder(Math.Min(len, 120) + 4);
+            int printEnd = Math.Min(i, start + 120);
+            for (int j = start; j < printEnd; j++)
+            {
+                byte c = p[j];
+                sb.Append(c >= 0x20 && c < 0x7F ? (char)c : '.');
+            }
+            if (len > 120) sb.Append('…');
+
+            _modLog!.Info($"[BMD][{count:D3}] +0x{start:X4} len={len}: \"{sb}\"");
+            count++;
+        }
+
+        _modLog!.Info($"[BMD] Logged {count} strings from 0x{_bmdBase:X}.");
+    }
+
+    private async System.Threading.Tasks.Task DispatchMsgLlmAsync(
+        SocialLinkSnapshot snap, ushort msgId, nuint session)
+    {
+        using var cts = new System.Threading.CancellationTokenSource(
+            TimeSpan.FromSeconds(_cfg.TimeoutSeconds));
+        try
+        {
+            string ctx = Memory.ContextBuilder.Build(snap) + $" [msg_0x{msgId:X}]";
+            var req = new Server.GenerateRequest
+            {
+                ConfidantId   = snap.ConfidantId,
+                Rank          = snap.RankLevel,
+                Context       = ctx,
+                CharacterName = Memory.ConfidantNames.Resolve(snap.ConfidantId),
+            };
+
+            string text = await _llmClient!.GenerateAsync(req, cts.Token);
+            if (string.IsNullOrWhiteSpace(text)) return;
+
+            _modLog!.Info($"[LLM] msgId=0x{msgId:X}: \"{text[..Math.Min(text.Length, 100)]}\"");
+            bool wrote = TryWriteToSessionDesc(session, text);
+            _modLog!.Info(wrote
+                ? $"[LLM] Wrote {text.Length} chars to session+0x9B0."
+                : "[LLM] Write-back SKIPPED (session gone or slot too small).");
+        }
+        catch (Server.InferenceInFlightException)  { /* server busy, ignore */ }
+        catch (OperationCanceledException)
+        {
+            _modLog!.Warn("[LLM] Timeout — keeping original dialogue.");
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            _modLog!.Warn($"[LLM] Error: {ex.Message}");
+        }
+    }
+
+    private static unsafe bool TryWriteToSessionDesc(nuint session, string text)
+    {
+        nuint addr = session + 0x9B0;
+        if (!Memory.MemoryGuard.IsReadable(addr, 4)) return false;
+
+        byte* cur = (byte*)addr;
+        // Measure existing string length — must not exceed it to avoid overwriting adjacent data.
+        int origLen = 0;
+        while (origLen < 200 && cur[origLen] != 0) origLen++;
+        if (origLen < 4) return false;  // empty/binary slot
+
+        if (!Memory.MemoryGuard.IsWritable(addr, origLen + 1)) return false;
+
+        byte[] encoded = System.Text.Encoding.UTF8.GetBytes(text);
+        int writeLen   = Math.Min(encoded.Length, origLen);
+        fixed (byte* src = encoded)
+            System.Buffer.MemoryCopy(src, cur, origLen, writeLen);
+        cur[writeLen] = 0;
+        return true;
     }
 
     private void StartPollLoop()
@@ -541,9 +817,16 @@ public class Mod : IModV1
                 {
                     _diffScanner.Reset();
                     _bridge!.ResetSession();
-                    _lastBfPc     = 0;
-                    _bfBufferBase = 0;
-                    _bfBufferOff  = 0;
+                    _lastBfPc        = 0;
+                    _bfBufferBase    = 0;
+                    _bfBufferOff     = 0;
+                    _currentMsgId    = 0;
+                    _msgIdCandidate  = 0;
+                    _msgIdStreak     = 0;
+                    _capturedSession = 0;
+                    _confirmedBfBase = 0;
+                    _bmdBase         = 0;
+                    _bmdScanDone     = false;
                     lock (_largeCopyLock) _largeCopyDsts.Clear();
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
                 }
@@ -585,6 +868,13 @@ public class Mod : IModV1
 
             // BF line probe: read current dialogue text from bfBase+pc on every tick.
             ProbeBfLine(session);
+
+            // One-shot BMD scan per session — fires once after first msgId confirmation.
+            if (_confirmedBfBase != 0 && _bmdBase == 0 && !_bmdScanDone)
+            {
+                _bmdScanDone = true;
+                TryScanForBmd();
+            }
         }
     }
 
