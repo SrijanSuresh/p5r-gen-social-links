@@ -730,18 +730,29 @@ public class Mod : IModV1
 
         if (hits.Count == 0) return false;
 
-        // Prefer a header at or after bfBase — that is the script embedded in the BF
-        // currently executing. Among those, take the one with the most English text.
+        // Selection is driven by messageCount, not proximity to bfBase. The running
+        // script indexes message 0x348 (840), so any file declaring fewer entries than
+        // that cannot be the one being read — in the observed run exactly one of 21
+        // files qualified. Among qualifying files take the tightest fit: the smallest
+        // count that still covers the index, since a scene script sized just past the
+        // messages it uses is far likelier than a huge global table.
         (nuint Base, uint Size, uint Count, int Score) pick = default;
         bool found = false;
-        foreach (var h in hits)
+
+        if (_currentMsgId != 0)
         {
-            if (h.Base < center || h.Score <= 0) continue;
-            if (!found || h.Score > pick.Score) { pick = h; found = true; }
+            foreach (var h in hits)
+            {
+                if (h.Count <= _currentMsgId || h.Score <= 0) continue;
+                if (!found || h.Count < pick.Count) { pick = h; found = true; }
+            }
         }
+
+        // No msgId yet, or nothing covers it: fall back to the most English-dense file.
         if (!found)
             foreach (var h in hits)
                 if (h.Score > 0 && (!found || h.Score > pick.Score)) { pick = h; found = true; }
+
         if (!found) return false;
 
         _bmdPoolLen  = ReadableLen(pick.Base, (int)Math.Min(pick.Size, 0x40000u));
@@ -751,9 +762,48 @@ public class Mod : IModV1
             $"[MSG1] SELECTED 0x{pick.Base:X} size={pick.Size} msgs={pick.Count} " +
             $"slots={_poolSlots.Length} (msgId=0x{_currentMsgId:X})");
 
+        DumpMessageTableEntry(pick.Base, pick.Count, _bmdPoolLen);
+
         string? pending = _lastLlmText;
         if (pending != null) WritePoolStrings(pending);
         return true;
+    }
+
+    /// <summary>
+    /// Dumps the message-table entry for the current msgId so the addressing convention
+    /// can be confirmed from a real run rather than assumed. The table follows the 32-byte
+    /// header as (kind:int, offset:int) pairs. What is not yet established is what the
+    /// offset is relative to — the file start or the end of the table — and whether the
+    /// loader has already relocated it to an absolute pointer (the header carries an
+    /// isRelocated flag at +0x1C). Both candidate bases are dumped for comparison.
+    /// </summary>
+    private unsafe void DumpMessageTableEntry(nuint fileBase, uint msgCount, int usableLen)
+    {
+        if (_currentMsgId == 0 || _currentMsgId >= msgCount) return;
+
+        nuint entry = fileBase + 0x20 + (nuint)(_currentMsgId * 8);
+        if (!MemoryGuard.IsReadable(entry, 8)) return;
+
+        uint kind   = *(uint*)entry;
+        uint offset = *(uint*)(entry + 4);
+        _modLog!.Info($"[MSG1] entry[{_currentMsgId}] kind={kind} offset=0x{offset:X}");
+
+        nuint tableEnd = fileBase + 0x20 + (nuint)(msgCount * 8);
+        DumpAt("fileBase+off", fileBase + offset, usableLen, fileBase);
+        DumpAt("tableEnd+off", tableEnd + offset, usableLen, fileBase);
+
+        void DumpAt(string label, nuint at, int limit, nuint origin)
+        {
+            if (at < origin || at - origin >= (nuint)limit) return;
+            if (!MemoryGuard.IsReadable(at, 64)) return;
+            byte* q = (byte*)at;
+            var sb = new System.Text.StringBuilder($"[MSG1] {label} 0x{at:X}: ");
+            for (int i = 0; i < 48; i++) sb.Append($"{q[i]:X2} ");
+            sb.Append(" \"");
+            for (int i = 0; i < 48; i++) sb.Append(IsPrintable(q[i]) ? (char)q[i] : '·');
+            sb.Append('"');
+            _modLog!.Info(sb.ToString());
+        }
     }
 
     /// <summary>
@@ -807,16 +857,24 @@ public class Mod : IModV1
         return true;
     }
 
+    private static bool IsPrintable(byte c) => c >= 0x20 && c <= 0x7E;
+
+    /// <summary>
+    /// Counts maximal runs of printable ASCII that read as English. Runs are delimited by
+    /// ANY non-printable byte, not just NUL. BMD text carries embedded function codes —
+    /// voice cues, speaker-name substitution, line breaks — as control and high bytes, so
+    /// walking only to the next NUL yielded one enormous run per file, which failed the
+    /// len>400 check and scored every message file zero.
+    /// </summary>
     private static unsafe int CountEnglishSentences(byte* buf, int maxBytes)
     {
         int count = 0, pos = 0;
         while (pos < maxBytes)
         {
+            while (pos < maxBytes && !IsPrintable(buf[pos])) pos++;
             int begin = pos;
-            while (pos < maxBytes && buf[pos] != 0) pos++;
-            if (IsEnglishSentence(buf + begin, pos - begin)) count++;
-            if (pos >= maxBytes) break;
-            pos++; // skip '\0'
+            while (pos < maxBytes && IsPrintable(buf[pos])) pos++;
+            if (pos > begin && IsEnglishSentence(buf + begin, pos - begin)) count++;
         }
         return count;
     }
@@ -828,15 +886,14 @@ public class Mod : IModV1
         int pos = 0;
         while (pos < maxBytes && sb.Length < maxChars)
         {
+            while (pos < maxBytes && !IsPrintable(buf[pos])) pos++;
             int begin = pos;
-            while (pos < maxBytes && buf[pos] != 0) pos++;
-            if (IsEnglishSentence(buf + begin, pos - begin))
+            while (pos < maxBytes && IsPrintable(buf[pos])) pos++;
+            if (pos > begin && IsEnglishSentence(buf + begin, pos - begin))
             {
                 if (sb.Length > 0) sb.Append(" | ");
                 for (int i = begin; i < pos && sb.Length < maxChars; i++) sb.Append((char)buf[i]);
             }
-            if (pos >= maxBytes) break;
-            pos++;
         }
         return sb.ToString();
     }
@@ -852,13 +909,14 @@ public class Mod : IModV1
         int pos = 0;
 
         // 512, not 64: a scene's message script holds every line of the conversation.
+        // Runs are delimited by any non-printable byte — see CountEnglishSentences.
         while (pos < scanLen && slots.Count < 512)
         {
+            while (pos < scanLen && !IsPrintable(p[pos])) pos++;
             int begin = pos;
-            while (pos < scanLen && p[pos] != 0) pos++;
-            if (IsEnglishSentence(p + begin, pos - begin)) slots.Add((begin, pos - begin));
-            if (pos >= scanLen) break;
-            pos++; // skip '\0'
+            while (pos < scanLen && IsPrintable(p[pos])) pos++;
+            if (pos > begin && IsEnglishSentence(p + begin, pos - begin))
+                slots.Add((begin, pos - begin));
         }
         return slots.ToArray();
     }
@@ -892,11 +950,15 @@ public class Mod : IModV1
 
         foreach ((int off, int len) in _poolSlots)
         {
-            int wl = Math.Min(enc.Length, len - 1);
+            int wl = Math.Min(enc.Length, len);
             if (wl <= 0) continue;
             fixed (byte* src = enc)
                 System.Buffer.MemoryCopy(src, p + off, len, wl);
-            p[off + wl] = 0;
+            // Pad with spaces rather than writing a NUL. The run is delimited by the
+            // surrounding control bytes (function codes, line breaks) which the message
+            // parser relies on — injecting a terminator inside the run would truncate
+            // the entry as far as the parser is concerned and could desync the page.
+            for (int i = wl; i < len; i++) p[off + i] = (byte)' ';
             written++;
         }
 
