@@ -3685,3 +3685,112 @@ P5R `.bmd` (message) files start with a binary header: a magic word, string coun
 ### Diagnostic approach
 
 Instead of stopping at the first 10-sentence region, log EVERY committed readable region that has ≥1 qualifying sentence. Output its base, size, protect flags, first 4 raw bytes (to identify file magic), and sentence count. This gives a full map of what text regions exist in the window and why the threshold isn't being met.
+
+---
+
+## Chapter 48 — BMD Control Codes and Printable-Run Scanning
+
+### Why null-terminated scanning fails on BMD data
+
+P5R BMD dialogue strings are NOT simple null-terminated strings. They use embedded control codes where `\x00` followed by a non-zero byte is a formatting command (speaker label, line break, color change), not a string terminator. A single displayed line like:
+
+```
+"Strongest, most powerful Personas."
+```
+
+is stored in the BMD as something like:
+
+```
+53 74 72 6F 6E 67 65 73 74 2C  "Strongest,"
+00 01                           [control: line break?]
+6D 6F 73 74 20 70 6F 77 65 72 66 75 6C  "most powerful"
+00 02                           [control: next segment]
+50 65 72 73 6F 6E 61 73 2E     "Personas."
+00 00                           [true terminator]
+```
+
+Our null-terminated scanner stops at the first `\x00 01` and sees "Strongest," (10 chars) — too short to count as a sentence. The full string is never reconstructed.
+
+### The diagnostic signal: `[0D 00 xx xx]` regions
+
+Two PAGE_READONLY (prot=0x2) regions appeared with this magic:
+
+| Region | Magic | LE uint16[0] | LE uint16[1] |
+|--------|-------|------|------|
+| `0x190000` | `0D 00 E4 04` | 13 (version?) | 1252 (string count?) |
+| `0x1B0000` | `0D 00 B5 01` | 13 (version?) | 437 (string count?) |
+
+1252 strings in one file, 437 in another. msgId=840 < 1252 so it fits in the first file. These are the BMD files — but they scored `s=1` because the control-code nulls broke our scanner.
+
+### Printable-run scanning
+
+Instead of looking for null-terminated strings, scan for **contiguous runs of printable ASCII bytes** (0x20–0x7E), ignoring the intervening control code bytes:
+
+```
+Scan byte-by-byte.
+When byte is printable (0x20–0x7E): accumulate into run.
+When byte is non-printable (<0x20 or ≥0x7F): end run, evaluate.
+
+If run length ≥ 12 AND letters ≥ 60% AND spaces ≥ 1 → count it.
+```
+
+"Strongest," + control code + "most powerful" would produce TWO qualifying runs instead of being killed by the null. A BMD region would score 50–100+ runs vs. 0–3 for model/shader assets.
+
+---
+
+## Chapter 49 — BMD Offset Table Lookup and In-Place Write
+
+### The BMD binary layout
+
+Now that we have `_bmdBase = 0x190000`, we need to find exactly where msgId N's text lives inside the file. The BMD format is:
+
+```
+Offset 0x0000:  uint16  version    = 13  (0x0D 0x00)
+Offset 0x0002:  uint16  msgCount   = 1252 (0xE4 0x04)
+Offset 0x0004:  uint32[msgCount]   offset table
+                  Each entry is a byte offset FROM the start of the BMD
+                  to the beginning of that message's data.
+Offset 0x138C:  <string data>      Shift-JIS text + control codes
+```
+
+To get the bytes for msgId N:
+```
+uint* offsetTable = (uint*)(bmdBase + 4);
+uint  msgOffset   = offsetTable[N];          // e.g. 0x2A10
+byte* msgData     = (byte*)bmdBase + msgOffset;
+```
+
+`msgData` now points to the first byte of that dialogue entry.
+
+### Why the region is PAGE_READONLY and how to write to it
+
+The game's asset loader maps BMD files from disk with `CreateFileMapping` + `MapViewOfFile(FILE_MAP_READ)`, which gives PAGE_READONLY pages. You cannot write to them directly — the CPU raises an access violation.
+
+`VirtualProtect` changes the memory protection flags on a page range at runtime without unmapping the view:
+
+```
+VirtualProtect(addr, size, PAGE_READWRITE, out oldProtect)
+// ... write your bytes ...
+VirtualProtect(addr, size, oldProtect, out _)  // restore
+```
+
+This works because the OS kernel only checks protection flags on access — the underlying file mapping stays intact. After restoring PAGE_READONLY, any further writes AV again (good — prevents accidental corruption).
+
+### In-place length constraint
+
+The original string at `msgData` has a fixed byte length determined by the gap between consecutive offset table entries:
+
+```
+slotSize = offsetTable[N+1] - offsetTable[N]   (for N < msgCount - 1)
+```
+
+We can only overwrite up to `slotSize` bytes. If the LLM text is longer, we truncate. If shorter, we null-terminate and leave the trailing bytes as-is (the game reads until its own terminator).
+
+### Write strategy
+
+1. Encode LLM text as ASCII bytes (plain Latin fits; no Shift-JIS needed for our generated output)
+2. VirtualProtect → PAGE_READWRITE
+3. `Marshal.Copy` or a direct `byte*` loop to write bytes
+4. Write a null terminator at `min(llmLen, slotSize - 1)`
+5. VirtualProtect → restore original protect
+6. The game's renderer re-reads from the same address next frame → shows new text

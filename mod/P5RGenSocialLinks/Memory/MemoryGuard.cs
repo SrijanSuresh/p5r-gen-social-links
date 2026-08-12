@@ -14,6 +14,13 @@ internal static class MemoryGuard
         out MEMORY_BASIC_INFORMATION lpBuffer,
         nuint dwLength);
 
+    [DllImport("kernel32.dll")]
+    internal static extern bool VirtualProtect(
+        nuint lpAddress,
+        nuint dwSize,
+        uint  flNewProtect,
+        out uint lpflOldProtect);
+
     [StructLayout(LayoutKind.Sequential)]
     private struct MEMORY_BASIC_INFORMATION
     {

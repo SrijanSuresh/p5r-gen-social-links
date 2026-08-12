@@ -761,10 +761,10 @@ public class Mod : IModV1
             if (string.IsNullOrWhiteSpace(text)) return;
 
             _modLog!.Info($"[LLM] msgId=0x{msgId:X}: \"{text[..Math.Min(text.Length, 100)]}\"");
-            bool wrote = TryWriteToSessionDesc(session, text);
+            bool wrote = TryWriteToBmd(msgId, text);
             _modLog!.Info(wrote
-                ? $"[LLM] Wrote {text.Length} chars to session+0x9B0."
-                : "[LLM] Write-back SKIPPED (session gone or slot too small).");
+                ? $"[LLM] BMD write OK — msgId=0x{msgId:X}"
+                : "[LLM] BMD write SKIPPED (no BMD locked or msgId out of range).");
         }
         catch (Server.InferenceInFlightException)  { /* server busy, ignore */ }
         catch (OperationCanceledException)
@@ -795,6 +795,43 @@ public class Mod : IModV1
         fixed (byte* src = encoded)
             System.Buffer.MemoryCopy(src, cur, origLen, writeLen);
         cur[writeLen] = 0;
+        return true;
+    }
+
+    private unsafe bool TryWriteToBmd(ushort msgId, string text)
+    {
+        nuint bmdBase = _bmdBase;
+        if (bmdBase == 0) return false;
+        if (!Memory.MemoryGuard.IsReadable(bmdBase, 4)) return false;
+
+        byte* hdr      = (byte*)bmdBase;
+        ushort msgCount = (ushort)(hdr[2] | (hdr[3] << 8));
+        if (msgId >= msgCount) return false;
+
+        // Offset table immediately after the 4-byte header.
+        uint* offsets   = (uint*)(bmdBase + 4);
+        uint  msgOffset = offsets[msgId];
+        nuint msgAddr   = bmdBase + msgOffset;
+
+        // Slot size = distance to next entry (or end of region for the last entry).
+        uint nextOffset = msgId + 1 < msgCount ? offsets[msgId + 1] : (uint)0x11000;
+        int  slotSize   = (int)(nextOffset - msgOffset);
+        if (slotSize <= 1) return false;
+
+        byte[] encoded = System.Text.Encoding.ASCII.GetBytes(text);
+        int writeLen   = Math.Min(encoded.Length, slotSize - 1);
+
+        const uint PAGE_READWRITE = 0x04;
+        if (!Memory.MemoryGuard.VirtualProtect(msgAddr, (nuint)slotSize, PAGE_READWRITE, out uint oldProtect))
+            return false;
+
+        byte* dst = (byte*)msgAddr;
+        fixed (byte* src = encoded)
+            System.Buffer.MemoryCopy(src, dst, slotSize, writeLen);
+        dst[writeLen] = 0;
+
+        Memory.MemoryGuard.VirtualProtect(msgAddr, (nuint)slotSize, oldProtect, out _);
+        _modLog!.Info($"[BMD] Wrote {writeLen} bytes to msgId=0x{msgId:X} @ 0x{msgAddr:X}");
         return true;
     }
 
