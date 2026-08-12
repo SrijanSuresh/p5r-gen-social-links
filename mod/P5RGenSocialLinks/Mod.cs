@@ -102,7 +102,10 @@ public class Mod : IModV1
     // Every game object pointer observed so far lands in 0x42xxxxxxxx, while the linear
     // sweep starts at HeapLow (0x4000000000) and spends whole sessions crawling through
     // DirectInput and font data around 0x4188xxxxxx without ever reaching game memory.
-    private static readonly nuint GameHeapStart = unchecked((nuint)0x4200000000UL);
+    // Confirmed dialogue addresses were 0x41DD7F6389 and 0x42102CAAA9, so the sweep must
+    // start below 0x42 — the system-string filter handles the DirectInput and font data
+    // that sits around 0x4188xxxxxx.
+    private static readonly nuint GameHeapStart = unchecked((nuint)0x4100000000UL);
 
     // Pointers harvested from the per-message D0 array — swept before the linear scan,
     // since they point at objects the game is using for the message on screen right now.
@@ -921,6 +924,37 @@ public class Mod : IModV1
         return hits;
     }
 
+    /// <summary>
+    /// ASCII counterpart to <see cref="FindUtf16English"/>. Cheat Engine located the live
+    /// dialogue at 0x41DD7F6389 and 0x42102CAAA9 as single-byte text — in the heap, not
+    /// the mapped BMD region. Both halves of that were already implemented and never
+    /// combined: the ASCII scanners only ever ran over the bfBase vicinity, and the heap
+    /// sweep only ever looked for wide chars.
+    /// </summary>
+    private static unsafe System.Collections.Generic.List<(nuint Addr, string Text)>
+        FindAsciiEnglish(nuint region, int byteLen, int maxHits)
+    {
+        var hits = new System.Collections.Generic.List<(nuint, string)>();
+        byte* p = (byte*)region;
+        int i = 0;
+
+        while (i < byteLen && hits.Count < maxHits)
+        {
+            while (i < byteLen && !IsPrintable(p[i])) i++;
+            int begin = i;
+            while (i < byteLen && IsPrintable(p[i])) i++;
+
+            int len = i - begin;
+            if (len < 10 || len > 400) continue;
+
+            var sb = new System.Text.StringBuilder(len);
+            for (int k = begin; k < i; k++) sb.Append((char)p[k]);
+            string s = sb.ToString();
+            if (IsEnglishString(s)) hits.Add((region + (nuint)begin, s));
+        }
+        return hits;
+    }
+
     private static unsafe string AsciiPreview(nuint addr, int maxChars)
     {
         if (!MemoryGuard.IsReadable(addr, maxChars)) return "";
@@ -1012,7 +1046,13 @@ public class Mod : IModV1
             for (nuint a = sFrom; a < seed + span; a += chunk)
             {
                 if (!MemoryGuard.IsReadable(a, chunk)) continue;
-                foreach (var (addr2, t) in FindUtf16English(a, chunk, 64))
+                foreach (var (addr2, t) in FindAsciiEnglish(a, chunk, 64))
+                {
+                    if (IsSystemString(t)) continue;
+                    _modLog!.Info($"[SEEDASCII] 0x{addr2:X}: \"{t}\"");
+                    if (++_utf16SweepHits >= 40) return;
+                }
+                foreach (var (addr2, t) in FindUtf16English(a, chunk, 16))
                 {
                     if (IsSystemString(t)) continue;
                     _modLog!.Info($"[SEEDUTF16] 0x{addr2:X}: \"{t}\"");
@@ -1047,7 +1087,13 @@ public class Mod : IModV1
                     // 64 candidates per chunk, then filter: the sweep previously spent its
                     // entire hit budget on Windows runtime strings in the low heap and
                     // stopped before reaching any game data.
-                    foreach (var (a, t) in FindUtf16English(from, len, 64))
+                    foreach (var (a, t) in FindAsciiEnglish(from, len, 64))
+                    {
+                        if (IsSystemString(t)) continue;
+                        _modLog!.Info($"[HEAPASCII] 0x{a:X}: \"{t}\"");
+                        if (++_utf16SweepHits >= 40) { _heapSweepCursor = regionEnd; return; }
+                    }
+                    foreach (var (a, t) in FindUtf16English(from, len, 16))
                     {
                         if (IsSystemString(t)) continue;
                         _modLog!.Info($"[HEAPUTF16] 0x{a:X}: \"{t}\"");
