@@ -1403,12 +1403,19 @@ public class Mod : IModV1
         if (ranked.Count == 0) return;
         ranked.Sort((a, b) => b.Score.CompareTo(a.Score));
 
-        // Arm every scored region, not the top 8. The previous run scored 41 regions and
-        // wrote only 8 — the scene's own dialogue is plausibly ranked below that cutoff,
-        // found and then discarded before the write. Ranking has picked wrong at every
-        // threshold tried, so stop relying on it to be right.
-        int take = Math.Min(32, ranked.Count);
+        // Average-per-line ranking put the live scene at #0 ("Here we are... Protein
+        // Lovers gym!", avg 4.72, 36 slots) with item tables at 3.18 and shader source at
+        // 1.00, so the shotgun is no longer needed. Three rather than one: the top few
+        // averages sit close together (4.72 / 4.44 / 4.41) and a miss costs a whole play
+        // session to notice, while two extra regions cost almost nothing.
+        int take = Math.Min(3, ranked.Count);
         _heapPools.Clear();
+
+        // List more than are armed. If the ranking ever shifts and the scene stops
+        // landing near the top, the runners-up are the evidence needed to see why.
+        for (int i = take; i < Math.Min(10, ranked.Count); i++)
+            _modLog!.Info($"[POOL] alt #{i} 0x{ranked[i].Base:X} avg={ranked[i].Score / 100.0:F2}: " +
+                          $"\"{ranked[i].Sample}\"");
 
         for (int i = 0; i < take; i++)
         {
@@ -1416,13 +1423,8 @@ public class Mod : IModV1
             var slots = CapturePoolSlotsSafe(c.Base, c.Len);
             if (slots.Length == 0) continue;
             _heapPools.Add((c.Base, c.Len, slots));
-
-            // Log every armed region, not just the leaders. The region that actually
-            // rendered was #14 — outside the previous 12-line cutoff, so the one entry
-            // that mattered was the one never printed. The properties of the winner are
-            // what a better ranking has to be derived from.
             _modLog!.Info(
-                $"[POOL] #{i} 0x{c.Base:X} len={c.Len} avg={c.Score / 100.0:F2} " +
+                $"[POOL] ARM #{i} 0x{c.Base:X} len={c.Len} avg={c.Score / 100.0:F2} " +
                 $"slots={slots.Length}: \"{c.Sample}\"");
         }
 
