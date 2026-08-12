@@ -87,6 +87,18 @@ public class Mod : IModV1
     // otherwise a single page. Used to size the VirtualProtect call.
     private int _bmdPoolLen = 0x1000;
 
+    // The MSG1 files reachable from bfBase are all global item/skill tables, so the pool
+    // write is now a one-shot probe of the write path rather than a per-message action:
+    // if skill descriptions in-game show the mock text, write→render is proven.
+    private bool _poolWriteDone;
+
+    // UTF-16 hunt state. _utf16CpyLogged caps the memcpy log; the sweep cursor lets a
+    // multi-GB heap scan resume across ticks instead of stalling one.
+    private int   _utf16CpyLogged;
+    private nuint _heapSweepCursor;
+    private int   _utf16SweepHits;
+    private bool  _heapSweepDone;
+
     // Most recent LLM response. Written on the async LLM thread; read volatilely on the
     // game thread inside OnGameMemcpy so no lock is needed (reference read/write is
     // atomic on x64, and we only need eventual visibility, not strict ordering).
@@ -296,12 +308,27 @@ public class Mod : IModV1
             }
         }
 
-        // No small-copy text inspection here. The [MemcpyText] probe established that
-        // dialogue never flows through this function — every capture that passed an
-        // "English text" filter turned out to be an array of heap pointers whose 0x20
-        // bytes happened to look like spaces. The renderer walks the BMD in place, so
-        // the write target is the pool itself (see WritePoolStrings). Scanning bytes on
-        // every memcpy the game makes was pure overhead in a very hot path.
+        // UTF-16 dialogue detection. The earlier ASCII probe concluded dialogue never
+        // flows through this function, but it could not have seen wide-char text at all —
+        // interleaved nulls end every ASCII run after one character. This retries that
+        // question with the right encoding.
+        //
+        // The prefilter reads 8 bytes and rejects nearly every copy the game makes, so
+        // the expensive scan runs only on plausible wide strings. That matters: this is
+        // one of the hottest functions in the process.
+        if (_utf16CpyLogged >= 40 || count < 16 || count > 800) return;
+        if (!Memory.MemoryGuard.IsReadable(dst, (int)count)) return;
+
+        byte* d = (byte*)dst;
+        if (d[1] != 0 || d[3] != 0 || d[5] != 0 || d[7] != 0)      return;
+        if (!IsPrintable(d[0]) || !IsPrintable(d[2]) ||
+            !IsPrintable(d[4]) || !IsPrintable(d[6]))              return;
+
+        var wide = FindUtf16English(dst, (int)count, 1);
+        if (wide.Count == 0) return;
+
+        _utf16CpyLogged++;
+        _modLog!.Info($"[UTF16cpy] src=0x{src:X} dst=0x{dst:X} n={count}: \"{wide[0].Text}\"");
     }
 
     private void TryActivateHook()
@@ -945,6 +972,61 @@ public class Mod : IModV1
             _modLog!.Info($"[UTF16] none within ±64KB of msgObj 0x{obj:X}");
     }
 
+    /// <summary>
+    /// Resumable UTF-16 sweep of the game heap, independent of the session struct.
+    /// session+0xC8 held a live message object one run and the flag value 0x80004001 the
+    /// next, so anything gated on it runs only intermittently; this is anchored to the
+    /// heap itself instead.
+    ///
+    /// A budget of bytes per tick keeps a multi-GB heap from stalling the poll loop —
+    /// the cursor persists so each tick continues where the last stopped.
+    /// </summary>
+    private unsafe void SweepHeapForUtf16()
+    {
+        if (_utf16SweepHits >= 12 || _heapSweepDone) return;
+
+        const long budget    = 24L * 1024 * 1024; // per tick
+        const int  chunk     = 0x100000;          // 1 MB per read
+        const uint MEM_COMMIT = 0x1000, PAGE_NOACCESS = 0x01, PAGE_GUARD = 0x100;
+
+        long  scanned = 0;
+        nuint addr    = _heapSweepCursor != 0 ? _heapSweepCursor : HeapLow;
+
+        while (scanned < budget)
+        {
+            var (ok, regionBase, regionSize, state, protect) = MemoryGuard.QueryRegion(addr);
+            if (!ok || regionSize == 0) { _heapSweepDone = true; break; }
+
+            nuint regionEnd = regionBase + regionSize;
+            if (regionEnd <= addr || regionEnd > UserAddrMax) { _heapSweepDone = true; break; }
+
+            bool usable = state == MEM_COMMIT
+                          && (protect & PAGE_NOACCESS) == 0
+                          && (protect & PAGE_GUARD) == 0;
+
+            if (usable)
+            {
+                nuint from = addr > regionBase ? addr : regionBase;
+                while (from < regionEnd && scanned < budget)
+                {
+                    int len = (int)Math.Min((ulong)(regionEnd - from), (ulong)chunk);
+                    if (len <= 0 || !MemoryGuard.IsReadable(from, len)) break;
+
+                    foreach (var (a, t) in FindUtf16English(from, len, 3))
+                    {
+                        _modLog!.Info($"[HEAPUTF16] 0x{a:X}: \"{t}\"");
+                        if (++_utf16SweepHits >= 12) { _heapSweepCursor = regionEnd; return; }
+                    }
+                    from    += (nuint)len;
+                    scanned += len;
+                }
+            }
+            addr = regionEnd;
+        }
+
+        _heapSweepCursor = addr;
+    }
+
     private static bool IsVowel(byte c) =>
         c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u';
 
@@ -1055,6 +1137,12 @@ public class Mod : IModV1
     private unsafe int WritePoolStrings(string text)
     {
         if (_bmdTextPool == 0 || _poolSlots is null || _poolSlots.Length == 0) return 0;
+
+        // One shot per session. These are the item/skill tables, not scene dialogue, so
+        // rewriting them on every message corrupts more descriptions for no new
+        // information — a single write still answers whether the renderer picks it up.
+        if (_poolWriteDone) return 0;
+        _poolWriteDone = true;
 
         const uint PAGE_WRITECOPY = 0x08;
         nuint pageBase = _bmdTextPool;
@@ -1618,6 +1706,11 @@ public class Mod : IModV1
                     _bmdScanAttempts     = 0;
                     _poolSlots           = null;
                     _bmdPoolLen          = 0x1000;
+                    _poolWriteDone       = false;
+                    _utf16CpyLogged      = 0;
+                    _heapSweepCursor     = 0;
+                    _utf16SweepHits      = 0;
+                    _heapSweepDone       = false;
                     _lastLlmText         = null;
                     lock (_largeCopyLock) _largeCopyDsts.Clear();
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
@@ -1677,6 +1770,11 @@ public class Mod : IModV1
             // One-shot bfBase-vicinity scan: find the BMD dialogue string pool.
             if (_confirmedBfBase != 0 && !_bmdScanDoneV2)
                 TryScanBmdVicinity();
+
+            // UTF-16 heap sweep, once a message is on screen. Budgeted per tick and
+            // resumable, so it does not depend on the session struct exposing anything.
+            if (_currentMsgId != 0)
+                SweepHeapForUtf16();
 
             // One-shot BMD scan per session — fires once after first msgId confirmation.
             if (_confirmedBfBase != 0 && _bmdBase == 0 && !_bmdScanDone)
