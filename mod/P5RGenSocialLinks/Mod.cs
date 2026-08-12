@@ -83,6 +83,10 @@ public class Mod : IModV1
     // Captured once at discovery, BEFORE any write — see CapturePoolSlots for why.
     private (int Off, int Len)[]? _poolSlots;
 
+    // Byte length of the pool region — the MSG1 file size when found via magic,
+    // otherwise a single page. Used to size the VirtualProtect call.
+    private int _bmdPoolLen = 0x1000;
+
     // Most recent LLM response. Written on the async LLM thread; read volatilely on the
     // game thread inside OnGameMemcpy so no lock is needed (reference read/write is
     // atomic on x64, and we only need eventual visibility, not strict ordering).
@@ -595,6 +599,11 @@ public class Mod : IModV1
         nuint center = _confirmedBfBase != 0 ? _confirmedBfBase : _bfBufferBase;
         if (center == 0) return;
 
+        // Preferred path: locate the message script by its MSG1 magic. Content
+        // heuristics alone cannot tell shop text from conversation — they scored the
+        // shoe-shop and Velvet Room files above the scene's own dialogue.
+        if (TryFindMessageScript(center)) return;
+
         // ±8 MB. The previous ±512KB window only reached compressed texture data;
         // the BMD for a conversation is mapped from the same archive as its BF but
         // not necessarily adjacent to it.
@@ -637,6 +646,7 @@ public class Mod : IModV1
 
         nuint best = ranked[0].Addr;
         _bmdTextPool = best;
+        _bmdPoolLen  = pageSize;
         _poolSlots   = CapturePoolSlots(best, pageSize);
         _modLog!.Info($"[BMD2] TextPool SELECTED 0x{best:X} score={ranked[0].Score} slots={_poolSlots.Length}");
 
@@ -644,6 +654,120 @@ public class Mod : IModV1
         // apply that text now rather than waiting for the next message.
         string? pending = _lastLlmText;
         if (pending != null) WritePoolStrings(pending);
+    }
+
+    /// <summary>
+    /// Locates the Atlus MessageScript that belongs to the running BF by scanning for
+    /// the "MSG1" magic. In P5R the message script is normally embedded in the .bf
+    /// flowscript, so the first valid header at or after bfBase is this scene's dialogue.
+    ///
+    /// MessageScript binary header (32 bytes):
+    ///   +0x00 fileType(1) format(1) userId(2)
+    ///   +0x04 fileSize(4)
+    ///   +0x08 magic "MSG1"
+    ///   +0x0C extSize(4)
+    ///   +0x10 relocationTable(4)   +0x14 relocationTableSize(4)
+    ///   +0x18 messageCount(4)
+    ///   +0x1C isRelocated(2) version(2)
+    /// The magic sits at +0x08, so a hit implies a header start 8 bytes earlier.
+    /// </summary>
+    private unsafe bool TryFindMessageScript(nuint center)
+    {
+        const nuint back = 0x100000; // 1 MB before bfBase
+        const nuint fwd  = 0x400000; // 4 MB after — embedded MSG1 trails the BF code
+        nuint start = center > back ? center - back : 0x10000;
+        nuint end   = center + fwd;
+
+        var hits = new System.Collections.Generic.List<(nuint Base, uint Size, uint Count, int Score)>();
+
+        // Walk committed regions rather than probing every page: VirtualQuery skips
+        // whole unmapped spans in one call, so 5 MB costs a handful of syscalls.
+        nuint addr = start;
+        while (addr < end && hits.Count < 32)
+        {
+            var (ok, regionBase, regionSize, state, protect) = MemoryGuard.QueryRegion(addr);
+            if (!ok) break;
+            nuint regionEnd = regionBase + regionSize;
+            if (regionEnd <= addr) break;
+
+            const uint MEM_COMMIT = 0x1000, PAGE_NOACCESS = 0x01, PAGE_GUARD = 0x100;
+            bool usable = state == MEM_COMMIT
+                          && (protect & PAGE_NOACCESS) == 0
+                          && (protect & PAGE_GUARD) == 0;
+
+            if (usable)
+            {
+                nuint scanFrom = addr > regionBase ? addr : regionBase;
+                nuint scanTo   = regionEnd < end ? regionEnd : end;
+
+                for (nuint q = scanFrom; q + 4 < scanTo; q++)
+                {
+                    byte* m = (byte*)q;
+                    if (m[0] != (byte)'M' || m[1] != (byte)'S' ||
+                        m[2] != (byte)'G' || m[3] != (byte)'1') continue;
+                    if (q < 8) continue;
+
+                    nuint hdr = q - 8;
+                    if (!MemoryGuard.IsReadable(hdr, 0x20)) continue;
+
+                    uint fileSize = *(uint*)(hdr + 4);
+                    uint msgCount = *(uint*)(hdr + 0x18);
+                    if (fileSize < 0x40 || fileSize > 0x400000) continue;
+                    if (msgCount == 0 || msgCount > 20000)      continue;
+
+                    int usableLen = ReadableLen(hdr, (int)Math.Min(fileSize, 0x40000u));
+                    if (usableLen < 0x100) continue;
+
+                    int score = CountEnglishSentences((byte*)hdr, usableLen);
+                    hits.Add((hdr, fileSize, msgCount, score));
+                    _modLog!.Info(
+                        $"[MSG1] 0x{hdr:X} size={fileSize} msgs={msgCount} score={score} " +
+                        $"{(hdr >= center ? "after" : "before")}bf: \"{PreviewSentences(hdr, usableLen, 80)}\"");
+                }
+            }
+            addr = regionEnd;
+        }
+
+        if (hits.Count == 0) return false;
+
+        // Prefer a header at or after bfBase — that is the script embedded in the BF
+        // currently executing. Among those, take the one with the most English text.
+        (nuint Base, uint Size, uint Count, int Score) pick = default;
+        bool found = false;
+        foreach (var h in hits)
+        {
+            if (h.Base < center || h.Score <= 0) continue;
+            if (!found || h.Score > pick.Score) { pick = h; found = true; }
+        }
+        if (!found)
+            foreach (var h in hits)
+                if (h.Score > 0 && (!found || h.Score > pick.Score)) { pick = h; found = true; }
+        if (!found) return false;
+
+        _bmdPoolLen  = ReadableLen(pick.Base, (int)Math.Min(pick.Size, 0x40000u));
+        _bmdTextPool = pick.Base;
+        _poolSlots   = CapturePoolSlots(pick.Base, _bmdPoolLen);
+        _modLog!.Info(
+            $"[MSG1] SELECTED 0x{pick.Base:X} size={pick.Size} msgs={pick.Count} " +
+            $"slots={_poolSlots.Length} (msgId=0x{_currentMsgId:X})");
+
+        string? pending = _lastLlmText;
+        if (pending != null) WritePoolStrings(pending);
+        return true;
+    }
+
+    /// <summary>
+    /// Largest length up to <paramref name="want"/> that is fully readable from
+    /// <paramref name="addr"/>, resolved in page steps. A mapped file's tail pages may
+    /// not be resident, so committing to the header's declared size would fail the read.
+    /// </summary>
+    private static int ReadableLen(nuint addr, int want)
+    {
+        const int page = 0x1000;
+        if (MemoryGuard.IsReadable(addr, want)) return want;
+        int len = 0;
+        while (len + page <= want && MemoryGuard.IsReadable(addr, len + page)) len += page;
+        return len;
     }
 
     private static bool IsVowel(byte c) =>
@@ -727,7 +851,8 @@ public class Mod : IModV1
         byte* p = (byte*)poolBase;
         int pos = 0;
 
-        while (pos < scanLen && slots.Count < 64)
+        // 512, not 64: a scene's message script holds every line of the conversation.
+        while (pos < scanLen && slots.Count < 512)
         {
             int begin = pos;
             while (pos < scanLen && p[pos] != 0) pos++;
@@ -748,12 +873,14 @@ public class Mod : IModV1
     {
         if (_bmdTextPool == 0 || _poolSlots is null || _poolSlots.Length == 0) return 0;
 
-        const int  pageSize       = 0x1000;
         const uint PAGE_WRITECOPY = 0x08;
-        nuint pageBase = _bmdTextPool; // pool base is page-aligned since the ranked scan
+        nuint pageBase = _bmdTextPool;
 
+        // VirtualProtect rounds the range out to page boundaries, so an unaligned base
+        // is fine — but the length must cover the whole pool, which for an MSG1 file
+        // spans many pages.
         if (!MemoryGuard.IsWritable(_bmdTextPool, 16) &&
-            !MemoryGuard.VirtualProtect(pageBase, (nuint)pageSize, PAGE_WRITECOPY, out _))
+            !MemoryGuard.VirtualProtect(pageBase, (nuint)_bmdPoolLen, PAGE_WRITECOPY, out _))
         {
             _modLog!.Warn($"[BMD2] VirtualProtect WRITECOPY failed for page 0x{pageBase:X}");
             return 0;
@@ -1299,6 +1426,7 @@ public class Mod : IModV1
                     _bmdScanDoneV2       = false;
                     _bmdScanAttempts     = 0;
                     _poolSlots           = null;
+                    _bmdPoolLen          = 0x1000;
                     _lastLlmText         = null;
                     lock (_largeCopyLock) _largeCopyDsts.Clear();
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");

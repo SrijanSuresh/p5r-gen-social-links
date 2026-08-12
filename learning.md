@@ -4283,3 +4283,75 @@ Every dialogue-looking slot in the pool gets the same text, so a scene will repe
 one line. That is intentional for now — it proves the write reaches the renderer.
 Targeting the single entry for the current `msgId` requires parsing the BMD offset
 table, which is the next step once we have visual confirmation.
+
+---
+
+## Chapter 59: Stop Guessing From Content — Parse the Format
+
+### What the ranked scan actually proved
+
+Chapter 58's prose detector worked exactly as designed. It found real English:
+
+```
+cand#0 score=60: "The highest quality shoes! | Are you prepared if disaster strikes!?"
+cand#1 score=43: "Changed Shido's heart | Started Maruki's Palace"
+cand#2 score=32: "Which Persona will it be? | Select the base Persona."
+```
+
+Shoe shop ads, the journal, the Velvet Room fusion menu. All genuine game text,
+none of it from the scene on screen. The detector answered "is this English?"
+correctly and that turned out to be the wrong question — the address space holds
+dozens of loaded message files and prose-likeness cannot distinguish them.
+
+A heuristic that is working correctly and still gives you the wrong answer is a
+sign the question is wrong, not the thresholds.
+
+### The format has an answer built in
+
+Atlus message files carry a `MSG1` magic and a 32-byte header:
+
+```
++0x00  fileType(1)  format(1)  userId(2)
++0x04  fileSize(4)
++0x08  magic "MSG1"          <- the searchable anchor
++0x0C  extSize(4)
++0x10  relocationTable(4)   +0x14 relocationTableSize(4)
++0x18  messageCount(4)
++0x1C  isRelocated(2)  version(2)
+```
+
+The magic sits at +0x08, so a hit implies the header began 8 bytes earlier. That
+one subtraction converts a byte-pattern match into a structured record: declared
+file size, message count, and a validity check (`0x40 <= fileSize <= 4MB`,
+`0 < messageCount <= 20000`) that binary noise essentially cannot pass by accident.
+
+### Why bfBase is the right anchor
+
+In P5R the message script is normally *embedded inside* the `.bf` flowscript rather
+than shipped as a separate file. The script and its dialogue are one archive entry.
+So the first valid `MSG1` header at or after `bfBase` is this scene's dialogue —
+not the shoe shop's. `bfBase` is the one address this project resolves reliably on
+every single run, which makes it the right thing to anchor to.
+
+### Walking regions instead of probing pages
+
+Scanning 5 MB by probing each 4 KB page costs ~1280 `VirtualQuery` syscalls. Walking
+regions costs a handful:
+
+```csharp
+var (ok, regionBase, regionSize, state, protect) = MemoryGuard.QueryRegion(addr);
+// ... scan this region if committed ...
+addr = regionBase + regionSize;   // jump the whole region, mapped or not
+```
+
+`VirtualQuery` reports the extent of the *entire* run of pages sharing a state, so
+one call skips an unmapped span of any size. Region walking is the general pattern
+for "search a wide address range" — page probing is for "is this one pointer safe."
+
+### ReadableLen: never trust a declared size
+
+The header's `fileSize` describes the file on disk. Its tail pages may not be
+resident in memory. Reading the declared length would fault, so the length is
+resolved down in page steps until it is actually readable, and the scan uses that.
+Declared sizes are a claim about the format; `VirtualQuery` is the truth about
+this process.
