@@ -587,28 +587,48 @@ public class Mod : IModV1
                 _capturedSession = session;
                 if (_confirmedBfBase == 0) _confirmedBfBase = bfBase;
 
-                // Capture the current message text pointer from session+0xD0.
-                // This is the address the game is actively displaying from — valid
-                // while BF execution is paused waiting for player input.
+                // session+0xD0 → a message descriptor struct (not raw text).
+                // The actual text pointer is embedded at descriptor+0x18.
+                // We capture that inner address so TryWriteToBmd writes to the real text.
                 unsafe
                 {
                     if (MemoryGuard.IsReadable(session + 0xD0, 8))
                     {
-                        nuint txtAddr = *(nuint*)((byte*)session + 0xD0);
-                        _currentMsgTextAddr = txtAddr;
+                        nuint descriptor = *(nuint*)((byte*)session + 0xD0);
 
-                        // Dump first 64 bytes so we can see the message encoding
-                        if (txtAddr != 0 && MemoryGuard.IsReadable(txtAddr, 64))
+                        // Dump descriptor so we can verify its layout
+                        if (descriptor != 0 && MemoryGuard.IsReadable(descriptor, 64))
                         {
-                            byte* tb = (byte*)txtAddr;
-                            var dumpSb = new System.Text.StringBuilder("[MSG] TextBytes: ");
+                            byte* db = (byte*)descriptor;
+                            var dumpSb = new System.Text.StringBuilder("[MSG] Descriptor: ");
                             for (int di = 0; di < 64; di++)
                             {
                                 if (di > 0 && di % 16 == 0) dumpSb.Append(" | ");
-                                dumpSb.Append($"{tb[di]:X2} ");
+                                dumpSb.Append($"{db[di]:X2} ");
                             }
                             _modLog!.Info(dumpSb.ToString());
                         }
+
+                        // Follow the text pointer at descriptor+0x18
+                        nuint textAddr = 0;
+                        if (descriptor != 0 && MemoryGuard.IsReadable(descriptor + 0x18, 8))
+                        {
+                            textAddr = *(nuint*)(descriptor + 0x18);
+
+                            // Dump actual text bytes to confirm encoding
+                            if (textAddr != 0 && MemoryGuard.IsReadable(textAddr, 64))
+                            {
+                                byte* tb = (byte*)textAddr;
+                                var txtSb = new System.Text.StringBuilder("[MSG] TextBytes: ");
+                                for (int di = 0; di < 64; di++)
+                                {
+                                    if (di > 0 && di % 16 == 0) txtSb.Append(" | ");
+                                    txtSb.Append($"{tb[di]:X2} ");
+                                }
+                                _modLog!.Info(txtSb.ToString());
+                            }
+                        }
+                        _currentMsgTextAddr = textAddr;
                     }
                 }
 
