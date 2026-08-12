@@ -801,12 +801,24 @@ public class Mod : IModV1
     private unsafe bool TryWriteToBmd(ushort msgId, string text)
     {
         nuint bmdBase = _bmdBase;
-        if (bmdBase == 0) return false;
-        if (!Memory.MemoryGuard.IsReadable(bmdBase, 4)) return false;
+        if (bmdBase == 0)
+        {
+            _modLog!.Warn("[BMD] Write: bmdBase=0 (scan not complete yet)");
+            return false;
+        }
+        if (!Memory.MemoryGuard.IsReadable(bmdBase, 4))
+        {
+            _modLog!.Warn($"[BMD] Write: 0x{bmdBase:X} not readable");
+            return false;
+        }
 
-        byte* hdr      = (byte*)bmdBase;
+        byte* hdr       = (byte*)bmdBase;
         ushort msgCount = (ushort)(hdr[2] | (hdr[3] << 8));
-        if (msgId >= msgCount) return false;
+        if (msgId >= msgCount)
+        {
+            _modLog!.Warn($"[BMD] Write: msgId={msgId} >= msgCount={msgCount}");
+            return false;
+        }
 
         // Offset table immediately after the 4-byte header.
         uint* offsets   = (uint*)(bmdBase + 4);
@@ -816,7 +828,14 @@ public class Mod : IModV1
         // Slot size = distance to next entry (or end of region for the last entry).
         uint nextOffset = msgId + 1 < msgCount ? offsets[msgId + 1] : (uint)0x11000;
         int  slotSize   = (int)(nextOffset - msgOffset);
-        if (slotSize <= 1) return false;
+
+        _modLog!.Info($"[BMD] Write probe: msgId={msgId} off=0x{msgOffset:X} next=0x{nextOffset:X} slot={slotSize} addr=0x{msgAddr:X}");
+
+        if (slotSize <= 1)
+        {
+            _modLog!.Warn($"[BMD] Write: slotSize={slotSize} invalid");
+            return false;
+        }
 
         byte[] encoded = System.Text.Encoding.ASCII.GetBytes(text);
         int writeLen   = Math.Min(encoded.Length, slotSize - 1);
