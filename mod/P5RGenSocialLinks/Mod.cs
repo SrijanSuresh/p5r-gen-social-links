@@ -1242,7 +1242,10 @@ public class Mod : IModV1
         // nearest region the scan reported, so it was never read.
         const int  maxScan     = 0x800000;
         const int  maxRegions  = 4096;
-        const long totalBudget = 512L * 1024 * 1024;
+        // 2 GB, not 512 MB. At 8 MB per region the old budget stopped after 64 regions —
+        // far short of the game's heap — so the scan could exhaust itself before ever
+        // reaching the allocation holding the live scene.
+        const long totalBudget = 2048L * 1024 * 1024;
 
         var ranked = new System.Collections.Generic.List<(int Score, nuint Base, int Len, string Sample)>();
         nuint addr = GameHeapStart;
@@ -1284,6 +1287,12 @@ public class Mod : IModV1
             }
             addr = regionEnd;
         }
+
+        // Coverage matters as much as the ranking: if the budget ran out, the right region
+        // may simply never have been read, which looks identical to a bad ranking.
+        _modLog!.Info($"[POOL] scanned {seen} regions, {totalScanned / (1024 * 1024)} MB, " +
+                      $"{ranked.Count} scored" +
+                      $"{(totalScanned >= totalBudget ? " (BUDGET EXHAUSTED — coverage incomplete)" : "")}");
 
         if (ranked.Count == 0) return;
         ranked.Sort((a, b) => b.Score.CompareTo(a.Score));
@@ -1435,9 +1444,10 @@ public class Mod : IModV1
         byte* p = (byte*)poolBase;
         int pos = 0;
 
-        // 512, not 64: a scene's message script holds every line of the conversation.
-        // Runs are delimited by any non-printable byte — see CountEnglishSentences.
-        while (pos < scanLen && slots.Count < 512)
+        // 20000, not 512. Slots are captured from the region base outward, so a low cap
+        // covered only the first sliver of a multi-megabyte region — text deeper in was
+        // scored but never made writable, which defeated the whole point of scanning it.
+        while (pos < scanLen && slots.Count < 20000)
         {
             while (pos < scanLen && !IsPrintable(p[pos])) pos++;
             int begin = pos;
