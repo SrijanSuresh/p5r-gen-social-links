@@ -38,6 +38,20 @@ internal static class MemoryGuard
         PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
 
     /// <summary>
+    /// Returns the VirtualQuery descriptor for the region that contains
+    /// <paramref name="addr"/>. Used by callers that need to walk the
+    /// address space region-by-region rather than check one range.
+    /// </summary>
+    internal static (bool ok, nuint regionBase, nuint regionSize, uint state, uint protect)
+        QueryRegion(nuint addr)
+    {
+        nint result = VirtualQuery(addr, out var mbi,
+                          (nuint)Marshal.SizeOf<MEMORY_BASIC_INFORMATION>());
+        if (result == 0) return (false, 0, 0, 0, 0);
+        return (true, mbi.BaseAddress, mbi.RegionSize, mbi.State, mbi.Protect);
+    }
+
+    /// <summary>
     /// Returns true only if [addr, addr+size) is fully within a committed,
     /// readable page — safe to dereference without an AV.
     /// </summary>

@@ -3572,3 +3572,56 @@ To inject LLM text we must:
 3. Write LLM text in-place at `bmd_base + offset`.
 
 **Short-term beta path**: The social-link description text is written *inline* in the session struct at `session+0x9B0` and is readable/writable.  Writing LLM text there lets us display generated content in the hang-out UI while the full BMD injection is wired up.
+
+---
+
+## Chapter 45 — P5R Memory Layout and Finding the BMD
+
+### Two distinct memory regions
+
+P5R uses two address-space zones for runtime data:
+
+| Zone | Address range | What lives here |
+|------|---------------|-----------------|
+| **Lower 4 GB** (memory-mapped) | `0x0–0xFFFF_FFFF` | PAK-file assets loaded by the game's resource manager. Non-heap. VirtualQuery shows `MEM_MAPPED`. |
+| **Upper heap** | `> 0x4000_0000_0000` (HeapLow) | CLR runtime, game-engine objects, session structs, dialogue string pools. `VirtualQuery` shows `MEM_PRIVATE`. |
+
+The BF script is at **`0x702594D8`** (≈ 1.8 GB) — solidly in the mapped-file region.  
+The BMD for the same scene is loaded from the same PAK archive, so it **must be nearby** in the same 4 GB window.
+
+Our earlier `HeapLow` filter silently rejected `bfBase` because we assumed all game data is in the upper heap. It isn't.
+
+### The BF instruction format (confirmed from 32-byte windows)
+
+Every BF dialogue instruction is exactly **12 bytes**:
+
+```
+Offset │ Size │ Field
+───────┼──────┼──────────────────────
+   0   │ 2 B  │ opcode (LE uint16) — 0x0009, 0x000A, 0x000B … increments per exchange
+   2   │ 2 B  │ arg1   (LE uint16) — low byte = 0x01 (const), high byte = line_idx
+   4   │ 2 B  │ arg2   (LE uint16) — varies (speaker param / sub-message index)
+   6   │ 2 B  │ msgId  (LE uint16) — BMD message index (0x0348, 0x02C7, …)
+   8   │ 4 B  │ trailing zeros
+```
+
+The 32-byte window captures **two complete instructions** back-to-back, confirming the 12-byte stride.
+
+### BMD search strategy
+
+The BMD file is somewhere near `bfBase` (±32 MB) in the mapped-file region.  
+Characteristics that distinguish BMD from the BF script (binary bytecode):
+
+| Property | BF script | BMD |
+|---|---|---|
+| Printable ratio | Low (binary opcodes) | High (>60% — all text) |
+| Null-separated strings | 0–5 | 20–200+ |
+| Content | opcode bytes | English dialogue sentences |
+
+Scan using `VirtualQuery` to walk committed regions near `bfBase`.  
+For each region: compute printable%, count English sentences (≥8 chars, ≥2 spaces, ≥3 vowels).  
+The region with the highest sentence count that is NOT the BF script itself is the BMD.
+
+Once found, log the first 30 null-separated strings to:
+1. Confirm it's the right BMD (contains rank-specific dialogue).
+2. Reverse-engineer the offset table format (likely `uint32 count` + `uint32 offsets[count]` + strings).
