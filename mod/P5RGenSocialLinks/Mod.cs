@@ -649,22 +649,22 @@ public class Mod : IModV1
                     int probeLen = (int)Math.Min(regSize, 131072u);
                     if (MemoryGuard.IsReadable(regBase, probeLen))
                     {
-                        int sentences = CountDialogueSentences(regBase, probeLen);
+                        int runs = CountPrintableRuns(regBase, probeLen);
                         regionsChecked++;
 
-                        // Log any region with even one qualifying sentence (diagnostic).
-                        if (sentences >= 1)
+                        // Log any region with even one qualifying run (diagnostic).
+                        if (runs >= 1)
                         {
                             byte* p4 = (byte*)regBase;
                             _modLog!.Info(
                                 $"[BMD] Region 0x{regBase:X} sz=0x{regSize:X} prot=0x{protect:X}" +
-                                $" s={sentences} [{p4[0]:X2} {p4[1]:X2} {p4[2]:X2} {p4[3]:X2}]");
+                                $" r={runs} [{p4[0]:X2} {p4[1]:X2} {p4[2]:X2} {p4[3]:X2}]");
                         }
 
-                        if (sentences >= 5)
+                        if (runs >= 5)
                         {
                             _bmdBase = regBase;
-                            _modLog!.Info($"[BMD] Candidate locked: 0x{regBase:X} sentences={sentences}");
+                            _modLog!.Info($"[BMD] Candidate locked: 0x{regBase:X} runs={runs}");
                             TryLogBmdStrings();
                             return;
                         }
@@ -679,40 +679,33 @@ public class Mod : IModV1
         _modLog!.Info($"[BMD] Scan done — {regionsChecked} text regions, none hit ≥10 sentences.");
     }
 
-    private static unsafe int CountDialogueSentences(nuint regionBase, int scanBytes)
+    private static unsafe int CountPrintableRuns(nuint regionBase, int scanBytes)
     {
         byte* p = (byte*)regionBase;
-        int sentences = 0;
+        int runs = 0;
         int i = 0;
 
         while (i < scanBytes)
         {
-            if (p[i] == 0) { i++; continue; }
+            byte c = p[i];
+            if (c < 0x20 || c >= 0x7F) { i++; continue; }
 
             int start = i;
-            while (i < scanBytes && p[i] != 0) i++;
-            int len = i - start;
-            // Short strings (bone names, labels) are always < 25 chars.
-            // Bone names also have very short average word length ("b l b …" → avg 1-2).
-            if (len < 25) continue;
-
-            int spaces = 0, vowels = 0, ascii = 0;
-            for (int j = start; j < i; j++)
+            int letters = 0, spaces = 0;
+            while (i < scanBytes)
             {
-                byte c = p[j];
+                c = p[i];
+                if (c < 0x20 || c >= 0x7F) break;
+                if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) letters++;
                 if (c == ' ') spaces++;
-                byte lc = (byte)(c | 0x20);
-                if (lc == 'a' || lc == 'e' || lc == 'i' || lc == 'o' || lc == 'u') vowels++;
-                if (c >= 0x20 && c < 0x7F) ascii++;
+                i++;
             }
-
-            // avgWordLen = len / (wordCount): filters "b l b seifuk02" (avg ≈ 2)
-            int avgWordLen = len / (spaces + 1);
-            if (spaces >= 2 && vowels >= 4 && ascii >= len * 9 / 10 && avgWordLen >= 4)
-                sentences++;
+            int runLen = i - start;
+            if (runLen >= 12 && spaces >= 1 && letters * 10 >= runLen * 6)
+                runs++;
         }
 
-        return sentences;
+        return runs;
     }
 
     private unsafe void TryLogBmdStrings()
