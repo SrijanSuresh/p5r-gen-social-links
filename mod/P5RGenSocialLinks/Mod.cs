@@ -821,9 +821,16 @@ public class Mod : IModV1
         byte[] encoded = System.Text.Encoding.ASCII.GetBytes(text);
         int writeLen   = Math.Min(encoded.Length, slotSize - 1);
 
-        const uint PAGE_READWRITE = 0x04;
-        if (!Memory.MemoryGuard.VirtualProtect(msgAddr, (nuint)slotSize, PAGE_READWRITE, out uint oldProtect))
+        // PAGE_WRITECOPY (0x08): required for file-mapped read-only pages.
+        // PAGE_READWRITE fails on MapViewOfFile(FILE_MAP_READ) mappings.
+        // WRITECOPY gives this process a private dirty copy; the on-disk file is untouched.
+        const uint PAGE_WRITECOPY = 0x08;
+        if (!Memory.MemoryGuard.VirtualProtect(msgAddr, (nuint)slotSize, PAGE_WRITECOPY, out uint oldProtect))
+        {
+            int err = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+            _modLog!.Warn($"[BMD] VirtualProtect failed: err=0x{err:X} addr=0x{msgAddr:X} sz={slotSize}");
             return false;
+        }
 
         byte* dst = (byte*)msgAddr;
         fixed (byte* src = encoded)

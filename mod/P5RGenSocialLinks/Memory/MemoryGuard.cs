@@ -14,7 +14,7 @@ internal static class MemoryGuard
         out MEMORY_BASIC_INFORMATION lpBuffer,
         nuint dwLength);
 
-    [DllImport("kernel32.dll")]
+    [DllImport("kernel32.dll", SetLastError = true)]
     internal static extern bool VirtualProtect(
         nuint lpAddress,
         nuint dwSize,
