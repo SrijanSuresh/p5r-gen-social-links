@@ -92,6 +92,11 @@ public class Mod : IModV1
     // if skill descriptions in-game show the mock text, write→render is proven.
     private bool _poolWriteDone;
 
+    // True when the pool is the heap dialogue allocation rather than a mapped MSG1 file.
+    // The heap pool is the correct target, so it is rewritten on every message; the
+    // one-shot guard applies only to the MSG1 item tables.
+    private bool _poolIsHeap;
+
     // UTF-16 hunt state. _utf16CpyLogged caps the memcpy log; the sweep cursor lets a
     // multi-GB heap scan resume across ticks instead of stalling one.
     private int   _utf16CpyLogged;
@@ -1175,6 +1180,78 @@ public class Mod : IModV1
         }
     }
 
+    /// <summary>
+    /// Locates the scene's dialogue pool on the heap and captures its slots.
+    ///
+    /// Cheat Engine established the layout: consecutive lines land in the same regions at
+    /// increasing offsets — "Protein Lovers gym!" at 0x41DD7F6389, the next line 0x56A
+    /// later at 0x41DD7F68F3, with a second region advancing by exactly the same delta.
+    /// The scene's lines therefore sit sequentially in one allocation rather than being
+    /// reallocated per line, which makes the containing region a stable write target for
+    /// the whole conversation.
+    ///
+    /// Regions are ranked by how many non-system English sentences they hold and the top
+    /// candidates are logged, so a wrong pick is visible rather than silent — the same
+    /// mistake the mapped-file scan made when it locked onto the shoe shop.
+    /// </summary>
+    private unsafe void TryFindHeapDialoguePool()
+    {
+        const uint MEM_COMMIT = 0x1000, PAGE_NOACCESS = 0x01, PAGE_GUARD = 0x100;
+        const int  maxScan     = 0x40000;   // 256 KB sampled per region
+        const int  maxRegions  = 4096;
+
+        var ranked = new System.Collections.Generic.List<(int Score, nuint Base, int Len, string Sample)>();
+        nuint addr = GameHeapStart;
+        int   seen = 0;
+
+        while (addr < UserAddrMax && seen < maxRegions)
+        {
+            var (ok, regionBase, regionSize, state, protect) = MemoryGuard.QueryRegion(addr);
+            if (!ok || regionSize == 0) break;
+            nuint regionEnd = regionBase + regionSize;
+            if (regionEnd <= addr) break;
+            seen++;
+
+            bool usable = state == MEM_COMMIT
+                          && (protect & PAGE_NOACCESS) == 0
+                          && (protect & PAGE_GUARD) == 0;
+
+            if (usable && regionSize >= 0x1000 && regionSize <= 0x400000)
+            {
+                int len = (int)Math.Min((ulong)regionSize, (ulong)maxScan);
+                if (MemoryGuard.IsReadable(regionBase, len))
+                {
+                    int    score  = 0;
+                    string sample = "";
+                    foreach (var (a, t) in FindAsciiEnglish(regionBase, len, 256))
+                    {
+                        if (IsSystemString(t)) continue;
+                        if (score == 0) sample = t;
+                        score++;
+                    }
+                    if (score >= 5) ranked.Add((score, regionBase, len, sample));
+                }
+            }
+            addr = regionEnd;
+        }
+
+        if (ranked.Count == 0) return;
+        ranked.Sort((a, b) => b.Score.CompareTo(a.Score));
+
+        for (int i = 0; i < Math.Min(5, ranked.Count); i++)
+            _modLog!.Info($"[POOL] cand#{i} 0x{ranked[i].Base:X} score={ranked[i].Score}: \"{ranked[i].Sample}\"");
+
+        var pick = ranked[0];
+        _bmdTextPool = pick.Base;
+        _bmdPoolLen  = pick.Len;
+        _poolIsHeap  = true;
+        _poolSlots   = CapturePoolSlots(pick.Base, pick.Len);
+        _modLog!.Info($"[POOL] SELECTED 0x{pick.Base:X} len={pick.Len} score={pick.Score} slots={_poolSlots.Length}");
+
+        string? pending = _lastLlmText;
+        if (pending != null) WritePoolStrings(pending);
+    }
+
     private static bool IsVowel(byte c) =>
         c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u';
 
@@ -1289,8 +1366,11 @@ public class Mod : IModV1
         // One shot per session. These are the item/skill tables, not scene dialogue, so
         // rewriting them on every message corrupts more descriptions for no new
         // information — a single write still answers whether the renderer picks it up.
-        if (_poolWriteDone) return 0;
-        _poolWriteDone = true;
+        if (!_poolIsHeap)
+        {
+            if (_poolWriteDone) return 0;
+            _poolWriteDone = true;
+        }
 
         const uint PAGE_WRITECOPY = 0x08;
         nuint pageBase = _bmdTextPool;
@@ -1859,6 +1939,7 @@ public class Mod : IModV1
                     _poolSlots           = null;
                     _bmdPoolLen          = 0x1000;
                     _poolWriteDone       = false;
+                    _poolIsHeap          = false;
                     _utf16CpyLogged      = 0;
                     _heapSweepCursor     = 0;
                     _utf16SweepHits      = 0;
@@ -1919,14 +2000,18 @@ public class Mod : IModV1
                 }
             }
 
-            // One-shot bfBase-vicinity scan: find the BMD dialogue string pool.
-            if (_confirmedBfBase != 0 && !_bmdScanDoneV2)
-                TryScanBmdVicinity();
+            // Primary target: the heap dialogue pool. The mapped-file scans below reach
+            // only the global item/skill tables — the live conversation is on the heap,
+            // as ASCII, confirmed at 0x41DD7F6389 / 0x42102CAAA9.
+            if (_currentMsgId != 0 && _bmdTextPool == 0)
+                TryFindHeapDialoguePool();
 
-            // UTF-16 heap sweep, once a message is on screen. Budgeted per tick and
-            // resumable, so it does not depend on the session struct exposing anything.
-            if (_currentMsgId != 0)
-                SweepHeapForUtf16();
+            // Diagnostic sweeps, off by default now that the pool location is known.
+            if (_cfg.StructDiffEnabled)
+            {
+                if (_confirmedBfBase != 0 && !_bmdScanDoneV2) TryScanBmdVicinity();
+                if (_currentMsgId != 0)                       SweepHeapForUtf16();
+            }
 
             // One-shot BMD scan per session — fires once after first msgId confirmation.
             if (_confirmedBfBase != 0 && _bmdBase == 0 && !_bmdScanDone)
