@@ -17,6 +17,7 @@ from pathlib import Path
 
 from .config import LlamaServerConfig, ModelConfig
 from .llama_client import LlamaServerClient
+from .win_job import KillOnCloseJob
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +36,9 @@ class LlamaServerProcess:
         self._model_cfg = model_cfg
         self._proc: subprocess.Popen[bytes] | None = None
         self._log_file: Path = SERVER_DIR / "logs" / "llama-server.log"
+        # Held for this object's lifetime: releasing the job handle is what kills the
+        # child, so it must outlive every normal code path.
+        self._job = KillOnCloseJob()
 
     @property
     def is_running(self) -> bool:
@@ -129,6 +133,10 @@ class LlamaServerProcess:
                 f"failed to spawn {command[0]}: {exc}"
             ) from exc
 
+        # Adopt before waiting for health: the model load is the longest window in
+        # which a force-kill could strand a child holding VRAM and the port.
+        self._job.adopt(self._proc.pid)
+
         self._await_health()
 
     def _await_health(self) -> None:
@@ -170,9 +178,11 @@ class LlamaServerProcess:
     def stop(self, timeout_s: float = 10.0) -> None:
         """Terminate the child, escalating to kill if it does not exit."""
         if self._proc is None:
+            self._job.close()
             return
         if self._proc.poll() is not None:
             self._proc = None
+            self._job.close()
             return
 
         log.info("Stopping llama-server (pid %s) …", self._proc.pid)
@@ -185,3 +195,6 @@ class LlamaServerProcess:
             self._proc.wait()
         finally:
             self._proc = None
+            # Backstop: if terminate and kill both somehow left it alive, closing the
+            # job hands the problem to the kernel.
+            self._job.close()
