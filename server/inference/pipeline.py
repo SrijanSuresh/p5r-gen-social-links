@@ -2,20 +2,37 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Any, Protocol
 
 from .config import ModelConfig
 from social_link.prompt_builder import build_prompt
 from inference.postprocess import clean_response
 
-if TYPE_CHECKING:
-    import llama_cpp
+
+class ChatCompletionBackend(Protocol):
+    """
+    Anything that can answer an OpenAI-shaped chat completion.
+
+    Structural rather than nominal on purpose: this was `llama_cpp.Llama`, is now
+    `LlamaServerClient`, and is a MagicMock under test. All three satisfy it without
+    inheriting from anything, which is what let inference move out of process without
+    touching this file's logic. See learning.md Ch. 62.
+    """
+
+    def create_chat_completion(
+        self,
+        messages: list[Any],
+        max_tokens: int | None = ...,
+        temperature: float | None = ...,
+        top_p: float | None = ...,
+        repeat_penalty: float | None = ...,
+    ) -> dict[str, Any]: ...
 
 
 class InferencePipeline:
-    """Wraps a llama-cpp Llama instance into a single generate() call."""
+    """Wraps a chat-completion backend into a single generate() call."""
 
-    def __init__(self, model: "llama_cpp.Llama", cfg: ModelConfig) -> None:
+    def __init__(self, model: ChatCompletionBackend, cfg: ModelConfig) -> None:
         self._model = model
         self._cfg   = cfg
 

@@ -9,6 +9,9 @@ server/models/*.gguf
 server/models/*.bin
 server/models/*.safetensors
 
+# llama.cpp prebuilt binaries — ~640 MB, fetched by scripts/fetch-llama-server.ps1
+server/vendor/
+
 # .NET
 bin/
 obj/

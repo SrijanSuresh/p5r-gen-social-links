@@ -4496,3 +4496,321 @@ does: validation and copy happen together inside one kernel call.
 A corollary worth carrying: raw pointer walks over another subsystem's live memory
 are safe only for small, immediate reads. Anything that scans in bulk should copy
 first and parse the copy.
+
+## Chapter 62: Process Boundaries Beat Language Bindings
+
+### The wall
+
+The server had been answering `/health` with `"mock"` for weeks. The assumption was a
+stray config flag. The actual cause:
+
+```
+>>> import llama_cpp
+ModuleNotFoundError: No module named 'llama_cpp'
+```
+
+It was never installed. And it could not be, because of a detail that has nothing to
+do with this project:
+
+| | |
+|---|---|
+| The venv | Python 3.13 |
+| Official CUDA wheels | cp39–cp312. No cp313. |
+| PyPI | sdist only — no binaries at all |
+
+`llama-cpp-python` is not Python. It is a C++ library with a thin Python jacket, and
+that jacket is stitched to a specific CPython ABI. A `cp312` wheel contains machine
+code linked against `python312.dll`; loading it into 3.13 is not a version warning,
+it is a missing symbol. So "just install it" decomposes into: install the CUDA
+Toolkit, install MSVC build tools, and compile llama.cpp from source — a multi-hour
+setup that then has to be repeated by every person who installs the mod.
+
+### The thing worth noticing
+
+The dependency was never really on *a Python package*. It was on **llama.cpp**, a C++
+program. The Python package was a delivery mechanism, and it was the delivery
+mechanism imposing every constraint: the ABI pin, the missing wheel, the compiler
+requirement. None of those are properties of the inference engine.
+
+Upstream already publishes exactly what we want, prebuilt:
+
+```
+llama-b10408-bin-win-cuda-12.4-x64.zip     # llama-server.exe + friends
+cudart-llama-bin-win-cuda-12.4-x64.zip     # bundled CUDA runtime DLLs
+```
+
+An `.exe` has no opinion about the Python interpreter that talks to it. Swapping the
+binding for a process boundary deletes the entire class of problem — not by solving
+the ABI mismatch, but by arranging for there not to be an ABI.
+
+### Why the CUDA runtime ships in the zip
+
+`cudart-*.zip` is 391 MB of CUDA runtime DLLs, and shipping it is what removes the
+"install the CUDA Toolkit" step. The split matters because two different things are
+often both called "CUDA":
+
+- **The driver** (`nvidia-smi` reports 13.1 here) — kernel-mode, installed with the GPU driver.
+- **The runtime** (`cudart64_*.dll`) — user-mode, versioned with the toolkit, and
+  legal to ship next to the application.
+
+NVIDIA guarantees *backward* compatibility: a newer driver runs applications built
+against older toolkits. That is why the build tagged 12.4 is the safe pick on a 13.1
+driver, and the 13.3 build is not obviously safer despite the closer number — it
+would rely on minor-version compatibility within CUDA 13, which holds only as long as
+the binary avoids driver APIs newer than the installed driver. Backward compatibility
+is a guarantee; forward compatibility is a hope.
+
+### What the boundary buys beyond the install
+
+The original design loaded the model inside the FastAPI process:
+
+```python
+model     = load_model(_cfg)          # ~15s, blocking, 4.9 GB into VRAM
+_pipeline = InferencePipeline(model, _cfg)
+```
+
+Three consequences, all of which the split fixes:
+
+1. **Startup coupling.** The dialogue server was unavailable until the weights
+   finished loading. Separated, the HTTP server answers `/health` immediately and
+   reports the model as not-yet-ready — a much more useful signal to the mod than a
+   connection refusal.
+2. **Failure coupling.** A CUDA OOM inside the binding takes down the process that
+   the game is talking to. As a child process, the same OOM leaves our server up and
+   able to say *why* it degraded.
+3. **Lifecycle coupling.** Reloading the model, or swapping to a different GGUF,
+   meant restarting the API. Now it does not.
+
+There is a cost, and it should be stated plainly: an extra process to supervise, one
+more thing to fail, and an HTTP hop (sub-millisecond on loopback, against a ~2s
+generation — irrelevant here, but not in every system).
+
+### The interface was already the right shape
+
+The reason this rewrite is small is visible in the existing call:
+
+```python
+response = self._model.create_chat_completion(
+    messages=[{"role": "system", ...}, {"role": "user", ...}],
+    max_tokens=..., temperature=..., top_p=...,
+)
+raw = response["choices"][0]["message"]["content"]
+```
+
+That is the OpenAI chat-completions schema, which is also precisely what
+`llama-server` exposes at `/v1/chat/completions`. `llama-cpp-python` was mirroring
+that schema in-process; the same request shape crosses a socket instead. The port is
+therefore a change of *transport*, not of contract — `build_prompt` and
+`clean_response` on either side of the call never learn that anything moved.
+
+### The general rule
+
+When a dependency is painful, check whether the pain belongs to the thing you need or
+to the wrapper you are getting it through. Native bindings couple you to the host
+language's ABI, its version, and its build toolchain, and they charge that cost to
+every user at install time. A subprocess speaking a documented protocol couples you to
+a wire format — which is versioned far more slowly and can be reimplemented by hand if
+it ever breaks.
+
+Prefer a process boundary to a language binding when the dependency is a program that
+already knows how to be a server.
+
+## Chapter 63: Nobody Runs Your Cleanup Code
+
+### The orphan
+
+With inference moved into a child process, shutdown looked handled:
+
+```python
+yield                    # FastAPI lifespan: everything after this is teardown
+if _process is not None:
+    _process.stop()      # terminate llama-server
+```
+
+Then the parent was force-killed during testing, and:
+
+```
+$ netstat -ano | grep 8766
+  TCP  127.0.0.1:8766  LISTENING  133716        # still there
+```
+
+llama-server survived, holding the port and ~4.9 GB of VRAM. The next start then
+failed its port check — a second, more confusing symptom caused by the first.
+
+### Why the handler did not run
+
+`stop()` is ordinary Python. It runs when the interpreter reaches it, which requires
+the process to still be alive and cooperating. None of these give it that chance:
+
+- `taskkill /F` — `TerminateProcess`, no notification to the target at all
+- Closing the console window — the parent can be killed before its handler finishes
+- Task Manager "End task"
+- A hard crash in the parent
+
+This is the same shape as the `AccessViolationException` in Chapter 61, and it has the
+same moral. There, the fix was not a better `catch` — an uncatchable exception cannot
+be caught — but making the fault impossible by moving validation into the kernel with
+`ReadProcessMemory`. Here the fix is not a better handler. A handler that never runs
+cannot be improved. The cleanup has to happen *somewhere that is not our process*.
+
+### Job Objects
+
+Windows has exactly that mechanism:
+
+```python
+job = kernel32.CreateJobObjectW(None, None)
+info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+kernel32.SetInformationJobObject(job, JobObjectExtendedLimitInformation, ...)
+kernel32.AssignProcessToJobObject(job, child_handle)
+```
+
+A Job Object is a kernel container for processes. `KILL_ON_JOB_CLOSE` says: when the
+last handle to this job closes, terminate everything inside it.
+
+The load-bearing detail is that handles are closed by the **kernel**, as part of
+tearing down a process, whatever killed it. There is no callback, no unwind, no code
+of ours involved. Our process dying *is* the trigger. That is why this survives
+`TerminateProcess` when a `finally` block does not.
+
+Two practical notes:
+
+- **Hold the handle.** The job dies with the last handle, so it lives on the supervisor
+  object for the process lifetime. Closing it early kills the child immediately —
+  which is also exactly how `stop()` uses it as a backstop.
+- **Adopt before waiting for readiness.** Model load is a ~20 s window and the longest
+  stretch in which a force-kill could strand a child. Adopting after the health check
+  would leave precisely the riskiest period unprotected.
+
+### Testing something that requires killing yourself
+
+The real behaviour — child dies when force-killed parent dies — cannot be asserted
+in-process, because demonstrating it means killing the test runner. It was verified
+with a spawned parent/child pair instead:
+
+```
+parent=162732 child=161360 adopted True
+child alive before kill: True
+child alive AFTER force-kill of parent: False
+```
+
+The suite then covers what it usefully can: that closing the job kills its members
+(the same limit, triggered directly), that adoption failure returns `False` rather
+than raising, and that the whole thing no-ops off Windows so CI stays green. When a
+property cannot be tested automatically, test its mechanism and record the manual
+verification — do not pretend the untestable part is covered.
+
+### The general rule
+
+Cleanup that depends on your own code running is not cleanup, it is an optimistic
+default. It handles the polite exits, which are the ones that were never going to
+cause trouble. For any resource whose leak actually hurts — a port, GPU memory, a
+lock, a temp directory — ask what happens when the process is shot in the head, and
+push the release down to something that outlives you: the kernel, the OS, the
+supervisor, the database's session timeout.
+
+"The exit handler didn't run" is not an edge case. It is the normal outcome of every
+abnormal exit, and abnormal exits are the ones worth designing for.
+
+## Chapter 64: The Data You Destroy Is the Data You Need
+
+### The symptom
+
+Generated dialogue was in character and in the right register, and still felt wrong:
+
+```
+Ryuji (scripted):  "A towel?"  →  "Nah, they'll lend you one of them."
+Ryuji (generated): "Time to crush it, let's go all-out on these reps!"
+```
+
+Nothing about that line is incorrect. It is a gym line, in his voice, at the right
+rank. It is also completely deaf to the conversation it replaced.
+
+The context being sent explains why:
+
+```
+"Hang-out with Ryuji Sakamoto (rank 4/10) at Protein Lovers gym.
+ This is a Social Link conversation — ..."
+```
+
+Who, where, how close. Nothing about *what is being said*. The model was writing
+ambience because ambience is all it had the information to write.
+
+### Where the missing context was
+
+In the buffer we were overwriting.
+
+```csharp
+fixed (byte* src = enc)
+    System.Buffer.MemoryCopy(src, p + off, len, wl);
+```
+
+Before that copy, `p + off` holds the scripted line. The write is the only operation
+in the system that touches the script, and it discards it without reading it. The
+information needed to respond to the scene was being destroyed by the act of
+responding to the scene.
+
+This is worth sitting with, because it is a shape that recurs: a destructive operation
+standing exactly where the missing input lives. Migrations that drop the column whose
+old values would validate the migration. Caches invalidated before the recomputation
+that could have reused them. The fix is never to reconstruct the data later — it is to
+notice that the last moment it exists is *right here*, and read it first.
+
+### Ordering is the whole design
+
+The capture has to happen at arm time, before the first write:
+
+```csharp
+if (_sceneScript.Count == 0)
+{
+    var script = CaptureSceneScript(ranked[0].Base, ranked[0].Len, maxLines: 12, maxChars: 480);
+    ...
+}
+foreach (int i in selected) { /* arm regions for writing */ }
+```
+
+Reading lazily — when the context is first needed — would look equivalent and be
+silently wrong. By then the first line has been written, so every slot holds our own
+generated text. The model would receive its own previous output labelled as the
+scene's script, and each generation would drift further from a scene it could no
+longer see. A feedback loop that produces plausible output is far harder to notice
+than one that crashes.
+
+The same reasoning drives an explicit guard, because arming can recur mid-session:
+
+```csharp
+if (_lastLlmText != null && line.Contains(_lastLlmText)) continue;
+```
+
+### Handing over dialogue invites imitation
+
+The first framing was simply the lines. The obvious failure followed: the model
+paraphrased them, which reads worse than generic filler, because a near-copy of the
+original looks like a bug rather than a variation.
+
+```
+"The scene's original dialogue, for subject matter only — do not repeat or
+ paraphrase these lines: ..."
+```
+
+Context is not neutral. Anything placed in a prompt is an implicit instruction, and
+examples are the strongest implicit instruction there is — a model shown text will
+tend to produce text like it. When the intent is *topic* rather than *style*, that has
+to be said, or the examples win.
+
+### Result
+
+```
+before   "Time to crush it, let's go all-out on these reps!"
+after    "What's with the look, you think I'm scrawny?"
+         "Dude, stop tryin', you'll just end up hurtin' yourself."
+```
+
+The second set engages with the actual banter — the ribbing, Ryuji's defensiveness
+about his build — without reusing a line from it.
+
+### The general rule
+
+When output is generically correct but contextually hollow, the question is not which
+model or which sampling parameters. It is what the model was given. Trace the inputs
+before touching the generation, and check specifically whether the thing you need is
+being thrown away somewhere upstream — most often by the very step that needed it.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -11,7 +12,9 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import uvicorn
 
-from inference.config import ModelConfig
+from inference.config import LlamaServerConfig, ModelConfig
+from inference.llama_client import LlamaServerClient, LlamaServerError
+from inference.llama_process import LlamaServerProcess, LlamaServerStartupError
 from inference.pipeline import InferencePipeline
 from inference.queue import InferenceQueue
 from social_link.arcana import get_confidant
@@ -23,26 +26,52 @@ log = logging.getLogger(__name__)
 _MOCK = object()
 
 _pipeline: InferencePipeline | object | None = None
-_queue    = InferenceQueue()
-_cfg      = ModelConfig()
+_queue      = InferenceQueue()
+_cfg        = ModelConfig()
+_server_cfg = LlamaServerConfig()
+_process: LlamaServerProcess | None = None
+_client: LlamaServerClient | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    global _pipeline
+    """
+    Bring up the inference backend, then tear it down.
+
+    Inference runs in a llama-server child process rather than an in-process binding,
+    so a failure here degrades the API to 503 instead of killing it. See
+    learning.md Ch. 62.
+    """
+    global _pipeline, _process, _client
     if os.getenv("MOCK_LLM"):
         log.info("MOCK_LLM=1 — skipping model load, returning canned responses.")
         _pipeline = _MOCK
     else:
-        log.info("Loading model from %s …", _cfg.model_path)
         try:
-            from inference.model_loader import load_model
-            model     = load_model(_cfg)
-            _pipeline = InferencePipeline(model, _cfg)
-            log.info("Model ready.")
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Model load failed (%s). /generate will return 503.", exc)
+            if _server_cfg.autostart:
+                _process = LlamaServerProcess(_server_cfg, _cfg)
+                _process.start()  # returns only once the weights are resident
+            else:
+                log.info(
+                    "LLAMA_AUTOSTART=0 — attaching to existing llama-server at %s",
+                    _server_cfg.base_url,
+                )
+            _client   = LlamaServerClient(_server_cfg, _cfg)
+            _pipeline = InferencePipeline(_client, _cfg)
+            log.info("Inference backend ready at %s", _server_cfg.base_url)
+        except LlamaServerStartupError as exc:
+            # Narrow: a backend that will not start is expected and recoverable, and
+            # the message already carries the child's exit code and log tail.
+            log.warning("llama-server unavailable (%s). /generate will return 503.", exc)
+
     yield
+
+    if _client is not None:
+        _client.close()
+        _client = None
+    if _process is not None:
+        _process.stop()
+        _process = None
     _pipeline = None
 
 
@@ -105,6 +134,11 @@ async def model_info() -> dict[str, object]:
         "n_ctx":        _cfg.n_ctx,
         "max_tokens":   _cfg.max_tokens,
         "temperature":  _cfg.temperature,
+        # Inference runs out of process; surfacing where and whether we spawned it
+        # makes a misconfigured LLAMA_AUTOSTART=0 diagnosable from the mod's log.
+        "backend":         "llama-server",
+        "backend_url":     _server_cfg.base_url,
+        "backend_managed": _process is not None and _process.is_running,
     }
     return info
 
@@ -119,9 +153,23 @@ async def generate(req: GenerateRequest) -> GenerateResponse:
         return GenerateResponse(text=mock_text, session_id=_queue.total_requests)
 
     async def _run() -> str:
-        return _pipeline.generate(req.confidant_id, req.rank, req.context)  # type: ignore[union-attr]
+        # generate() blocks for the whole round-trip (~2s). Running it on the event
+        # loop would stall /health and /stats for that entire window, which the mod
+        # polls — so it goes to a worker thread.
+        return await asyncio.to_thread(
+            _pipeline.generate,  # type: ignore[union-attr]
+            req.confidant_id,
+            req.rank,
+            req.context,
+        )
 
-    result = await _queue.run_if_idle(_run)
+    try:
+        result = await _queue.run_if_idle(_run)
+    except LlamaServerError as exc:
+        # The child died or stopped answering after startup. 503 tells the mod to
+        # fall back to scripted dialogue rather than retry a broken backend.
+        raise HTTPException(status_code=503, detail=f"Inference backend: {exc}") from exc
+
     if result is None:
         raise HTTPException(status_code=429, detail="Inference already in-flight.")
     return GenerateResponse(text=result, session_id=_queue.total_completions)

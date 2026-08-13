@@ -1,8 +1,16 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 pydantic==2.9.2
-# llama-cpp-python with CUDA — install via:
-#   pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu122
-# The package is listed here for reference; the index URL selects the CUDA-enabled wheel.
-llama-cpp-python==0.3.2
+
+# Inference runs in an upstream llama-server.exe child process, reached over
+# loopback HTTP — not through the llama-cpp-python binding.
+#
+# The binding is a C extension pinned to a CPython ABI: official CUDA wheels stop at
+# cp312 (so nothing exists for 3.13), and PyPI ships an sdist only, meaning every
+# install would need the CUDA Toolkit and MSVC. A prebuilt .exe has no opinion about
+# the interpreter talking to it. See learning.md Ch. 62.
+#
+# Fetch the binary with: scripts/fetch-llama-server.ps1
+httpx==0.27.2
+
 huggingface-hub==0.25.2

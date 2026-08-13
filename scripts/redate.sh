@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# redate.sh — spread feature-branch commits evenly across a 2-week window.
+# redate.sh — restamp feature-branch commits across a single working day.
+#
+# All commits on a branch carry the PR day's date. They are spread across working
+# hours on that ONE day, never across multiple days: the work happened in one
+# session and the history should say so.
 #
 # Run from repo root in WSL/Git Bash before opening a PR:
 #   bash scripts/redate.sh [branch] [base]
@@ -7,7 +11,7 @@
 #   branch  feature branch to redate  (default: current branch)
 #   base    merge target               (default: main)
 #
-# Set PR_DATE env var to override end date (default: today).
+# Set PR_DATE env var to override the day (default: today).
 # Example: PR_DATE=2026-08-08 bash scripts/redate.sh
 
 set -euo pipefail
@@ -25,11 +29,12 @@ if [[ $N -eq 0 ]]; then
   exit 0
 fi
 
-echo "Redating $N commits on '$BRANCH' → window: $PR_DATE -14d to $PR_DATE"
+echo "Redating $N commits on '$BRANCH' → $PR_DATE 09:00-17:00 (single day)"
 
-# 14-day window ending on PR date
+# One working day. Deliberately NOT a multi-day window: a branch built in a single
+# session should not appear in the log as a fortnight of work.
+START_TS=$(date -d "$PR_DATE 09:00:00" +%s)
 END_TS=$(date -d "$PR_DATE 17:00:00" +%s)
-START_TS=$(date -d "$PR_DATE -14 days 09:00:00" +%s)
 
 if [[ $N -eq 1 ]]; then
   STEP=0
@@ -37,7 +42,7 @@ else
   STEP=$(( (END_TS - START_TS) / (N - 1) ))
 fi
 
-echo "Interval between commits: ~$((STEP / 3600))h $((STEP % 3600 / 60))m"
+echo "Interval between commits: ~$((STEP / 60))m"
 echo ""
 
 # Stash any uncommitted changes so cherry-pick doesn't trip on them
