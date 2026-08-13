@@ -1403,33 +1403,63 @@ public class Mod : IModV1
         if (ranked.Count == 0) return;
         ranked.Sort((a, b) => b.Score.CompareTo(a.Score));
 
-        // Average-per-line ranking put the live scene at #0 ("Here we are... Protein
-        // Lovers gym!", avg 4.72, 36 slots) with item tables at 3.18 and shader source at
-        // 1.00, so the shotgun is no longer needed. Three rather than one: the top few
-        // averages sit close together (4.72 / 4.44 / 4.41) and a miss costs a whole play
-        // session to notice, while two extra regions cost almost nothing.
-        // Narrowed from 3 after a live crash. Each armed region is overwritten in full,
-        // so this is a blast radius rather than a retry count: three regions wrote 211
-        // slots, and the top-ranked one sampled as "ternTableOffset: -1" — a data table
-        // that scored well on average while not being dialogue at all. Writing unrelated
-        // game structures is a far worse failure than missing a line.
-        int take = Math.Min(Math.Max(_cfg.MaxWriteRegions, 1), ranked.Count);
+        // Average-per-line ranking reliably puts the live scene at #0 ("Here we are...
+        // Protein Lovers gym!", avg 4.72) above item tables at 3.18 and shader source at
+        // 1.00. Rank alone is not enough to pick the write set, though, for two reasons
+        // learned the hard way:
+        //
+        //  - Taking the top 3 by rank once armed "ternTableOffset: -1", a data table that
+        //    averaged well without being dialogue, and writing it crashed the game. Rank
+        //    is a similarity score, not a type check.
+        //  - Taking only #0 rendered nothing. P5R holds the scene's dialogue in TWO
+        //    buffers: one the text log reads, one the renderer reads. Writing #0 filled
+        //    the backlog with generated lines while the speech bubble kept the original.
+        //    The twin was sitting at alt #9 (avg 2.35) with an identical sample — far
+        //    below any sane rank cutoff, and identical in content.
+        //
+        // So: anchor on #0 by rank, then include its content-identical siblings. Matching
+        // on text rather than score finds the second copy wherever it ranks, and cannot
+        // pull in an unrelated structure, because a data table never shares a sample with
+        // the scene's dialogue.
         _heapPools.Clear();
+        string anchorSample = ranked[0].Sample;
 
-        // List more than are armed. If the ranking ever shifts and the scene stops
-        // landing near the top, the runners-up are the evidence needed to see why.
-        for (int i = take; i < Math.Min(10, ranked.Count); i++)
+        var selected = new System.Collections.Generic.List<int> { 0 };
+        for (int i = 1; i < ranked.Count && selected.Count < 8; i++)
+        {
+            if (ranked[i].Sample == anchorSample) selected.Add(i);
+        }
+
+        // MaxWriteRegions still caps rank-based additions, for diagnosing a scene that
+        // ranks poorly. Siblings are exempt: they are the same buffer content, so they
+        // carry the safety of the anchor rather than the risk of an unranked guess.
+        int extraByRank = Math.Max(_cfg.MaxWriteRegions, 1) - 1;
+        for (int i = 1; i < ranked.Count && extraByRank > 0; i++)
+        {
+            if (selected.Contains(i)) continue;
+            selected.Add(i);
+            extraByRank--;
+        }
+        selected.Sort();
+
+        // List the runners-up. If the ranking ever shifts and the scene stops landing at
+        // the top, or a third copy appears, these are the evidence needed to see it.
+        for (int i = 0; i < Math.Min(12, ranked.Count); i++)
+        {
+            if (selected.Contains(i)) continue;
             _modLog!.Info($"[POOL] alt #{i} 0x{ranked[i].Base:X} avg={ranked[i].Score / 100.0:F2}: " +
                           $"\"{ranked[i].Sample}\"");
+        }
 
-        for (int i = 0; i < take; i++)
+        foreach (int i in selected)
         {
             var c = ranked[i];
             var slots = CapturePoolSlotsSafe(c.Base, c.Len);
             if (slots.Length == 0) continue;
             _heapPools.Add((c.Base, c.Len, slots));
+            string why = i == 0 ? "anchor" : (c.Sample == anchorSample ? "twin" : "rank");
             _modLog!.Info(
-                $"[POOL] ARM #{i} 0x{c.Base:X} len={c.Len} avg={c.Score / 100.0:F2} " +
+                $"[POOL] ARM #{i} ({why}) 0x{c.Base:X} len={c.Len} avg={c.Score / 100.0:F2} " +
                 $"slots={slots.Length}: \"{c.Sample}\"");
         }
 
