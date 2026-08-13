@@ -10,6 +10,7 @@ does not mean restarting the API. See learning.md Ch. 62.
 from __future__ import annotations
 
 import logging
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -71,6 +72,27 @@ class LlamaServerProcess:
             "--ctx-size", str(self._model_cfg.n_ctx),
         ]
 
+    def _assert_port_free(self) -> None:
+        """
+        Fail early, and legibly, if something already owns the port.
+
+        Without this the child binds, fails, and exits, and the symptom is an exit
+        code plus a log line buried in the tail — while a foreign service on the same
+        port answers /health with its own 404, which looks like a half-started model
+        rather than a port conflict. Checking first names the real problem.
+        """
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            # No SO_REUSEADDR: the question is whether a live listener holds the port,
+            # which is exactly what a plain bind answers.
+            try:
+                probe.bind((self._cfg.host, self._cfg.port))
+            except OSError as exc:
+                raise LlamaServerStartupError(
+                    f"port {self._cfg.port} on {self._cfg.host} is already in use "
+                    f"({exc}). Another process is listening there — set LLAMA_PORT to "
+                    f"a free port, or stop that process."
+                ) from exc
+
     def start(self) -> None:
         """
         Spawn the child and block until it reports healthy.
@@ -83,6 +105,7 @@ class LlamaServerProcess:
             return
 
         command = self._build_command()
+        self._assert_port_free()
         self._log_file.parent.mkdir(parents=True, exist_ok=True)
 
         log.info("Starting llama-server on %s …", self._cfg.base_url)

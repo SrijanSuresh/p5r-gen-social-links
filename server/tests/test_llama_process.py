@@ -228,3 +228,50 @@ def test_stop_without_start_is_safe(
 ) -> None:
     server_cfg, model_cfg = installed
     LlamaServerProcess(server_cfg, model_cfg).stop()
+
+
+# --- port conflict -----------------------------------------------------------
+
+
+def test_occupied_port_is_reported_before_spawning(
+    installed: tuple[LlamaServerConfig, ModelConfig], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A foreign listener answers /health with its own 404, which reads as a half-started
+    model rather than a port conflict. The pre-flight check must name the real cause,
+    and must do so without launching a doomed child.
+    """
+    import socket as socket_module
+
+    server_cfg, model_cfg = installed
+    with socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM) as squatter:
+        squatter.bind((server_cfg.host, 0))
+        squatter.listen(1)
+        taken_port = squatter.getsockname()[1]
+
+        conflicted = LlamaServerConfig(
+            binary_path=server_cfg.binary_path, port=taken_port
+        )
+        proc = LlamaServerProcess(conflicted, model_cfg)
+
+        spawns: list[int] = []
+        monkeypatch.setattr(
+            subprocess, "Popen", lambda *a, **k: spawns.append(1) or _StubProc([None])
+        )
+
+        with pytest.raises(LlamaServerStartupError, match="already in use"):
+            proc.start()
+        assert not spawns, "must not spawn a child that cannot bind"
+
+
+def test_free_port_passes_the_preflight_check(
+    installed: tuple[LlamaServerConfig, ModelConfig], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server_cfg, model_cfg = installed
+    proc = LlamaServerProcess(server_cfg, model_cfg)
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: _StubProc([None]))
+    monkeypatch.setattr(
+        "inference.llama_process.LlamaServerClient.is_healthy", lambda self: True
+    )
+    proc.start()
+    assert proc.is_running

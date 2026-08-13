@@ -60,7 +60,12 @@ class LlamaServerConfig:
     host: str = field(default_factory=lambda: os.getenv("LLAMA_HOST", "127.0.0.1"))
 
     # Distinct from the FastAPI port (8765) — both listen on loopback simultaneously.
-    port: int = field(default_factory=lambda: int(os.getenv("LLAMA_PORT", "8080")))
+    #
+    # Deliberately not 8080, llama.cpp's own default: that port is heavily contested
+    # on developer machines (Apache, Tomcat, node dev servers, and this machine's own
+    # httpd service all want it). Sitting next to the FastAPI port keeps the pair
+    # obviously related and out of the way.
+    port: int = field(default_factory=lambda: int(os.getenv("LLAMA_PORT", "8766")))
 
     # Path to llama-server.exe, relative to server/. Populated by
     # scripts/fetch-llama-server.ps1, which extracts the release zips into vendor/.

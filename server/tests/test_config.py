@@ -63,7 +63,7 @@ def test_n_ctx_too_small_raises() -> None:
 def test_llama_server_default_config_is_valid() -> None:
     cfg = LlamaServerConfig()
     assert cfg.host == "127.0.0.1"
-    assert cfg.port == 8080
+    assert cfg.port == 8766
     assert cfg.autostart is True
 
 
@@ -95,3 +95,12 @@ def test_llama_server_negative_startup_timeout_raises() -> None:
 def test_llama_server_zero_request_timeout_raises() -> None:
     with pytest.raises(ValueError, match="request_timeout_s"):
         LlamaServerConfig(request_timeout_s=0.0)
+
+
+def test_llama_server_avoids_contested_port_8080() -> None:
+    """
+    8080 is llama.cpp's own default and is routinely taken — Apache holds it on this
+    machine. Defaulting there produced a bind failure that looked like a model
+    problem, so the default deliberately moved off it.
+    """
+    assert LlamaServerConfig().port != 8080
