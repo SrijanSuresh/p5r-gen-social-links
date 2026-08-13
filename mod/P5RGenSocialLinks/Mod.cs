@@ -1408,7 +1408,12 @@ public class Mod : IModV1
         // 1.00, so the shotgun is no longer needed. Three rather than one: the top few
         // averages sit close together (4.72 / 4.44 / 4.41) and a miss costs a whole play
         // session to notice, while two extra regions cost almost nothing.
-        int take = Math.Min(3, ranked.Count);
+        // Narrowed from 3 after a live crash. Each armed region is overwritten in full,
+        // so this is a blast radius rather than a retry count: three regions wrote 211
+        // slots, and the top-ranked one sampled as "ternTableOffset: -1" — a data table
+        // that scored well on average while not being dialogue at all. Writing unrelated
+        // game structures is a far worse failure than missing a line.
+        int take = Math.Min(Math.Max(_cfg.MaxWriteRegions, 1), ranked.Count);
         _heapPools.Clear();
 
         // List more than are armed. If the ranking ever shifts and the scene stops
@@ -1475,6 +1480,11 @@ public class Mod : IModV1
 
     private unsafe int WriteAllHeapPools(string text)
     {
+        if (!_cfg.PoolWriteEnabled)
+        {
+            _modLog!.Info($"[POOL] write disabled by config ← \"{text[..Math.Min(text.Length, 50)]}\"");
+            return 0;
+        }
         if (_heapPools.Count == 0) return 0;
 
         int totalSlots = 0, regions = 0;

@@ -25,6 +25,18 @@
   // depend on any of it. Turn on only when a pool stops being found.
   "struct_diff_enabled": false,
 
+  // Master switch for writing generated text into the game's dialogue pool.
+  // Set false to run the full pipeline (session, msgId, LLM) while touching no game
+  // memory — the log still shows every generated line. Try this first if the game
+  // becomes unstable: if the crashes stop, the write is the cause.
+  "pool_write_enabled": true,
+
+  // How many top-ranked heap regions to overwrite. This is a blast radius, not a retry
+  // count — every armed region is written in full. Three regions wrote 211 slots and
+  // included a data table ("ternTableOffset: -1") that ranked highest without being
+  // dialogue. Keep at 1 unless diagnosing why the scene is not being found.
+  "max_write_regions": 1,
+
   // Log every pointer chain step with address + dereferenced value.
   // Enable when TryResolve() fails and you need to find the broken link.
   // Leave false in normal play — fires every 500ms poll tick.

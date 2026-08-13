@@ -30,6 +30,28 @@ internal sealed class GenConfig
     public bool StructDiffEnabled { get; init; } = false;
 
     /// <summary>
+    /// Master switch for writing generated text into the dialogue pool.
+    ///
+    /// Set false to run the whole pipeline — session detection, msgId, LLM call — while
+    /// touching no game memory. This is the first thing to try when the game becomes
+    /// unstable: if crashes stop with it off, the write is the cause, and the log still
+    /// shows every generated line.
+    /// </summary>
+    [JsonPropertyName("pool_write_enabled")]
+    public bool PoolWriteEnabled { get; init; } = true;
+
+    /// <summary>
+    /// How many of the top-ranked heap regions to write.
+    ///
+    /// Every armed region is overwritten in full, so this is a blast radius, not a
+    /// retry count. Three regions wrote 211 slots across memory that included
+    /// "ternTableOffset: -1" — a data table, not dialogue — which is a strong crash
+    /// candidate. One keeps the damage to a single mis-ranked region.
+    /// </summary>
+    [JsonPropertyName("max_write_regions")]
+    public int MaxWriteRegions { get; init; } = 1;
+
+    /// <summary>
     /// When true, PointerChainResolver logs each chain step with address and dereferenced value.
     /// Useful for diagnosing broken pointer chains after a game patch; leave false in production.
     /// </summary>
