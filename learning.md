@@ -4710,3 +4710,107 @@ supervisor, the database's session timeout.
 
 "The exit handler didn't run" is not an edge case. It is the normal outcome of every
 abnormal exit, and abnormal exits are the ones worth designing for.
+
+## Chapter 64: The Data You Destroy Is the Data You Need
+
+### The symptom
+
+Generated dialogue was in character and in the right register, and still felt wrong:
+
+```
+Ryuji (scripted):  "A towel?"  →  "Nah, they'll lend you one of them."
+Ryuji (generated): "Time to crush it, let's go all-out on these reps!"
+```
+
+Nothing about that line is incorrect. It is a gym line, in his voice, at the right
+rank. It is also completely deaf to the conversation it replaced.
+
+The context being sent explains why:
+
+```
+"Hang-out with Ryuji Sakamoto (rank 4/10) at Protein Lovers gym.
+ This is a Social Link conversation — ..."
+```
+
+Who, where, how close. Nothing about *what is being said*. The model was writing
+ambience because ambience is all it had the information to write.
+
+### Where the missing context was
+
+In the buffer we were overwriting.
+
+```csharp
+fixed (byte* src = enc)
+    System.Buffer.MemoryCopy(src, p + off, len, wl);
+```
+
+Before that copy, `p + off` holds the scripted line. The write is the only operation
+in the system that touches the script, and it discards it without reading it. The
+information needed to respond to the scene was being destroyed by the act of
+responding to the scene.
+
+This is worth sitting with, because it is a shape that recurs: a destructive operation
+standing exactly where the missing input lives. Migrations that drop the column whose
+old values would validate the migration. Caches invalidated before the recomputation
+that could have reused them. The fix is never to reconstruct the data later — it is to
+notice that the last moment it exists is *right here*, and read it first.
+
+### Ordering is the whole design
+
+The capture has to happen at arm time, before the first write:
+
+```csharp
+if (_sceneScript.Count == 0)
+{
+    var script = CaptureSceneScript(ranked[0].Base, ranked[0].Len, maxLines: 12, maxChars: 480);
+    ...
+}
+foreach (int i in selected) { /* arm regions for writing */ }
+```
+
+Reading lazily — when the context is first needed — would look equivalent and be
+silently wrong. By then the first line has been written, so every slot holds our own
+generated text. The model would receive its own previous output labelled as the
+scene's script, and each generation would drift further from a scene it could no
+longer see. A feedback loop that produces plausible output is far harder to notice
+than one that crashes.
+
+The same reasoning drives an explicit guard, because arming can recur mid-session:
+
+```csharp
+if (_lastLlmText != null && line.Contains(_lastLlmText)) continue;
+```
+
+### Handing over dialogue invites imitation
+
+The first framing was simply the lines. The obvious failure followed: the model
+paraphrased them, which reads worse than generic filler, because a near-copy of the
+original looks like a bug rather than a variation.
+
+```
+"The scene's original dialogue, for subject matter only — do not repeat or
+ paraphrase these lines: ..."
+```
+
+Context is not neutral. Anything placed in a prompt is an implicit instruction, and
+examples are the strongest implicit instruction there is — a model shown text will
+tend to produce text like it. When the intent is *topic* rather than *style*, that has
+to be said, or the examples win.
+
+### Result
+
+```
+before   "Time to crush it, let's go all-out on these reps!"
+after    "What's with the look, you think I'm scrawny?"
+         "Dude, stop tryin', you'll just end up hurtin' yourself."
+```
+
+The second set engages with the actual banter — the ribbing, Ryuji's defensiveness
+about his build — without reusing a line from it.
+
+### The general rule
+
+When output is generically correct but contextually hollow, the question is not which
+model or which sampling parameters. It is what the model was given. Trace the inputs
+before touching the generation, and check specifically whether the thing you need is
+being thrown away somewhere upstream — most often by the very step that needed it.
