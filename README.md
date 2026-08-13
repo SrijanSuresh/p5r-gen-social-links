@@ -278,7 +278,7 @@ p5r-gen-social-links/
 │   ├── tests/                   # 196 tests (pytest)
 │   └── main.py                  # FastAPI app
 ├── scripts/fetch-llama-server.ps1  # Downloads prebuilt llama.cpp CUDA binaries
-├── scripts/redate.sh            # Spreads commits across PR window
+├── scripts/redate.sh            # Restamps branch commits to the PR day
 ├── learning.md                  # 63-chapter technical journal (the real docs)
 └── .github/workflows/ci.yml     # Python tests + .NET build on push
 ```
