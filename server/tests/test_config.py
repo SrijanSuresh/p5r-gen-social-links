@@ -1,7 +1,7 @@
 """Tests for ModelConfig validation."""
 
 import pytest
-from inference.config import ModelConfig
+from inference.config import LlamaServerConfig, ModelConfig
 
 
 def test_default_config_is_valid() -> None:
@@ -55,3 +55,43 @@ def test_max_tokens_512_is_valid() -> None:
 def test_n_ctx_too_small_raises() -> None:
     with pytest.raises(ValueError, match="n_ctx"):
         ModelConfig(n_ctx=64)
+
+
+# --- LlamaServerConfig -------------------------------------------------------
+
+
+def test_llama_server_default_config_is_valid() -> None:
+    cfg = LlamaServerConfig()
+    assert cfg.host == "127.0.0.1"
+    assert cfg.port == 8080
+    assert cfg.autostart is True
+
+
+def test_llama_server_base_url_composes_host_and_port() -> None:
+    cfg = LlamaServerConfig(host="127.0.0.1", port=9999)
+    assert cfg.base_url == "http://127.0.0.1:9999"
+
+
+def test_llama_server_port_does_not_collide_with_fastapi() -> None:
+    # The FastAPI app binds 8765; the child must not default to the same port.
+    assert LlamaServerConfig().port != 8765
+
+
+def test_llama_server_port_zero_raises() -> None:
+    with pytest.raises(ValueError, match="port"):
+        LlamaServerConfig(port=0)
+
+
+def test_llama_server_port_above_range_raises() -> None:
+    with pytest.raises(ValueError, match="port"):
+        LlamaServerConfig(port=70000)
+
+
+def test_llama_server_negative_startup_timeout_raises() -> None:
+    with pytest.raises(ValueError, match="startup_timeout_s"):
+        LlamaServerConfig(startup_timeout_s=-1.0)
+
+
+def test_llama_server_zero_request_timeout_raises() -> None:
+    with pytest.raises(ValueError, match="request_timeout_s"):
+        LlamaServerConfig(request_timeout_s=0.0)
