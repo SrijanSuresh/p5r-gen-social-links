@@ -53,12 +53,18 @@ def test_short_text_not_truncated() -> None:
     assert clean_response(text, max_chars=200) == "Short."
 
 
-def test_emoji_in_response_passes_through() -> None:
-    """Emoji should survive cleaning — the game renderer may handle them as unknown glyphs."""
-    raw = "Let's go! 🔥 We'll crush this!"
-    result = clean_response(raw)
+def test_emoji_are_dropped_and_the_line_survives() -> None:
+    """
+    Emoji cannot reach the bubble intact: the mod writes ASCII, so each one becomes a
+    literal '?'. The line around them must stay readable.
+
+    This previously asserted emoji "should survive as unknown glyphs" — but its
+    assertions never checked, so it passed either way. Now it pins the real behaviour.
+    """
+    result = clean_response("Let's go! 🔥 We'll crush this!")
+    assert "🔥" not in result
+    assert result.isascii()
     assert "crush this" in result
-    assert len(result) > 0
 
 
 def test_japanese_characters_are_stripped_not_passed_through() -> None:
@@ -161,3 +167,20 @@ def test_output_is_always_pure_ascii() -> None:
 
 def test_non_breaking_space_becomes_a_plain_space() -> None:
     assert clean_response("Yo there") == "Yo there"
+
+
+def test_two_quoted_utterances_are_merged() -> None:
+    """Observed live: the model returned '"Come on!" "Let\'s go!"' as one response."""
+    result = clean_response('"Come on!" "Let\'s go!"')
+    assert '"' not in result
+    assert result == "Come on! Let's go!"
+
+
+def test_three_quoted_segments_are_merged() -> None:
+    assert clean_response('"A." "B." "C."') == "A. B. C."
+
+
+def test_quoted_speech_inside_a_line_is_not_unwrapped() -> None:
+    """The safeguard: this is narration, not a wrapped utterance."""
+    source = 'He said, "go" and left'
+    assert clean_response(source) == source

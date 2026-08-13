@@ -20,9 +20,15 @@ _NAME_PREFIX = re.compile(r"^[A-Z][a-zA-Z]+(?: [A-Z][a-zA-Z]+)?:\s*")
 # renders the buffer literally, so these reach the speech bubble as asterisks.
 _STAGE_DIRECTION = re.compile(r"\*[^*]{1,60}\*")
 
-# The model wraps its line in quotes roughly half the time. P5R's bubble never shows
-# them, and the inconsistency is more jarring than either choice — so they always go.
-_WRAPPING_QUOTES = re.compile(r'^"(.*)"$', re.DOTALL)
+# The model wraps its line in quotes roughly half the time, and sometimes returns two
+# quoted utterances back to back: "Come on!" "Let's go!". P5R's bubble never shows
+# quotes, and the inconsistency reads worse than either choice.
+#
+# Matching *all* segments rather than one outer pair is what makes the two-utterance
+# case work. Requiring the whole string to be quoted segments is also the safeguard:
+# 'He said, "go"' does not match, so ordinary quoted speech inside a line survives.
+_ALL_QUOTED_SEGMENTS = re.compile(r'^\s*(?:"[^"]*"\s*)+$', re.DOTALL)
+_QUOTED_SEGMENT = re.compile(r'"([^"]*)"')
 
 # The mod writes the buffer with Encoding.ASCII, which turns any character above 0x7F
 # into a literal '?'. Folding the punctuation an instruct model reaches for keeps a
@@ -74,13 +80,9 @@ def clean_response(raw: str, max_chars: int = 200) -> str:
     text = re.sub(r"  +", " ", text).strip()
 
     # After removals, so a line that was *action* "speech" still unwraps.
-    wrapped = _WRAPPING_QUOTES.match(text)
-    if wrapped:
-        inner = wrapped.group(1)
-        # Only unwrap a quote enclosing the whole line. '"Yo," he said, "go"' has a
-        # leading and trailing quote too, and stripping those would corrupt it.
-        if '"' not in inner:
-            text = inner.strip()
+    if text and _ALL_QUOTED_SEGMENTS.match(text):
+        segments = [s.strip() for s in _QUOTED_SEGMENT.findall(text)]
+        text = " ".join(s for s in segments if s)
 
     # Last line of defence: drop anything the fold missed rather than let the mod's
     # ASCII encoder turn it into '?' inside the speech bubble.
