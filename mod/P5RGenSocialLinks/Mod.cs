@@ -1441,6 +1441,38 @@ public class Mod : IModV1
     /// the single-pool writer: never exceed a slot's original run length, and pad with
     /// spaces rather than a NUL so the surrounding function codes stay intact.
     /// </summary>
+    /// <summary>
+    /// Returns how many bytes of <paramref name="enc"/> to write into a slot of
+    /// <paramref name="slotLen"/> bytes, breaking on a word boundary rather than
+    /// mid-word.
+    /// </summary>
+    /// <remarks>
+    /// The renderer reads the slot in place and the write cannot exceed the original
+    /// line's length, so a long generation is clipped rather than wrapped. A raw
+    /// Math.Min cut produced "…you're seriously the onl" on screen — text that reads
+    /// as a bug rather than as a shortened line.
+    ///
+    /// Backing up to the last space costs a word but always ends cleanly. The 60%
+    /// floor guards the degenerate case: if the only space sits near the start, a
+    /// word-boundary cut would throw away most of the slot, and a hard cut carries
+    /// more of the sentence.
+    /// </remarks>
+    private static int FitToSlot(byte[] enc, int slotLen)
+    {
+        int wl = Math.Min(enc.Length, slotLen);
+        if (wl <= 0) return 0;
+        if (wl == enc.Length) return wl;   // fits whole; nothing to trim
+
+        int lastSpace = -1;
+        for (int i = wl - 1; i > 0; i--)
+        {
+            if (enc[i] == (byte)' ') { lastSpace = i; break; }
+        }
+
+        if (lastSpace > 0 && lastSpace * 100 >= wl * 60) return lastSpace;
+        return wl;
+    }
+
     private unsafe int WriteAllHeapPools(string text)
     {
         if (_heapPools.Count == 0) return 0;
@@ -1451,10 +1483,10 @@ public class Mod : IModV1
         {
             var (poolBase, poolLen, slots) = _heapPools[r];
 
-            // Tag each region with its index so the one that actually reaches the screen
-            // is identifiable by eye. Seeing "[R3] ..." in the bubble collapses the
-            // shotgun to a single target — no ranking heuristic can tell us this.
-            byte[] enc = System.Text.Encoding.ASCII.GetBytes($"[R{r}] {text}");
+            // The "[Rn] " region tag has served its purpose: R0 was confirmed as the
+            // region that reaches the screen. Keeping it now costs ~5 of a ~44-char
+            // slot — over a tenth of the visible line — to display a debug marker.
+            byte[] enc = System.Text.Encoding.ASCII.GetBytes(text);
 
             // Validate the whole range, not just the first bytes. The region was captured
             // on an earlier tick and the game may have freed it since; writing through a
@@ -1465,7 +1497,7 @@ public class Mod : IModV1
             int wrote = 0;
             foreach ((int off, int len) in slots)
             {
-                int wl = Math.Min(enc.Length, len);
+                int wl = FitToSlot(enc, len);
                 if (wl <= 0) continue;
                 fixed (byte* src = enc)
                     System.Buffer.MemoryCopy(src, p + off, len, wl);
