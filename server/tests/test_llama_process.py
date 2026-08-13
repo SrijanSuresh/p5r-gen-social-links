@@ -19,15 +19,35 @@ from inference.config import LlamaServerConfig, ModelConfig
 from inference.llama_process import LlamaServerProcess, LlamaServerStartupError
 
 
+def _free_port() -> int:
+    """
+    An ephemeral port the OS says is currently free.
+
+    Fixtures must not use LlamaServerConfig's default port: start() pre-flights the
+    bind, so any test using the default fails the moment a real llama-server is
+    running on this machine — which is exactly when the suite gets run.
+    """
+    import socket as socket_module
+
+    with socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
 @pytest.fixture
 def installed(tmp_path: Path) -> tuple[LlamaServerConfig, ModelConfig]:
-    """Configs pointing at an existing fake binary and fake GGUF."""
+    """Configs pointing at an existing fake binary and fake GGUF, on a free port."""
     binary = tmp_path / "llama-server.exe"
     binary.write_bytes(b"MZ")
     model = tmp_path / "model.gguf"
     model.write_bytes(b"GGUF")
     return (
-        LlamaServerConfig(binary_path=str(binary), startup_timeout_s=1.0, startup_poll_s=0.01),
+        LlamaServerConfig(
+            binary_path=str(binary),
+            port=_free_port(),
+            startup_timeout_s=1.0,
+            startup_poll_s=0.01,
+        ),
         ModelConfig(model_path=str(model)),
     )
 
