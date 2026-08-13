@@ -8,7 +8,7 @@ def test_default_config_is_valid() -> None:
     cfg = ModelConfig()
     assert cfg.temperature == 0.8
     assert cfg.top_p == 0.9
-    assert cfg.max_tokens == 80
+    assert cfg.max_tokens == 32
     assert cfg.n_ctx == 2048
 
 
@@ -104,3 +104,22 @@ def test_llama_server_avoids_contested_port_8080() -> None:
     problem, so the default deliberately moved off it.
     """
     assert LlamaServerConfig().port != 8080
+
+
+def test_response_budget_fits_a_dialogue_slot() -> None:
+    """
+    The mod clamps each write to the original line's length, so surplus characters
+    are never written rather than wrapped. An observed slot was ~44 chars; the budget
+    stays in that neighbourhood instead of the old 200.
+    """
+    assert ModelConfig().max_response_chars <= 64
+
+
+def test_max_tokens_exceeds_the_char_budget() -> None:
+    """
+    Tokens must not be the binding constraint. Roughly 4 chars per token, so the cap
+    has to sit above the character budget or generation stops mid-clause and the
+    sentence-boundary truncation has nothing to cut back to.
+    """
+    cfg = ModelConfig()
+    assert cfg.max_tokens * 4 > cfg.max_response_chars

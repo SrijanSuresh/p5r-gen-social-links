@@ -26,14 +26,25 @@ class ModelConfig:
     # Context window. Our prompts are short (~300 tokens); 2048 is plenty.
     n_ctx: int = 2048
 
-    # Generation parameters
-    max_tokens: int = 80          # ~2-3 sentences of dialogue
+    # Generation parameters.
+    #
+    # Set above the character budget on purpose: the model needs room to finish its
+    # sentence, and clean_response then truncates at a sentence boundary. Capping
+    # tokens at exactly the target would stop mid-clause and guarantee a ragged line.
+    max_tokens: int = 32
     temperature: float = 0.8
     top_p: float = 0.9
     repeat_penalty: float = 1.1
 
-    # Dialogue must fit in P5R's display area — hard cap before sending to game.
-    max_response_chars: int = 200
+    # The real constraint is not P5R's display area but the write itself: the mod
+    # overwrites each slot in place and clamps to the ORIGINAL line's length
+    # (Mod.cs, `Math.Min(enc.Length, len)`), so surplus characters are not shown
+    # smaller or wrapped — they are simply never written.
+    #
+    # An observed slot was ~44 characters. 56 is deliberately a little above that:
+    # slots vary, and the mod now truncates on a word boundary, so overshooting
+    # costs a clipped tail rather than a broken word.
+    max_response_chars: int = 56
 
     def __post_init__(self) -> None:
         if not (0.0 <= self.temperature <= 2.0):
