@@ -16,6 +16,27 @@ _OOC_PATTERNS: list[re.Pattern[str]] = [
 # "Name: " or "Name Surname: " prefix the model sometimes adds despite the rule
 _NAME_PREFIX = re.compile(r"^[A-Z][a-zA-Z]+(?: [A-Z][a-zA-Z]+)?:\s*")
 
+# Roleplay stage directions: *pumps fist*, *grins*. Observed in live output. The game
+# renders the buffer literally, so these reach the speech bubble as asterisks.
+_STAGE_DIRECTION = re.compile(r"\*[^*]{1,60}\*")
+
+# The model wraps its line in quotes roughly half the time. P5R's bubble never shows
+# them, and the inconsistency is more jarring than either choice — so they always go.
+_WRAPPING_QUOTES = re.compile(r'^"(.*)"$', re.DOTALL)
+
+# The mod writes the buffer with Encoding.ASCII, which turns any character above 0x7F
+# into a literal '?'. Folding the punctuation an instruct model reaches for keeps a
+# stray em-dash from surfacing in-game as "You've been slackin? off".
+_ASCII_FOLD = str.maketrans({
+    "‘": "'", "’": "'",              # single curly quotes
+    "“": '"', "”": '"',              # double curly quotes
+    "–": "-", "—": "-", "−": "-",  # en/em dash, minus
+    "…": "...",                            # ellipsis
+    " ": " ", " ": " ", " ": " ",  # non-breaking/thin spaces
+    "•": "-",                              # bullet
+    "´": "'", "ʼ": "'",              # acute accent, modifier apostrophe
+})
+
 
 def _truncate_at_sentence(text: str, max_chars: int) -> str:
     """Truncate at the last sentence boundary before max_chars."""
@@ -38,13 +59,33 @@ def clean_response(raw: str, max_chars: int = 200) -> str:
     """
     text = raw.strip()
 
+    # Fold before anything else, so later patterns match on plain ASCII quotes.
+    text = text.translate(_ASCII_FOLD)
+
     # Remove "CharacterName: " prefix if model ignored the rule
     text = _NAME_PREFIX.sub("", text, count=1)
 
     for pattern in _OOC_PATTERNS:
         text = pattern.sub("", text)
 
+    text = _STAGE_DIRECTION.sub("", text)
+
     # Collapse multiple spaces left by removals
+    text = re.sub(r"  +", " ", text).strip()
+
+    # After removals, so a line that was *action* "speech" still unwraps.
+    wrapped = _WRAPPING_QUOTES.match(text)
+    if wrapped:
+        inner = wrapped.group(1)
+        # Only unwrap a quote enclosing the whole line. '"Yo," he said, "go"' has a
+        # leading and trailing quote too, and stripping those would corrupt it.
+        if '"' not in inner:
+            text = inner.strip()
+
+    # Last line of defence: drop anything the fold missed rather than let the mod's
+    # ASCII encoder turn it into '?' inside the speech bubble.
+    text = text.encode("ascii", "ignore").decode("ascii")
+
     text = re.sub(r"  +", " ", text).strip()
 
     return _truncate_at_sentence(text, max_chars)
