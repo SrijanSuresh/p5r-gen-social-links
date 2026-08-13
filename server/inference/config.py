@@ -19,12 +19,28 @@ class ModelConfig:
         )
     )
 
-    # -1 = offload all layers to GPU (recommended for RTX 4060 8GB).
-    # Set to e.g. 28 to keep 4 layers on CPU if VRAM is tight with P5R running.
-    n_gpu_layers: int = -1
+    # Layers to offload to the GPU. NOT -1 (all), deliberately.
+    #
+    # Full offload puts ~5.2 GB of an 8 GB card into the model. P5R then cannot fit its
+    # own render targets and Windows pages VRAM to system RAM, which stutters the whole
+    # game — observed from the intro video onward, long before any dialogue ran.
+    #
+    # Llama-3.1-8B has 32 layers at roughly 153 MB each, so 20 costs ~3.5 GB and leaves
+    # ~4.6 GB for the game. The rest runs on CPU: slower per token, but generation was
+    # 410 ms fully offloaded and the throttle allows 3 s, so there is ample headroom.
+    #
+    # Lower this if the game still stutters; raise it if the GPU is otherwise idle.
+    n_gpu_layers: int = field(
+        default_factory=lambda: int(os.getenv("LLAMA_GPU_LAYERS", "20"))
+    )
 
     # Context window. Our prompts are short (~300 tokens); 2048 is plenty.
     n_ctx: int = 2048
+
+    # Concurrent generation slots in llama-server. Its default is 4, and each holds its
+    # own KV cache — four times the VRAM for parallelism we never use, since
+    # InferenceQueue is single-slot and drops rather than queues.
+    n_parallel: int = 1
 
     # Generation parameters.
     #

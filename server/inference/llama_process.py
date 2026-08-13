@@ -74,6 +74,9 @@ class LlamaServerProcess:
             # nvidia-smi with the game closed.
             "--n-gpu-layers", str(self._model_cfg.n_gpu_layers),
             "--ctx-size", str(self._model_cfg.n_ctx),
+            # One slot, not llama-server's default of four. Each slot carries its own
+            # KV cache, and the queue in front of this is single-slot anyway.
+            "--parallel", str(self._model_cfg.n_parallel),
         ]
 
     def _assert_port_free(self) -> None:
