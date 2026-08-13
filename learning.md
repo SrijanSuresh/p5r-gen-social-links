@@ -4614,3 +4614,99 @@ it ever breaks.
 
 Prefer a process boundary to a language binding when the dependency is a program that
 already knows how to be a server.
+
+## Chapter 63: Nobody Runs Your Cleanup Code
+
+### The orphan
+
+With inference moved into a child process, shutdown looked handled:
+
+```python
+yield                    # FastAPI lifespan: everything after this is teardown
+if _process is not None:
+    _process.stop()      # terminate llama-server
+```
+
+Then the parent was force-killed during testing, and:
+
+```
+$ netstat -ano | grep 8766
+  TCP  127.0.0.1:8766  LISTENING  133716        # still there
+```
+
+llama-server survived, holding the port and ~4.9 GB of VRAM. The next start then
+failed its port check — a second, more confusing symptom caused by the first.
+
+### Why the handler did not run
+
+`stop()` is ordinary Python. It runs when the interpreter reaches it, which requires
+the process to still be alive and cooperating. None of these give it that chance:
+
+- `taskkill /F` — `TerminateProcess`, no notification to the target at all
+- Closing the console window — the parent can be killed before its handler finishes
+- Task Manager "End task"
+- A hard crash in the parent
+
+This is the same shape as the `AccessViolationException` in Chapter 61, and it has the
+same moral. There, the fix was not a better `catch` — an uncatchable exception cannot
+be caught — but making the fault impossible by moving validation into the kernel with
+`ReadProcessMemory`. Here the fix is not a better handler. A handler that never runs
+cannot be improved. The cleanup has to happen *somewhere that is not our process*.
+
+### Job Objects
+
+Windows has exactly that mechanism:
+
+```python
+job = kernel32.CreateJobObjectW(None, None)
+info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+kernel32.SetInformationJobObject(job, JobObjectExtendedLimitInformation, ...)
+kernel32.AssignProcessToJobObject(job, child_handle)
+```
+
+A Job Object is a kernel container for processes. `KILL_ON_JOB_CLOSE` says: when the
+last handle to this job closes, terminate everything inside it.
+
+The load-bearing detail is that handles are closed by the **kernel**, as part of
+tearing down a process, whatever killed it. There is no callback, no unwind, no code
+of ours involved. Our process dying *is* the trigger. That is why this survives
+`TerminateProcess` when a `finally` block does not.
+
+Two practical notes:
+
+- **Hold the handle.** The job dies with the last handle, so it lives on the supervisor
+  object for the process lifetime. Closing it early kills the child immediately —
+  which is also exactly how `stop()` uses it as a backstop.
+- **Adopt before waiting for readiness.** Model load is a ~20 s window and the longest
+  stretch in which a force-kill could strand a child. Adopting after the health check
+  would leave precisely the riskiest period unprotected.
+
+### Testing something that requires killing yourself
+
+The real behaviour — child dies when force-killed parent dies — cannot be asserted
+in-process, because demonstrating it means killing the test runner. It was verified
+with a spawned parent/child pair instead:
+
+```
+parent=162732 child=161360 adopted True
+child alive before kill: True
+child alive AFTER force-kill of parent: False
+```
+
+The suite then covers what it usefully can: that closing the job kills its members
+(the same limit, triggered directly), that adoption failure returns `False` rather
+than raising, and that the whole thing no-ops off Windows so CI stays green. When a
+property cannot be tested automatically, test its mechanism and record the manual
+verification — do not pretend the untestable part is covered.
+
+### The general rule
+
+Cleanup that depends on your own code running is not cleanup, it is an optimistic
+default. It handles the polite exits, which are the ones that were never going to
+cause trouble. For any resource whose leak actually hurts — a port, GPU memory, a
+lock, a temp directory — ask what happens when the process is shot in the head, and
+push the release down to something that outlives you: the kernel, the OS, the
+supervisor, the database's session timeout.
+
+"The exit handler didn't run" is not an edge case. It is the normal outcome of every
+abnormal exit, and abnormal exits are the ones worth designing for.
