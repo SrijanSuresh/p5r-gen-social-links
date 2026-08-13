@@ -135,6 +135,19 @@ public class Mod : IModV1
     // atomic on x64, and we only need eventual visibility, not strict ordering).
     private volatile string? _lastLlmText;
 
+    /// <summary>
+    /// The scene's original scripted lines, read out of the pool before we overwrite it.
+    ///
+    /// This is the context the model was missing: it knew who and where, but never what
+    /// the conversation was actually about, so Ryuji answered the room rather than the
+    /// scene. The lines we destroy are exactly the lines needed to respond to.
+    ///
+    /// Capture is once-only, at arm time. After the first write every slot holds our own
+    /// generated text, so a later read would feed the model its own words back as if they
+    /// were the script.
+    /// </summary>
+    private readonly System.Collections.Generic.List<string> _sceneScript = new();
+
     // Large-copy log: OnGameMemcpy records the dst of every heap-to-heap copy
     // ≥ 500 bytes. TryFindBfBuffer probes these at session start to locate the
     // BF script buffer, which is loaded in one bulk copy before session detection.
@@ -1034,6 +1047,68 @@ public class Mod : IModV1
     /// straddle a chunk boundary are dropped rather than stitched — at 256 KB chunks that
     /// is a negligible fraction, and it keeps every read bounds-checked.
     /// </summary>
+    /// <summary>
+    /// Renders the captured script as a context fragment, or empty if nothing was caught.
+    /// </summary>
+    /// <remarks>
+    /// Framed as what the scene is about rather than as lines to imitate. Handing the
+    /// model verbatim dialogue invites it to parrot a line back, which reads worse than
+    /// generic filler — the goal is a reply that belongs in this conversation, not a
+    /// paraphrase of one already in it.
+    /// </remarks>
+    private string ScriptContext()
+    {
+        if (_sceneScript.Count == 0) return "";
+        return " The scene's original dialogue, for subject matter only — do not repeat " +
+               "or paraphrase these lines: \"" +
+               string.Join("\" \"", _sceneScript) + "\"";
+    }
+
+    /// <summary>
+    /// Reads the scripted lines out of a pool region, in address order.
+    /// </summary>
+    /// <remarks>
+    /// Must run before the first write to this region. The pool is the only place the
+    /// scene's script exists in memory, and overwriting it is destructive — there is no
+    /// second chance to read it, which is why this is called at arm time rather than
+    /// lazily when the context is first needed.
+    ///
+    /// Lines are capped in count and total length: the context field is limited to 1024
+    /// characters server-side, and a 36-slot scene at ~40 characters each would exceed it
+    /// on its own and crowd out the rolling session history.
+    /// </remarks>
+    private string[] CaptureSceneScript(nuint poolBase, int scanLen, int maxLines, int maxChars)
+    {
+        var lines = new System.Collections.Generic.List<string>();
+        var seen  = new System.Collections.Generic.HashSet<string>();
+        int used  = 0;
+
+        for (int chunkOff = 0; chunkOff < scanLen && lines.Count < maxLines; chunkOff += ScanChunk)
+        {
+            int want = Math.Min(ScanChunk, scanLen - chunkOff);
+            if (!MemoryGuard.TryRead(poolBase + (nuint)chunkOff, _scanBuf, want)) continue;
+
+            foreach (var (_, text) in FindAsciiEnglishBuf(_scanBuf, want, poolBase + (nuint)chunkOff, 20000))
+            {
+                string line = text.Trim();
+                if (line.Length < 8) continue;
+
+                // Consecutive slots repeat the same line often enough that the raw list
+                // wastes most of the budget on duplicates.
+                if (!seen.Add(line)) continue;
+
+                // Refuse anything we generated. Arming can recur mid-session, and feeding
+                // the model its own output back as "the script" would compound drift.
+                if (_lastLlmText != null && line.Contains(_lastLlmText)) continue;
+
+                lines.Add(line);
+                used += line.Length + 1;
+                if (lines.Count >= maxLines || used >= maxChars) return lines.ToArray();
+            }
+        }
+        return lines.ToArray();
+    }
+
     private (int Off, int Len)[] CapturePoolSlotsSafe(nuint poolBase, int scanLen)
     {
         var slots = new System.Collections.Generic.List<(int, int)>();
@@ -1449,6 +1524,21 @@ public class Mod : IModV1
             if (selected.Contains(i)) continue;
             _modLog!.Info($"[POOL] alt #{i} 0x{ranked[i].Base:X} avg={ranked[i].Score / 100.0:F2}: " +
                           $"\"{ranked[i].Sample}\"");
+        }
+
+        // Snapshot the script from the anchor before anything is armed for writing.
+        // Ordering is load-bearing: the write is destructive and the pool is the only
+        // copy, so this is the last moment the scene's real dialogue exists to be read.
+        if (_sceneScript.Count == 0)
+        {
+            var script = CaptureSceneScript(ranked[0].Base, ranked[0].Len,
+                                            maxLines: 12, maxChars: 480);
+            if (script.Length > 0)
+            {
+                _sceneScript.AddRange(script);
+                _modLog!.Info($"[SCRIPT] captured {script.Length} original lines: " +
+                              $"\"{script[0][..Math.Min(script[0].Length, 60)]}\"");
+            }
         }
 
         foreach (int i in selected)
@@ -2095,7 +2185,12 @@ public class Mod : IModV1
             TimeSpan.FromSeconds(_cfg.TimeoutSeconds));
         try
         {
-            string ctx = Memory.ContextBuilder.Build(snap) + $" [msg_0x{msgId:X}]";
+            // Pydantic rejects context over 1024 chars with a 422, which would surface as
+            // a silent generation failure rather than an obvious error. The script is
+            // already budgeted well under this; the clamp guards against the pieces
+            // growing independently and quietly crossing the limit.
+            string ctx = Memory.ContextBuilder.Build(snap) + ScriptContext() + $" [msg_0x{msgId:X}]";
+            if (ctx.Length > 1000) ctx = ctx[..1000];
             var req = new Server.GenerateRequest
             {
                 ConfidantId   = snap.ConfidantId,
@@ -2249,6 +2344,9 @@ public class Mod : IModV1
                     _poolWriteDone       = false;
                     _poolIsHeap          = false;
                     _heapPools.Clear();
+                    // Cleared with the session: the next hang-out is a different scene,
+                    // and a stale script would describe a conversation that already ended.
+                    _sceneScript.Clear();
                     _utf16CpyLogged      = 0;
                     _heapSweepCursor     = 0;
                     _utf16SweepHits      = 0;
