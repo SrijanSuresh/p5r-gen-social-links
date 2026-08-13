@@ -4496,3 +4496,121 @@ does: validation and copy happen together inside one kernel call.
 A corollary worth carrying: raw pointer walks over another subsystem's live memory
 are safe only for small, immediate reads. Anything that scans in bulk should copy
 first and parse the copy.
+
+## Chapter 62: Process Boundaries Beat Language Bindings
+
+### The wall
+
+The server had been answering `/health` with `"mock"` for weeks. The assumption was a
+stray config flag. The actual cause:
+
+```
+>>> import llama_cpp
+ModuleNotFoundError: No module named 'llama_cpp'
+```
+
+It was never installed. And it could not be, because of a detail that has nothing to
+do with this project:
+
+| | |
+|---|---|
+| The venv | Python 3.13 |
+| Official CUDA wheels | cp39–cp312. No cp313. |
+| PyPI | sdist only — no binaries at all |
+
+`llama-cpp-python` is not Python. It is a C++ library with a thin Python jacket, and
+that jacket is stitched to a specific CPython ABI. A `cp312` wheel contains machine
+code linked against `python312.dll`; loading it into 3.13 is not a version warning,
+it is a missing symbol. So "just install it" decomposes into: install the CUDA
+Toolkit, install MSVC build tools, and compile llama.cpp from source — a multi-hour
+setup that then has to be repeated by every person who installs the mod.
+
+### The thing worth noticing
+
+The dependency was never really on *a Python package*. It was on **llama.cpp**, a C++
+program. The Python package was a delivery mechanism, and it was the delivery
+mechanism imposing every constraint: the ABI pin, the missing wheel, the compiler
+requirement. None of those are properties of the inference engine.
+
+Upstream already publishes exactly what we want, prebuilt:
+
+```
+llama-b10408-bin-win-cuda-12.4-x64.zip     # llama-server.exe + friends
+cudart-llama-bin-win-cuda-12.4-x64.zip     # bundled CUDA runtime DLLs
+```
+
+An `.exe` has no opinion about the Python interpreter that talks to it. Swapping the
+binding for a process boundary deletes the entire class of problem — not by solving
+the ABI mismatch, but by arranging for there not to be an ABI.
+
+### Why the CUDA runtime ships in the zip
+
+`cudart-*.zip` is 391 MB of CUDA runtime DLLs, and shipping it is what removes the
+"install the CUDA Toolkit" step. The split matters because two different things are
+often both called "CUDA":
+
+- **The driver** (`nvidia-smi` reports 13.1 here) — kernel-mode, installed with the GPU driver.
+- **The runtime** (`cudart64_*.dll`) — user-mode, versioned with the toolkit, and
+  legal to ship next to the application.
+
+NVIDIA guarantees *backward* compatibility: a newer driver runs applications built
+against older toolkits. That is why the build tagged 12.4 is the safe pick on a 13.1
+driver, and the 13.3 build is not obviously safer despite the closer number — it
+would rely on minor-version compatibility within CUDA 13, which holds only as long as
+the binary avoids driver APIs newer than the installed driver. Backward compatibility
+is a guarantee; forward compatibility is a hope.
+
+### What the boundary buys beyond the install
+
+The original design loaded the model inside the FastAPI process:
+
+```python
+model     = load_model(_cfg)          # ~15s, blocking, 4.9 GB into VRAM
+_pipeline = InferencePipeline(model, _cfg)
+```
+
+Three consequences, all of which the split fixes:
+
+1. **Startup coupling.** The dialogue server was unavailable until the weights
+   finished loading. Separated, the HTTP server answers `/health` immediately and
+   reports the model as not-yet-ready — a much more useful signal to the mod than a
+   connection refusal.
+2. **Failure coupling.** A CUDA OOM inside the binding takes down the process that
+   the game is talking to. As a child process, the same OOM leaves our server up and
+   able to say *why* it degraded.
+3. **Lifecycle coupling.** Reloading the model, or swapping to a different GGUF,
+   meant restarting the API. Now it does not.
+
+There is a cost, and it should be stated plainly: an extra process to supervise, one
+more thing to fail, and an HTTP hop (sub-millisecond on loopback, against a ~2s
+generation — irrelevant here, but not in every system).
+
+### The interface was already the right shape
+
+The reason this rewrite is small is visible in the existing call:
+
+```python
+response = self._model.create_chat_completion(
+    messages=[{"role": "system", ...}, {"role": "user", ...}],
+    max_tokens=..., temperature=..., top_p=...,
+)
+raw = response["choices"][0]["message"]["content"]
+```
+
+That is the OpenAI chat-completions schema, which is also precisely what
+`llama-server` exposes at `/v1/chat/completions`. `llama-cpp-python` was mirroring
+that schema in-process; the same request shape crosses a socket instead. The port is
+therefore a change of *transport*, not of contract — `build_prompt` and
+`clean_response` on either side of the call never learn that anything moved.
+
+### The general rule
+
+When a dependency is painful, check whether the pain belongs to the thing you need or
+to the wrapper you are getting it through. Native bindings couple you to the host
+language's ABI, its version, and its build toolchain, and they charge that cost to
+every user at install time. A subprocess speaking a documented protocol couples you to
+a wire format — which is versioned far more slowly and can be reimplemented by hand if
+it ever breaks.
+
+Prefer a process boundary to a language binding when the dependency is a program that
+already knows how to be a server.
