@@ -5,7 +5,7 @@
 A [Reloaded-II](https://reloaded-project.github.io/Reloaded-II/) mod that replaces Persona 5 Royal's scripted Social Link dialogue with live AI generation — running entirely on your local GPU. No cloud, no API keys, no internet. Every conversation is unique.
 
 [![CI](https://github.com/SrijanSuresh/p5r-gen-social-links/actions/workflows/ci.yml/badge.svg)](https://github.com/SrijanSuresh/p5r-gen-social-links/actions/workflows/ci.yml)
-![Tests](https://img.shields.io/badge/tests-119%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-196%20passing-brightgreen)
 ![.NET](https://img.shields.io/badge/.NET-8.0-512BD4)
 ![Python](https://img.shields.io/badge/Python-3.13-3776AB)
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D4)
@@ -16,10 +16,12 @@ A [Reloaded-II](https://reloaded-project.github.io/Reloaded-II/) mod that replac
 
 Persona 5 Royal has 22 Social Link characters — Ryuji, Ann, Makoto, and so on. Every line they say is pre-written, fixed forever in the game's script. This mod hooks into the game's memory while it's running, reads who you're hanging out with and how close you are, sends that to a small AI model running on your own PC, and gets back a reply that sounds like that character at that moment in your relationship.
 
-**Ryuji at Rank 4, gym hang-out, confirmed output:**
-> *"Dude, what's up? I was thinkin' we could grab some ramen before we head back to..."*
+**Ryuji at Rank 4, gym hang-out — real Llama-3.1-8B output, generated locally:**
+> *"Yo, Joker, finally getting some actual exercise for once, huh? You gotta step up your game if we wanna take down those corrupt hearts!"*
 
-It generates in his voice, at the right emotional register for where you are in the friendship, without ever leaving your machine.
+> *"Dude, we gotta keep movin'! You're slippin', Joker, get those reps back up!"*
+
+Both took under a second on an RTX 4060. It generates in his voice, at the right emotional register for where you are in the friendship, without ever leaving your machine.
 
 ---
 
@@ -45,8 +47,11 @@ flowchart LR
     subgraph server ["Python server  ·  localhost:8765"]
         api["FastAPI  /generate"]
         queue["InferenceQueue\nsingle-slot drop-on-busy"]
-        pipe["InferencePipeline\nllama-cpp-python"]
-        model["Llama-3.1-8B-Instruct\nQ4_K_M · 4-bit quantized"]
+        pipe["InferencePipeline\nHTTP backend client"]
+    end
+
+    subgraph engine ["llama-server.exe  ·  localhost:8766"]
+        model["Llama-3.1-8B-Instruct\nQ4_K_M · CUDA offload"]
     end
 
     hook -->|fires per hang-out| chain
@@ -54,7 +59,8 @@ flowchart LR
     chain --> reader --> bridge
     monitor --> bridge
     bridge -->|"POST /generate\nconfidant · rank · context"| api
-    api --> queue --> pipe --> model
+    api --> queue --> pipe
+    pipe -->|"POST /v1/chat/completions"| model
     model -->|generated text| bridge
     bridge -.->|"write-back (Phase 3)"| writer
     writer -.-> pool -.-> renderer
@@ -75,9 +81,11 @@ The two processes communicate over localhost HTTP. The C# mod lives inside P5R's
 | `LineCounterMonitor` | C# | Polls `0x006FFC28` (discovered via Cheat Engine) — fires on each dialogue line advance |
 | `DialogueBridge` | C# | Leading-edge throttle (3s), rolling session history (8 entries), hash-based dedup, context budget management |
 | `DialogueWriter` | C# | Write-back stub — ready for when the text pool pointer chain is confirmed via Ghidra |
-| `InferencePipeline` | Python | llama-cpp-python wrapper; builds character-faithful prompts with rank-tier emotional guidance |
+| `InferencePipeline` | Python | Builds character-faithful prompts with rank-tier emotional guidance, then calls the backend |
+| `LlamaServerClient` | Python | HTTP client for `llama-server`, speaking OpenAI chat-completions |
+| `LlamaServerProcess` | Python | Spawns and supervises `llama-server.exe`; waits for weights, reaps on exit |
 | `InferenceQueue` | Python | Single-slot async queue — drops concurrent requests rather than queuing stale dialogue |
-| `postprocess.py` | Python | Strips OOC commentary, name-prefix artifacts, truncates at sentence boundaries |
+| `postprocess.py` | Python | Strips OOC commentary, name prefixes, stage directions and wrapping quotes; folds text to ASCII for the game buffer; truncates at sentence boundaries |
 
 ---
 
@@ -96,6 +104,21 @@ Switched backend from auto-gptq to llama-cpp-python. Wired real Llama-3.1-8B-Ins
 - CI: GitHub Actions runs Python tests + .NET build on every push
 
 ### 🔄 Phase 3 — Dialogue write-back *(in progress)*
+
+#### ✅ Real inference, out of process
+
+The server previously ran in mock mode because `llama-cpp-python` was never installable
+here — it is a C extension pinned to a CPython ABI, with no cp313 wheel and source-only
+distribution. Inference now runs in an upstream `llama-server.exe` child process reached
+over loopback HTTP, which needs no compiler, no CUDA Toolkit, and no particular Python
+version. Measured: **~18 s model load, ~0.8–1.1 s per line, 0 drops.**
+
+Two output defects surfaced only once real generations existed, and both are fixed:
+Ryuji proposed to *"take down those Phantom Thieves"* — a group he co-leads — which is
+now prevented by per-confidant world grounding that also keeps confidants who must not
+know from mentioning them at all; and the model emitted stage directions, wrapping
+quotes, and occasional non-ASCII, none of which survive an `Encoding.ASCII` write into
+the game buffer.
 
 #### 🏆 Milestone: mod-generated text rendered in-game, unaided
 
@@ -140,11 +163,24 @@ DirectX overlay for text input. Let the player type their own dialogue choice an
 
 ```
 Llama-3.1-8B-Instruct (Meta)
-  → GGUF Q4_K_M quantization  (~4.7 GB, fits in 8 GB VRAM)
-  → llama-cpp-python backend   (CUDA offload, no Python overhead on hot path)
-  → FastAPI /generate endpoint  (Pydantic validation, async queue)
-  → C# HTTP client             (30s timeout, 3× retry on 503 cold-start)
+  → GGUF Q4_K_M quantization    (~4.9 GB, fits in 8 GB VRAM)
+  → llama-server.exe :8766       (upstream ggml-org build, CUDA offload)
+  → FastAPI /generate :8765      (Pydantic validation, async queue)
+  → C# HTTP client               (30s timeout, 3× retry on 503 cold-start)
 ```
+
+**Why a subprocess rather than Python bindings.** `llama-cpp-python` is a C extension
+pinned to a CPython ABI: official CUDA wheels stop at cp312, and PyPI ships source
+only, so a Python 3.13 install would need the CUDA Toolkit and MSVC — on every machine
+running the mod. A prebuilt `.exe` has no opinion about the interpreter talking to it.
+
+The boundary pays for itself beyond the install: the API answers immediately instead of
+blocking ~20 s on weights, a CUDA OOM no longer takes down the process the game is
+talking to, and swapping the GGUF does not mean restarting the API. Because
+`llama-server` speaks the OpenAI chat-completions schema — the same shape the binding
+mirrored in-process — the port was a change of transport, not of contract.
+
+Measured on an RTX 4060 8 GB: **~18 s model load, ~1.0 s per generation.**
 
 ### Prompt structure
 
@@ -185,30 +221,43 @@ git clone https://github.com/SrijanSuresh/p5r-gen-social-links
 cd p5r-gen-social-links
 dotnet build mod/P5RGenSocialLinks/P5RGenSocialLinks.csproj --configuration Release
 ```
-Copy `mod/P5RGenSocialLinks/bin/Release/net8.0/P5RGenSocialLinks.dll` to your Reloaded-II mods folder.
+The build auto-deploys to `%USERPROFILE%\Desktop\Reloaded-II\Mods\P5GenSocialLinks` when that folder exists. Reloaded loads the DLL from its own `Mods` directory, not from `bin/` — a successful build says nothing about what the game will actually load.
 
 **2. Set up the Python server**
 ```powershell
 cd server
 python -m venv .wvenv
 .\.wvenv\Scripts\activate
-pip install -r requirements.txt   # llama-cpp-python[cuda], fastapi, uvicorn
+pip install -r requirements.txt   # fastapi, uvicorn, httpx — no compiler needed
 ```
-Download a Llama-3.1-8B-Instruct GGUF (Q4_K_M) and place it at `server/models/llama-3.1-8b-instruct-q4_k_m.gguf`.
 
-**3. Start server, then game**
+**3. Fetch the inference engine**
 ```powershell
-.\start.bat          # real inference
+.\scripts\fetch-llama-server.ps1
+```
+Downloads the upstream `llama-server.exe` and the redistributable CUDA runtime into
+`server/vendor/` (~640 MB, gitignored). No CUDA Toolkit or Visual Studio required —
+the runtime DLLs ship in the archive.
+
+Then download a Llama-3.1-8B-Instruct GGUF (Q4_K_M) to
+`server/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf`.
+
+**4. Start server, then game**
+```powershell
+.\start.bat          # real inference — spawns llama-server as a child process
 # or
 .\start-mock.bat     # no GPU needed, canned responses for testing
 ```
+Keep the window open while playing; closing it stops both processes.
 
 **Run tests**
 ```powershell
 cd server
 python -m pytest tests/ -q
-# 119 passed, 1 skipped
+# 196 passed, 1 skipped
 ```
+No GPU, model, or vendored binary needed — the inference backend is exercised through
+`httpx.MockTransport` and stub processes.
 
 ---
 
@@ -223,12 +272,14 @@ p5r-gen-social-links/
 │   ├── DialogueBridge.cs        # LLM dispatch, throttle, session history
 │   └── GenDialogue.json         # Runtime config (no recompile needed)
 ├── server/                      # Python inference server
-│   ├── inference/               # Pipeline, queue, postprocessor, config
+│   ├── inference/               # Pipeline, llama-server client + supervisor, queue, postprocessor
+│   ├── vendor/                  # llama-server.exe + CUDA runtime (gitignored, fetched)
 │   ├── social_link/             # Arcana roster, prompt builder, tier mapping
-│   ├── tests/                   # 119 tests (pytest)
+│   ├── tests/                   # 196 tests (pytest)
 │   └── main.py                  # FastAPI app
+├── scripts/fetch-llama-server.ps1  # Downloads prebuilt llama.cpp CUDA binaries
 ├── scripts/redate.sh            # Spreads commits across PR window
-├── learning.md                  # 22-chapter technical journal (the real docs)
+├── learning.md                  # 63-chapter technical journal (the real docs)
 └── .github/workflows/ci.yml     # Python tests + .NET build on push
 ```
 
@@ -236,7 +287,7 @@ p5r-gen-social-links/
 
 ## learning.md
 
-`learning.md` is a 22-chapter technical journal written alongside the code — covering ASLR and pointer arithmetic, Triton block-pointer math, 4-bit quantization, BF script format, CI design, and everything discovered via Cheat Engine and Ghidra. It exists because this project was built as a learning exercise as much as a mod.
+`learning.md` is a 63-chapter technical journal written alongside the code — covering ASLR and pointer arithmetic, Triton block-pointer math, 4-bit quantization, BF script format, CI design, process lifetime and Windows Job Objects, and everything discovered via Cheat Engine and Ghidra. It exists because this project was built as a learning exercise as much as a mod.
 
 ---
 
