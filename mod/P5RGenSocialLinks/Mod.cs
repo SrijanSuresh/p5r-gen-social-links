@@ -35,6 +35,10 @@ public class Mod : IModV1
     private IReloadedHooks?              _hooks;
     private int                          _cmmExecFireCount;
 
+    // Address of the interpreter's MOVZX, resolved by signature at load. Zero means the
+    // scan did not find it and the pool heuristic remains the only path to the text.
+    private nuint                        _msgByteFetch;
+
     [Function(CallingConventions.Microsoft)]
     public delegate nint CmmExecEventDelegate();
 
@@ -186,6 +190,7 @@ public class Mod : IModV1
             _logger.WriteLine($"[P5RGenSocialLinks] IReloadedHooks: {(_hooks is not null ? "OK" : "null")}");
 
             TryActivateHook();
+            TryResolveMsgInterpreter();
             SetupMemcpyHook();
             // BfDispatch hook crashes regardless of handler — abandoned, hunting text ptr via CE instead
             StartPollLoop();
@@ -373,6 +378,49 @@ public class Mod : IModV1
 
         _utf16CpyLogged++;
         _modLog!.Info($"[UTF16cpy] src=0x{src:X} dst=0x{dst:X} n={count}: \"{wide[0].Text}\"");
+    }
+
+    /// <summary>
+    /// Locate the message interpreter's byte-fetch instruction and record its address.
+    ///
+    /// This is the first half of replacing the heap heuristic. Everything the pool code
+    /// does today - scan tens of megabytes, score regions for English, arm the top one
+    /// plus its content-identical twin - exists only because we could not ask the game
+    /// which bytes it was about to render. This instruction can be asked: the struct in
+    /// RBX holds the record pointer and the cursor, so hooking it turns a guess into a
+    /// read (learning.md Ch. 65-66).
+    ///
+    /// Resolution is separated from hooking on purpose. A signature that resolves proves
+    /// the pattern survived this build; a hook that misbehaves is a different failure,
+    /// and diagnosing them together in a live game means restarting P5R for each guess.
+    /// </summary>
+    private void TryResolveMsgInterpreter()
+    {
+        try
+        {
+            using var scanner = new FunctionScanner();
+            nuint? addr = scanner.TryFindFirst(Signatures.MsgByteFetch);
+            if (addr is null)
+            {
+                _logger!.WriteLine(
+                    "[P5RGenSocialLinks] MsgByteFetch sig NOT FOUND — p5r.exe build differs " +
+                    "from the one the pattern was taken from. Pool heuristic stays in charge.");
+                return;
+            }
+
+            _msgByteFetch = addr.Value + Signatures.MsgByteFetchToMovzx;
+            nuint rva     = addr.Value - scanner.ModuleBase;
+
+            // Expected P5R.exe+17A3D1F. Logging the offset rather than the absolute
+            // address is what makes this comparable to a disassembler across runs.
+            _logger!.WriteLine(
+                $"[P5RGenSocialLinks] MsgByteFetch sig OK: P5R.exe+{rva:X} " +
+                $"(abs 0x{addr.Value:X}, movzx at 0x{_msgByteFetch:X})");
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger!.WriteLine($"[P5RGenSocialLinks] MsgByteFetch scan FAILED: {ex.Message}");
+        }
     }
 
     private void TryActivateHook()
