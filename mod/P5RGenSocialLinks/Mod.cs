@@ -2843,7 +2843,11 @@ public class Mod : IModV1
                 string text = await _llmClient!.GenerateAsync(req, cts.Token);
                 if (string.IsNullOrWhiteSpace(text))
                 {
-                    record.State = RecordState.Pending;   // retry on a later tick
+                    // Empty means the server had nothing that fit — usually a short record
+                    // no complete sentence will go into. Retrying that produces the same
+                    // answer while holding a queue slot the whole scene, so it gets a
+                    // couple of chances and then keeps its scripted line.
+                    GiveUpOrRetry(record, "no line fit the record");
                     return;
                 }
 
@@ -2859,15 +2863,34 @@ public class Mod : IModV1
             }
             catch (OperationCanceledException)
             {
-                record.State = RecordState.Pending;
-                _modLog!.Warn($"[PREGEN] #{record.Index} timed out.");
+                GiveUpOrRetry(record, "timed out");
             }
             catch (Exception ex) when (ex is not OutOfMemoryException)
             {
-                record.State = RecordState.Pending;
-                _modLog!.Warn($"[PREGEN] #{record.Index} error: {ex.Message}");
+                GiveUpOrRetry(record, ex.Message);
             }
         });
+    }
+
+    /// <summary>
+    /// Put a failed record back in the queue, or stop trying.
+    ///
+    /// A busy server and a record no sentence will fit fail the same way here, and only
+    /// one of them is worth retrying. Two attempts covers the transient case; beyond that
+    /// the record keeps its scripted line, which is a good line rather than a missing one.
+    /// </summary>
+    private void GiveUpOrRetry(RecordPlan record, string why)
+    {
+        const int MaxAttempts = 2;
+
+        if (++record.Attempts >= MaxAttempts)
+        {
+            record.State = RecordState.Rendered;   // out of the queue for good
+            _modLog!.Info($"[PREGEN] #{record.Index} keeping the script after " +
+                          $"{record.Attempts} attempts ({why})");
+            return;
+        }
+        record.State = RecordState.Pending;
     }
 
     /// <summary>
@@ -2883,6 +2906,11 @@ public class Mod : IModV1
     /// </summary>
     private void PumpPregen(SocialLinkSnapshot snap)
     {
+        // Below this, a complete sentence in character does not fit and the server
+        // correctly returns nothing. Measured: records of 15-21 chars produced
+        // "You can grab a" and "Guess we good to" before fragments were rejected.
+        const int MinGeneratableChars = 24;
+
         int lookahead = _cfg.PregenLookahead;
         if (lookahead <= 0 || _plan.Count == 0) return;
 
@@ -2898,7 +2926,7 @@ public class Mod : IModV1
             // rather than generated for. A three-character record is a fragment of UI,
             // and replacing it wastes a slow inference on something nobody reads as
             // dialogue.
-            if (record.Original.Length < 8 || record.Capacity < 12)
+            if (record.Original.Length < 8 || record.Capacity < MinGeneratableChars)
             {
                 record.State = RecordState.Rendered;   // permanently out of the way
                 continue;

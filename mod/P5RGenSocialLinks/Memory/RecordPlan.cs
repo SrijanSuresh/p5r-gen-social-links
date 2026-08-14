@@ -57,6 +57,17 @@ internal sealed class RecordPlan
     /// The generated replacement, once it exists.
     internal string? Generated { get; set; }
 
+    /// <summary>
+    /// How many times generation has been asked for and come back empty.
+    ///
+    /// Every failure returns the record to Pending so a busy server or a timeout is
+    /// simply retried — which is right for a transient fault and wrong for a permanent
+    /// one. A short record whose line cannot fit a complete sentence fails identically
+    /// every time, and without a cap it would occupy the queue for the whole scene while
+    /// records that could succeed waited behind it.
+    /// </summary>
+    internal int Attempts { get; set; }
+
     /// True while the record may still be overwritten. Written is included on purpose:
     /// a pre-generated line is a floor that a reactive generation is allowed to raise,
     /// right up until the interpreter reads it.
