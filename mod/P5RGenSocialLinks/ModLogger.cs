@@ -25,6 +25,13 @@ internal sealed class ModLogger
     private readonly string?   _path;
     private readonly object    _fileLock = new();
 
+    // Held open rather than reopened per line. Opening, appending and closing a file for
+    // every message is fine at a 500ms tick and is not fine when the player opens the
+    // backlog: that re-reads dozens of records at once, and the resulting burst of log
+    // lines turned into a burst of file-open syscalls on a thread the game is waiting on.
+    // AutoFlush keeps the crash-safety that per-line opening was there to provide.
+    private readonly StreamWriter? _writer;
+
     /// <summary>
     /// Where the mirror is written. Temp rather than the mod directory: the mod folder
     /// lives under Reloaded's install and is not guaranteed writable by the game process,
@@ -49,7 +56,8 @@ internal sealed class ModLogger
         try
         {
             File.WriteAllText(LogPath, $"=== P5RGenSocialLinks {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===\n");
-            _path = LogPath;
+            _path   = LogPath;
+            _writer = new StreamWriter(LogPath, append: true) { AutoFlush = true };
         }
         catch (IOException)
         {
@@ -79,20 +87,20 @@ internal sealed class ModLogger
     }
 
     /// <summary>
-    /// Append one line, opening and closing the file each time.
+    /// Append one line through a writer held open for the process lifetime.
     ///
-    /// This is slower than holding a StreamWriter open, and it is chosen anyway: a
-    /// buffered writer loses its tail when the process dies, and a hard crash is exactly
-    /// the case where the last few lines are the entire value of the log. Logging happens
-    /// at a 500 ms poll tick, not on the hook path, so the cost is irrelevant.
+    /// AutoFlush is on, so the tail still survives a hard crash — which is the whole
+    /// reason the earlier version reopened the file per line. Reopening turned out to
+    /// cost far more than it bought: a backlog burst produced dozens of log lines in a
+    /// few milliseconds, and dozens of open/close syscalls with it.
     /// </summary>
     private void Mirror(string msg)
     {
-        if (_path is null) return;
+        if (_writer is null) return;
         try
         {
             lock (_fileLock)
-                File.AppendAllText(_path, $"{DateTime.Now:HH:mm:ss.fff}  {msg}\n");
+                _writer.WriteLine($"{DateTime.Now:HH:mm:ss.fff}  {msg}");
         }
         catch (IOException)
         {
