@@ -1798,6 +1798,65 @@ public class Mod : IModV1
     private const int MaxJoinGap = 32;
 
     /// <summary>
+    /// Build the record layout, recovering short text the slot scanner skipped.
+    ///
+    /// The scanner requires a run to read as an English sentence before it counts as a
+    /// slot, which is right when deciding whether a region is a script and wrong once
+    /// inside one. "you gotta" is nine characters and falls below that floor, so it was
+    /// never a slot — and so it survived the write and appeared on screen as
+    /// "Let's pump it up then, Joker. you gotta— Wait, that ain't it!".
+    ///
+    /// Inside a record the question is no longer "is this dialogue" — the record has
+    /// already been identified — but "is this text the bubble will draw". A three-
+    /// character printable run qualifies. Bytes outside the runs are left alone: the
+    /// Shift-JIS dash after "you gotta" is a glyph the game renders, not text we own.
+    /// </summary>
+    private ((int Off, int Len)[] Slots, System.Collections.Generic.List<(int Start, int Count)> Records)
+        BuildRecordLayout(nuint poolBase, (int Off, int Len)[] raw)
+    {
+        var slots   = new System.Collections.Generic.List<(int, int)>(raw.Length + 8);
+        var records = new System.Collections.Generic.List<(int, int)>();
+        var gapBuf  = new byte[MaxJoinGap];
+
+        int i = 0;
+        while (i < raw.Length)
+        {
+            int start = slots.Count;
+            slots.Add(raw[i]);
+            i++;
+
+            while (i < raw.Length && SameRecord(poolBase, raw[i - 1], raw[i], gapBuf))
+            {
+                AddGapRuns(poolBase, raw[i - 1], raw[i], gapBuf, slots);
+                slots.Add(raw[i]);
+                i++;
+            }
+            records.Add((start, slots.Count - start));
+        }
+        return (slots.ToArray(), records);
+    }
+
+    /// Add printable runs of three or more characters found between two fragments.
+    private void AddGapRuns(nuint poolBase, (int Off, int Len) prev, (int Off, int Len) next,
+                            byte[] buf, System.Collections.Generic.List<(int, int)> slots)
+    {
+        int gapStart = prev.Off + prev.Len;
+        int gap      = next.Off - gapStart;
+        if (gap <= 1 || gap > MaxJoinGap) return;
+        if (!MemoryGuard.TryRead(poolBase + (nuint)gapStart, buf, gap)) return;
+
+        int run = 0;
+        for (int b = 0; b <= gap; b++)
+        {
+            bool printable = b < gap && IsPrintable(buf[b]);
+            if (printable) { run++; continue; }
+            if (run >= 3) slots.Add((gapStart + b - run, run));
+            run = 0;
+        }
+    }
+
+
+    /// <summary>
     /// Whether two adjacent text runs belong to the same speech bubble.
     ///
     /// Decided by what is in the gap, not by how wide it is. Measured on a live scene:
@@ -3196,8 +3255,9 @@ public class Mod : IModV1
         _poolRecords.Clear();
         _poolNextRecord.Clear();
 
-        _heapPools.Add((regionBase, (int)regionSize, slots));
-        _poolRecords.Add(GroupSlotsIntoRecords(regionBase, slots));
+        var (layout, records) = BuildRecordLayout(regionBase, slots);
+        _heapPools.Add((regionBase, (int)regionSize, layout));
+        _poolRecords.Add(records);
         _poolNextRecord.Add(0);
         _poolIsHeap = true;
 
