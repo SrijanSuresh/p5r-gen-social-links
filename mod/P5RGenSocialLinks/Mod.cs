@@ -2657,6 +2657,131 @@ public class Mod : IModV1
     }
 
     /// <summary>
+    /// Context for one specific record: the scene, the line being replaced, and what has
+    /// already been said.
+    ///
+    /// The line being replaced is the part the reactive path never had. It was sending
+    /// "hang-out with Ryuji at Protein Lovers gym" for every line of the scene, so the
+    /// model wrote ambience and repeated itself — two consecutive generations came back
+    /// as "You comin' back here every week like me now?" and "You comin' here more often
+    /// now?", which are the same sentence.
+    /// </summary>
+    private string BuildRecordContext(SocialLinkSnapshot snap, RecordPlan record)
+    {
+        var ctx = new System.Text.StringBuilder(ContextBuilder.Build(snap));
+
+        ctx.Append(" The line you are replacing is: \"").Append(record.Original).Append('"');
+        ctx.Append(" Say something with the same purpose, in your own words.");
+
+        // Immediately preceding lines, so a reply reads as a reply. Generated text is
+        // preferred where it exists, because that is what the player actually saw.
+        int from = Math.Max(0, record.Index - 2);
+        if (from < record.Index)
+        {
+            ctx.Append(" Just before this, you said:");
+            for (int i = from; i < record.Index; i++)
+                ctx.Append(" \"").Append(_plan[i].Generated ?? _plan[i].Original).Append('"');
+        }
+
+        string text = ctx.ToString();
+        return text.Length > 1000 ? text[..1000] : text;   // Pydantic caps context at 1024
+    }
+
+    /// <summary>
+    /// Ask the server for one record's replacement line, off the poll thread.
+    ///
+    /// The record is passed rather than looked up on completion: by the time the answer
+    /// arrives the player may have moved on, the plan may have been rebuilt, or the
+    /// session may have ended, and resolving an index against a list that has since
+    /// changed is how a generated line lands on the wrong bubble.
+    /// </summary>
+    private void RequestForRecord(SocialLinkSnapshot snap, RecordPlan record)
+    {
+        _ = Task.Run(async () =>
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(_cfg.TimeoutSeconds));
+            try
+            {
+                var req = new Server.GenerateRequest
+                {
+                    ConfidantId   = snap.ConfidantId,
+                    Rank          = snap.RankLevel,
+                    Context       = BuildRecordContext(snap, record),
+                    CharacterName = Memory.ConfidantNames.Resolve(snap.ConfidantId),
+                    MaxChars      = record.Capacity,
+                };
+
+                string text = await _llmClient!.GenerateAsync(req, cts.Token);
+                if (string.IsNullOrWhiteSpace(text))
+                {
+                    record.State = RecordState.Pending;   // retry on a later tick
+                    return;
+                }
+
+                record.Generated = text;
+                record.State     = RecordState.Ready;
+                _modLog!.Info($"[PREGEN] #{record.Index} ready ({text.Length}/{record.Capacity}): \"{text}\"");
+            }
+            catch (Server.InferenceInFlightException)
+            {
+                // The server was busy with another record. Not an error — put it back and
+                // the next tick picks it up, which is what makes the queue self-pacing.
+                record.State = RecordState.Pending;
+            }
+            catch (OperationCanceledException)
+            {
+                record.State = RecordState.Pending;
+                _modLog!.Warn($"[PREGEN] #{record.Index} timed out.");
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                record.State = RecordState.Pending;
+                _modLog!.Warn($"[PREGEN] #{record.Index} error: {ex.Message}");
+            }
+        });
+    }
+
+    /// <summary>
+    /// Keep the next few records generated, without waiting for the player to reach them.
+    ///
+    /// Runs on the poll tick. Everything it needs was known at arm time, so this asks a
+    /// question the reactive path could not: not "what should Ryuji say now" but "what
+    /// should he say at record 14", answerable long before record 14 is on screen.
+    ///
+    /// One request is issued per tick at most. The server processes one at a time and
+    /// answers 429 to anything overlapping, so firing the whole window at once would
+    /// convert a queue into a pile of rejections.
+    /// </summary>
+    private void PumpPregen(SocialLinkSnapshot snap)
+    {
+        int lookahead = _cfg.PregenLookahead;
+        if (lookahead <= 0 || _plan.Count == 0) return;
+
+        int from = _poolNextRecord.Count > 0 ? Math.Max(0, _poolNextRecord[0]) : 0;
+        int to   = Math.Min(_plan.Count, from + lookahead);
+
+        for (int i = from; i < to; i++)
+        {
+            RecordPlan record = _plan[i];
+            if (record.State != RecordState.Pending) continue;
+
+            // Records whose scripted line is too short to be a spoken line are skipped
+            // rather than generated for. A three-character record is a fragment of UI,
+            // and replacing it wastes a slow inference on something nobody reads as
+            // dialogue.
+            if (record.Original.Length < 8 || record.Capacity < 12)
+            {
+                record.State = RecordState.Rendered;   // permanently out of the way
+                continue;
+            }
+
+            record.State = RecordState.InFlight;
+            RequestForRecord(snap, record);
+            return;   // one per tick
+        }
+    }
+
+    /// <summary>
     /// Build the scene plan from region 0: one entry per record, with its capacity and
     /// the scripted line it currently holds.
     ///
