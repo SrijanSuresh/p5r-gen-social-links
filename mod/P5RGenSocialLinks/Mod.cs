@@ -3277,6 +3277,7 @@ public class Mod : IModV1
                     _heapPools.Clear();
                     _poolRecords.Clear();
                     _poolNextRecord.Clear();
+                    LogSceneCoverage();
                     _plan.Clear();
                     // Cleared with the session: the next hang-out is a different scene,
                     // and a stale script would describe a conversation that already ended.
@@ -3288,7 +3289,6 @@ public class Mod : IModV1
                     _lastLlmText         = null;
                     lock (_largeCopyLock) _largeCopyDsts.Clear();
                     _sessionActive = false;
-                    LogSceneCoverage();
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
                 }
                 lastSession = 0;
