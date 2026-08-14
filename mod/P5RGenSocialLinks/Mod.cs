@@ -3136,6 +3136,18 @@ public class Mod : IModV1
                 continue;
             }
 
+            // Keep the queue ahead of the player, and land anything it has finished.
+            //
+            // Flush first: text generated on an earlier tick should reach memory before a
+            // new request is issued, so a busy server delays the next line rather than the
+            // one already paid for.
+            SocialLinkSnapshot? live = SocialLinkReader.TryReadFromPtr(session);
+            if (live is not null)
+            {
+                FlushReadyRecords();
+                PumpPregen(live);
+            }
+
             // BF buffer discovery: live scan of session struct every tick.
             TryFindBfBuffer(session);
 
