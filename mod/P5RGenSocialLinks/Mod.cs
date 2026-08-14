@@ -2838,7 +2838,8 @@ public class Mod : IModV1
 
             if (WriteRecord(record.Index, record.Generated) > 0)
             {
-                record.State = RecordState.Written;
+                record.State      = RecordState.Written;
+                record.WasWritten = true;
                 _modLog!.Info($"[PREGEN] #{record.Index} written, " +
                               $"{record.Index - CurrentRecord()} ahead of the player");
             }
@@ -2861,8 +2862,7 @@ public class Mod : IModV1
         var gaps = new System.Text.StringBuilder();
         foreach (RecordPlan record in _plan)
         {
-            bool replaced = record.Generated is not null &&
-                            record.State is RecordState.Written or RecordState.Rendered;
+            bool replaced = record.WasWritten;
             if (replaced) { written++; continue; }
             if (record.Original.Length < 8) continue;   // never a candidate
 
@@ -3251,6 +3251,7 @@ public class Mod : IModV1
         // offset and verifies byte-for-byte before touching anything. That is the
         // mechanism that actually knows two addresses hold the same line.
         _outsideReads = 0;
+        _twinDelta    = 0;   // learned for the pool being replaced; meaningless for this one
         _heapPools.Clear();
         _poolRecords.Clear();
         _poolNextRecord.Clear();
@@ -3326,7 +3327,21 @@ public class Mod : IModV1
     {
         if (_twinDelta == 0 || len <= 0 || len > _mirrorBuf.Length) return false;
 
-        nuint mirror = (nuint)((long)addr - _twinDelta);
+        // Both directions, because the sign of the delta is an accident of which copy the
+        // interpreter happened to read first. LearnTwinDelta computes (this - previous),
+        // and the game alternates, so the log shows the same offset as +0x33D83600 and
+        // -0x33D83600 within one scene. Trying one direction meant the mirror silently
+        // refused about half the time — it fired zero times in a whole hang-out, and the
+        // text log showed the original script throughout.
+        //
+        // Trying both is safe precisely because the guard below does the deciding: an
+        // address only gets written if it still holds the bytes the target held.
+        return TryMirrorAt((nuint)((long)addr - _twinDelta), original, len, written)
+            || TryMirrorAt((nuint)((long)addr + _twinDelta), original, len, written);
+    }
+
+    private unsafe bool TryMirrorAt(nuint mirror, byte[] original, int len, byte* written)
+    {
         if (!MemoryGuard.TryRead(mirror, _mirrorBuf, len)) return false;
 
         for (int i = 0; i < len; i++)

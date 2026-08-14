@@ -68,6 +68,16 @@ internal sealed class RecordPlan
     /// </summary>
     internal int Attempts { get; set; }
 
+    /// <summary>
+    /// True once the bytes actually reached the pool.
+    ///
+    /// Separate from State because a record can be generated and then frozen by the
+    /// interpreter before the flush runs, which leaves Generated set and State at
+    /// Rendered without a single byte having been written. Coverage counted those as
+    /// successes and reported 10 replaced against 7 writes in the log beneath it.
+    /// </summary>
+    internal bool WasWritten { get; set; }
+
     /// True while the record may still be overwritten. Written is included on purpose:
     /// a pre-generated line is a floor that a reactive generation is allowed to raise,
     /// right up until the interpreter reads it.
