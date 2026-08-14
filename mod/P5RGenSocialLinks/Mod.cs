@@ -142,6 +142,15 @@ public class Mod : IModV1
         _poolRecords = new();
     private readonly System.Collections.Generic.List<int> _poolNextRecord = new();
 
+    // The scene's records as a plan: capacity and original line per record, plus where
+    // each one is in its life cycle. Built once from region 0 at arm time, because every
+    // armed region is a copy of the same script with identical record widths.
+    //
+    // This is what makes generation independent of the player. All of it is knowable
+    // before a single line is displayed; waiting for a dispatch event to learn a record's
+    // size or its scripted text was only ever necessary while the buffer was a guess.
+    private readonly System.Collections.Generic.List<RecordPlan> _plan = new();
+
     // UTF-16 hunt state. _utf16CpyLogged caps the memcpy log; the sweep cursor lets a
     // multi-GB heap scan resume across ticks instead of stalling one.
     private int   _utf16CpyLogged;
@@ -1649,6 +1658,7 @@ public class Mod : IModV1
         _heapPools.Clear();
         _poolRecords.Clear();
         _poolNextRecord.Clear();
+        _plan.Clear();
         string anchorSample = ranked[0].Sample;
 
         var selected = new System.Collections.Generic.List<int> { 0 };
@@ -1711,6 +1721,10 @@ public class Mod : IModV1
 
         if (_heapPools.Count == 0) return;
         _poolIsHeap = true;
+
+        // Before the pending write below, for the reason in Ch. 64: this is the
+        // last moment each record still holds its scripted line.
+        BuildRecordPlan();
         _modLog!.Info($"[POOL] {_heapPools.Count} regions armed for write");
 
         string? pending = _lastLlmText;
@@ -2643,6 +2657,69 @@ public class Mod : IModV1
     }
 
     /// <summary>
+    /// Build the scene plan from region 0: one entry per record, with its capacity and
+    /// the scripted line it currently holds.
+    ///
+    /// Ordering is load-bearing in the same way as Ch. 64's script capture. The original
+    /// text only exists until the first write, and it is the best context the model can
+    /// be given about this specific moment — not the scene in general, but the line it is
+    /// replacing. Reading it later means reading whatever we ourselves wrote.
+    /// </summary>
+    private void BuildRecordPlan()
+    {
+        _plan.Clear();
+        if (_heapPools.Count == 0 || _poolRecords.Count == 0) return;
+
+        (nuint poolBase, _, (int Off, int Len)[] slots) = _heapPools[0];
+        var records = _poolRecords[0];
+
+        for (int i = 0; i < records.Count; i++)
+        {
+            (int start, int count) = records[i];
+
+            int capacity = 0;
+            var line     = new System.Text.StringBuilder();
+            for (int k = 0; k < count; k++)
+            {
+                (int off, int len) = slots[start + k];
+                capacity += len;
+
+                // Rows of one bubble join with a space, not a newline: the model is being
+                // shown a sentence, and the row split is a rendering detail it has no use
+                // for. Wrapping puts the breaks back on the way out.
+                if (line.Length > 0) line.Append(' ');
+                line.Append(AsciiPreview(poolBase + (nuint)off, len));
+            }
+
+            _plan.Add(new RecordPlan
+            {
+                Index    = i,
+                Capacity = capacity + (count - 1),
+                Original = line.ToString().Trim(),
+            });
+        }
+
+        _modLog!.Info($"[PLAN] {_plan.Count} records; " +
+                      $"capacity {MinCapacity()}-{MaxCapacity()} chars");
+        for (int i = 0; i < Math.Min(4, _plan.Count); i++)
+            _modLog!.Info($"[PLAN]   {_plan[i]}");
+    }
+
+    private int MinCapacity()
+    {
+        int min = int.MaxValue;
+        foreach (var p in _plan) min = Math.Min(min, p.Capacity);
+        return min == int.MaxValue ? 0 : min;
+    }
+
+    private int MaxCapacity()
+    {
+        int max = 0;
+        foreach (var p in _plan) max = Math.Max(max, p.Capacity);
+        return max;
+    }
+
+    /// <summary>
     /// Characters the next record to be written can hold, or 0 when there is no target.
     ///
     /// This is the sum of the record's fragment widths plus one per join: fragments are
@@ -2840,6 +2917,7 @@ public class Mod : IModV1
                     _heapPools.Clear();
                     _poolRecords.Clear();
                     _poolNextRecord.Clear();
+                    _plan.Clear();
                     // Cleared with the session: the next hang-out is a different scene,
                     // and a stale script would describe a conversation that already ended.
                     _sceneScript.Clear();
