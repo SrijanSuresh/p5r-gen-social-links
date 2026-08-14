@@ -2762,7 +2762,7 @@ public class Mod : IModV1
     {
         if (_plan.Count == 0) return;
 
-        int written = 0, pending = 0;
+        int written = 0, pending = 0, tooSmall = 0;
         var gaps = new System.Text.StringBuilder();
         foreach (RecordPlan record in _plan)
         {
@@ -2771,6 +2771,11 @@ public class Mod : IModV1
             if (replaced) { written++; continue; }
             if (record.Original.Length < 8) continue;   // never a candidate
 
+            // Records we deliberately never queue are not failures, and counting them as
+            // misses understated the result: the first report read 17/22 when five of the
+            // gaps were short interjections the queue was told to leave alone.
+            if (record.Capacity < 24) { tooSmall++; continue; }
+
             pending++;
             if (gaps.Length < 60) gaps.Append(gaps.Length > 0 ? ", " : "").Append('#').Append(record.Index);
         }
@@ -2778,6 +2783,7 @@ public class Mod : IModV1
         int candidates = written + pending;
         int percent    = candidates == 0 ? 0 : written * 100 / candidates;
         _modLog!.Info($"[SCENE] replaced {written}/{candidates} records ({percent}%)" +
+                      (tooSmall > 0 ? $", {tooSmall} too short to try" : "") +
                       (gaps.Length > 0 ? $" — missed {gaps}" : ""));
     }
 
@@ -2981,10 +2987,48 @@ public class Mod : IModV1
             });
         }
 
+        LogSlotSeparators(poolBase, slots);
+
         _modLog!.Info($"[PLAN] {_plan.Count} records; " +
                       $"capacity {MinCapacity()}-{MaxCapacity()} chars");
         for (int i = 0; i < Math.Min(4, _plan.Count); i++)
             _modLog!.Info($"[PLAN]   {_plan[i]}");
+    }
+
+    /// <summary>
+    /// Dump the bytes between consecutive text runs, to find out what actually separates
+    /// the rows of one bubble from the start of the next message.
+    ///
+    /// Grouping currently joins runs exactly one byte apart, because the one separator
+    /// ever inspected in a hex editor was a bare 0x0A. That is not the whole story: a
+    /// bubble rendered as
+    ///
+    ///     "Let's pump it up then, Joker. you gotta— Wait, that ain't it!"
+    ///
+    /// had its rows twelve bytes apart, so grouping saw two records, wrote the generated
+    /// line into the first, and left the rest of the script showing underneath.
+    ///
+    /// Widening the threshold by guesswork is how the 211-slot write happened. Twelve is
+    /// close to the ~27 that separates genuine messages, and the difference has to be read
+    /// out of the bytes rather than assumed from the distance.
+    /// </summary>
+    private void LogSlotSeparators(nuint poolBase, (int Off, int Len)[] slots)
+    {
+        var buf = new byte[32];
+        for (int i = 1, shown = 0; i < slots.Length && shown < 10; i++)
+        {
+            int gapStart = slots[i - 1].Off + slots[i - 1].Len;
+            int gap      = slots[i].Off - gapStart;
+            if (gap <= 1 || gap > 32) continue;   // 1 is the known newline; huge gaps are padding
+
+            if (!MemoryGuard.TryRead(poolBase + (nuint)gapStart, buf, gap)) continue;
+
+            var hex = new System.Text.StringBuilder(gap * 3);
+            for (int b = 0; b < gap; b++) hex.Append(buf[b].ToString("X2")).Append(' ');
+
+            _modLog!.Info($"[GAP] {gap,2}B between #{i - 1} and #{i}: {hex}");
+            shown++;
+        }
     }
 
     private int MinCapacity()
