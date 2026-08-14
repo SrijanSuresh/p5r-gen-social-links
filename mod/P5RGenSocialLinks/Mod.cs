@@ -1127,6 +1127,37 @@ public class Mod : IModV1
         return slots.ToArray();
     }
 
+    /// <summary>
+    /// Print absolute addresses of the anchor's first slots, for setting a hardware
+    /// read watchpoint on them in a debugger.
+    ///
+    /// The ranking tells us which region looks most like dialogue; it cannot tell us
+    /// which slot the renderer actually reads, which is why every slot gets written and
+    /// both rows of the bubble show the same line. That question is answerable only by
+    /// observing the consumer (learning.md Ch. 65), and observing it starts with an
+    /// address to watch.
+    ///
+    /// Hunting that address by string-scanning the process is possible but slow and
+    /// ambiguous — the same line exists in several copies. The mod already holds the
+    /// exact offsets, so printing them turns a search into a paste.
+    /// </summary>
+    private void LogWatchpointTargets(nuint poolBase, (int Off, int Len)[] slots, int maxSlots)
+    {
+        int n = Math.Min(maxSlots, slots.Length);
+        _modLog!.Info($"[WATCH] anchor 0x{poolBase:X} — first {n} of {slots.Length} slots:");
+        for (int i = 0; i < n; i++)
+        {
+            (int off, int len) = slots[i];
+            nuint addr = poolBase + (nuint)off;
+
+            // Read the text back rather than reusing the capture-time string: this runs
+            // before any write, so it is the scripted line, and it must match what is on
+            // screen for the address to be worth watching.
+            string text = AsciiPreview(addr, Math.Min(len, 64));
+            _modLog!.Info($"[WATCH]   0x{addr:X} len={len} \"{text}\"");
+        }
+    }
+
     private static unsafe string AsciiPreview(nuint addr, int maxChars)
     {
         if (!MemoryGuard.IsReadable(addr, maxChars)) return "";
@@ -1551,6 +1582,7 @@ public class Mod : IModV1
             _modLog!.Info(
                 $"[POOL] ARM #{i} ({why}) 0x{c.Base:X} len={c.Len} avg={c.Score / 100.0:F2} " +
                 $"slots={slots.Length}: \"{c.Sample}\"");
+            if (i == 0) LogWatchpointTargets(c.Base, slots, maxSlots: 8);
         }
 
         if (_heapPools.Count == 0) return;
