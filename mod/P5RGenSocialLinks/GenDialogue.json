@@ -37,6 +37,16 @@
   // dialogue. Keep at 1 unless diagnosing why the scene is not being found.
   "max_write_regions": 1,
 
+  // Fall back to scanning the heap for the dialogue pool.
+  //
+  // Superseded by the interpreter hook, which gets the region from an address the game
+  // itself read: microseconds instead of 33 seconds, and exact instead of ranked. The
+  // scan also could not start until a message was dispatched, so the opening lines of
+  // every scene played before anything could be written.
+  //
+  // Turn on only if a scene ends up with no pool armed at all.
+  "heap_scan_enabled": false,
+
   // How many records ahead of the player to keep generated.
   //
   // Generation takes ~2s and a held fast-forward button takes none, so the only way to

@@ -3278,7 +3278,7 @@ public class Mod : IModV1
             // Primary target: the heap dialogue pool. The mapped-file scans below reach
             // only the global item/skill tables — the live conversation is on the heap,
             // as ASCII, confirmed at 0x41DD7F6389 / 0x42102CAAA9.
-            if (_currentMsgId != 0 && _heapPools.Count == 0)
+            if (_cfg.HeapScanEnabled && _currentMsgId != 0 && _heapPools.Count == 0)
                 TryFindHeapDialoguePool();
 
             // Diagnostic sweeps, off by default now that the pool location is known.

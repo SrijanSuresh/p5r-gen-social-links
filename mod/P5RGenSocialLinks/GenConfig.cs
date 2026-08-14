@@ -52,6 +52,22 @@ internal sealed class GenConfig
     public int MaxWriteRegions { get; init; } = 1;
 
     /// <summary>
+    /// Fall back to scanning the heap for the dialogue pool.
+    ///
+    /// Superseded by the interpreter hook, which gets the region from an address the game
+    /// itself read — microseconds against 33 seconds, and exactly right rather than
+    /// ranked. The scan also could not run until a message had been dispatched, so the
+    /// opening lines of every scene played before anything could be written.
+    ///
+    /// Kept behind a switch for one release rather than deleted outright: the hook path
+    /// has been exercised on one scene, and a scan that is slow and occasionally wrong is
+    /// still better than no pool at all in a scene it turns out to miss. It goes when the
+    /// hook has been through a few more.
+    /// </summary>
+    [JsonPropertyName("heap_scan_enabled")]
+    public bool HeapScanEnabled { get; init; } = false;
+
+    /// <summary>
     /// How many records ahead of the player to keep generated.
     ///
     /// This is what makes pacing irrelevant: at a lookahead of 3, a line is written two
