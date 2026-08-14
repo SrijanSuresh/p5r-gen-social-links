@@ -59,6 +59,8 @@ Rules:
 - Do NOT start your response with the character's own name.
 - Match the emotional closeness appropriate for rank {rank}/10.
 - Do NOT repeat the player's words verbatim; respond naturally.
+- If you are told which line you are replacing, keep its purpose and move the
+  conversation the same distance forward. Do not restate a line you already said.
 """
 
 

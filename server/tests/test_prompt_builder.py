@@ -112,3 +112,28 @@ def test_default_budget_is_used_when_none_given() -> None:
     """Callers with no record in hand must still get a usable prompt."""
     system, _ = build_prompt(8, 4, "at the gym")
     assert "characters" in system
+
+
+# --- replacing a specific line ------------------------------------------------
+#
+# Pre-generation hands the model the scripted line it is displacing, so the rules have
+# to say what to do with it. Without this, two consecutive records came back as "You
+# comin' back here every week like me now?" and "You comin' here more often now?" — one
+# sentence twice, because every request carried the same scene blurb and nothing else.
+
+
+def test_rules_mention_replacing_a_line() -> None:
+    system, _ = build_prompt(8, 4, "at the gym")
+    assert "replacing" in system
+
+
+def test_rules_forbid_restating_an_earlier_line() -> None:
+    system, _ = build_prompt(8, 4, "at the gym")
+    assert "already said" in system
+
+
+def test_context_reaches_the_user_prompt_verbatim() -> None:
+    """The line being replaced travels in the context, so it must survive intact."""
+    original = 'The line you are replacing is: "A towel?"'
+    _, user = build_prompt(8, 4, original)
+    assert original in user
