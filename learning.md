@@ -5487,3 +5487,108 @@ and the thing that separated them was timestamped evidence: three writes to one 
 is a cursor problem, two addresses holding one line is a coverage problem, and a burst
 correlated with a keypress is a cost problem. Without the log they would have been one
 vague report of "it's glitchy", and any single fix would have left two of them live.
+
+---
+
+## Chapter 72: Generate Ahead, Because You Cannot Outrun a Button
+
+### The problem latency actually creates
+
+The pipeline today is reactive:
+
+```
+[MSG] dispatch  ->  generate (1.6-2.2s)  ->  write the next record  ->  player reads it
+```
+
+That works while the player reads at a human pace and falls apart the moment they do
+not. Hold fast-forward and the write lands after the line is drawn. Skip a scene and the
+record is consumed without ever being seen. Read slowly and nothing is wrong, which is
+the trap: the bug is invisible in exactly the conditions you test under.
+
+The instinct is to make generation faster. Two seconds is already good for an 8B model on
+a laptop GPU, and it will never beat a held button. Latency is not the problem; *waiting
+until the last moment to start* is.
+
+### What the hook changed about what is knowable
+
+Before the interpreter hook, reacting was the only option, because the buffer was
+discovered as it was used. That is no longer true. At arm time the mod holds:
+
+- every record in the scene, in order,
+- each record's exact capacity in characters,
+- each record's original scripted text.
+
+Nothing in that list requires the player to have reached the line. There is no reason to
+wait for a dispatch event to know what Ryuji says four lines from now — the script is
+already in memory, and so is the space his replacement has to fit into.
+
+So the design inverts. Instead of *an event triggering a generation*, a background
+scheduler keeps the next few records filled, and the player's arrival is merely when the
+work becomes visible:
+
+```
+arm  ->  plan all 22 records
+     ->  keep K ahead generating
+     ->  each result written seconds or minutes early
+     ->  player pacing stops mattering
+```
+
+### Why this does not preclude reacting to the player
+
+The obvious objection is that the end goal is the player typing something and Ryuji
+answering — which is reactive by definition, and cannot be pre-generated.
+
+Both fit, because the two cases are disjoint and the reactive one is where latency is
+free:
+
+| Case | Player input | Time available | Strategy |
+|---|---|---|---|
+| Ryuji monologue | none | ~0, they can hold FFWD | pre-generate |
+| Choice prompt (`SEL`) | menu navigation | 1-3s | reactive |
+| Typed line | typing a sentence | 5-15s | reactive |
+
+The player can only outrun inference when they are contributing nothing. The moment they
+contribute, they have spent seconds doing it. You cannot fast-forward through your own
+typing.
+
+And the two compose rather than compete, because the hook reports when a record has been
+*read*:
+
+```
+pre-generated line sits in record N            <- floor
+player types; reactive generation starts
+  arrives before N is reported rendered        -> overwrite
+  arrives after                                -> discard; the floor stands
+```
+
+That second branch is the "text changed under the player" bug from Ch. 71, restated as a
+rule: **a record is writable until the hook says it was read, and frozen afterwards.** The
+bug becomes the safety property.
+
+### The state a record needs
+
+Pre-generation means a record is no longer something written once at an event. It has a
+life cycle, and every transition matters:
+
+```
+Pending  -> InFlight -> Ready -> Written -> Rendered
+   ^                                          |
+   |                    (never goes backwards)|
+```
+
+`Ready` is separate from `Written` because generation completing and the bytes landing
+are different moments with different failure modes. `Rendered` is the freeze point. And
+the arrows only run one way — Ch. 71 was two bugs caused by a cursor that could be moved
+by the wrong event, so this one advances on explicit transitions and never recomputes
+itself from a timer.
+
+### The cost of being early
+
+Pre-generation buys pacing-independence and gives up immediacy: a line written four lines
+ahead cannot respond to what happened three lines ago. For scripted monologue that costs
+almost nothing, because the model is working from the scene script either way. It would
+cost a great deal for a reply to player input — which is precisely the case that stays
+reactive.
+
+Being early is not free, and it is worth naming the trade rather than discovering it
+later as a vague sense that the dialogue feels less connected.
