@@ -200,7 +200,8 @@ public class Mod : IModV1
             // BfDispatch hook crashes regardless of handler — abandoned, hunting text ptr via CE instead
             StartPollLoop();
 
-            _logger.WriteLine($"[P5RGenSocialLinks] Started — hook:{(_hookActive ? "ON" : "OFF")} poll:ON");
+            _modLog.Always($"[P5RGenSocialLinks] Started — hook:{(_hookActive ? "ON" : "OFF")} poll:ON");
+            _modLog.Always($"[P5RGenSocialLinks] Log mirrored to {ModLogger.LogPath}");
         }
         catch (Exception ex)
         {
@@ -407,7 +408,7 @@ public class Mod : IModV1
             nuint? addr = scanner.TryFindFirst(Signatures.MsgByteFetch);
             if (addr is null)
             {
-                _logger!.WriteLine(
+                _modLog!.Always(
                     "[P5RGenSocialLinks] MsgByteFetch sig NOT FOUND — p5r.exe build differs " +
                     "from the one the pattern was taken from. Pool heuristic stays in charge.");
                 return;
@@ -418,25 +419,25 @@ public class Mod : IModV1
 
             // Expected P5R.exe+17A3D1F. Logging the offset rather than the absolute
             // address is what makes this comparable to a disassembler across runs.
-            _logger!.WriteLine(
+            _modLog!.Always(
                 $"[P5RGenSocialLinks] MsgByteFetch sig OK: P5R.exe+{rva:X} " +
                 $"(abs 0x{addr.Value:X}, movzx at 0x{_msgByteFetch:X})");
 
             if (!_cfg.MsgHookEnabled)
             {
-                _logger.WriteLine("[P5RGenSocialLinks] Msg watch disabled by config.");
+                _modLog!.Always("[P5RGenSocialLinks] Msg watch disabled by config.");
                 return;
             }
             if (_hooks is null)
             {
-                _logger.WriteLine("[P5RGenSocialLinks] Msg watch skipped — IReloadedHooks null.");
+                _modLog!.Always("[P5RGenSocialLinks] Msg watch skipped — IReloadedHooks null.");
                 return;
             }
 
             try
             {
                 _msgWatch = new MsgInterpreterWatch(_hooks, _msgByteFetch);
-                _logger.WriteLine("[P5RGenSocialLinks] Msg watch ACTIVE.");
+                _modLog!.Always("[P5RGenSocialLinks] Msg watch ACTIVE.");
             }
             catch (Exception ex)
             {
@@ -445,13 +446,13 @@ public class Mod : IModV1
                 // the interface we reference, and every path after this point still works
                 // without the watch — so an unknown assembler error must degrade to the
                 // pool heuristic rather than abort mod startup.
-                _logger.WriteLine($"[P5RGenSocialLinks] Msg watch FAILED to install: {ex.Message}");
+                _modLog!.Always($"[P5RGenSocialLinks] Msg watch FAILED to install: {ex.Message}");
                 _msgWatch = null;
             }
         }
         catch (InvalidOperationException ex)
         {
-            _logger!.WriteLine($"[P5RGenSocialLinks] MsgByteFetch scan FAILED: {ex.Message}");
+            _modLog!.Always($"[P5RGenSocialLinks] MsgByteFetch scan FAILED: {ex.Message}");
         }
     }
 
@@ -1230,7 +1231,7 @@ public class Mod : IModV1
     private void LogWatchpointTargets(nuint poolBase, (int Off, int Len)[] slots, int maxSlots)
     {
         int n = Math.Min(maxSlots, slots.Length);
-        _modLog!.Info($"[WATCH] anchor 0x{poolBase:X} — first {n} of {slots.Length} slots:");
+        _modLog!.Info($"[SLOTS] anchor 0x{poolBase:X} — first {n} of {slots.Length} slots:");
         for (int i = 0; i < n; i++)
         {
             (int off, int len) = slots[i];
@@ -1240,7 +1241,7 @@ public class Mod : IModV1
             // before any write, so it is the scripted line, and it must match what is on
             // screen for the address to be worth watching.
             string text = AsciiPreview(addr, Math.Min(len, 64));
-            _modLog!.Info($"[WATCH]   0x{addr:X} len={len} \"{text}\"");
+            _modLog!.Info($"[SLOTS]   0x{addr:X} len={len} \"{text}\"");
         }
     }
 
