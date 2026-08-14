@@ -37,6 +37,16 @@
   // dialogue. Keep at 1 unless diagnosing why the scene is not being found.
   "max_write_regions": 1,
 
+  // How many records ahead of the player to keep generated.
+  //
+  // Generation takes ~2s and a held fast-forward button takes none, so the only way to
+  // win that race is to start early. At 3, a line is written two or three bubbles before
+  // the player reaches it. Raising it spends inference on records a branching scene may
+  // never reach; the server handles one request at a time.
+  //
+  // 0 restores the old reactive behaviour (generate when the line is dispatched).
+  "pregen_lookahead": 3,
+
   // Inject an assembly hook into the BMD message interpreter (P5R.exe+17A3D27) to
   // capture the record P5R is currently rendering, instead of inferring it by scanning
   // the heap and scoring regions for English.

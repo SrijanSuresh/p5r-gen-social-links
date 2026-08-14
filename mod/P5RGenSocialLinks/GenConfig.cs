@@ -52,6 +52,21 @@ internal sealed class GenConfig
     public int MaxWriteRegions { get; init; } = 1;
 
     /// <summary>
+    /// How many records ahead of the player to keep generated.
+    ///
+    /// This is what makes pacing irrelevant: at a lookahead of 3, a line is written two
+    /// or three bubbles before the player reaches it, so holding fast-forward no longer
+    /// beats a 2-second round trip. It cannot be raised without cost — the server runs
+    /// one request at a time, so a deep queue spends inference on records the player may
+    /// never see if the scene branches.
+    ///
+    /// 0 disables pre-generation and restores the reactive path, which is the fallback
+    /// if pre-generated lines ever read as disconnected from the scene.
+    /// </summary>
+    [JsonPropertyName("pregen_lookahead")]
+    public int PregenLookahead { get; init; } = 3;
+
+    /// <summary>
     /// When true, inject an assembly hook into the BMD message interpreter's byte-fetch
     /// loop to capture the record the game is currently rendering.
     ///
