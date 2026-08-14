@@ -4938,3 +4938,93 @@ the system will simply tell you. Runtime has information static inspection does 
 and a watchpoint, a `LD_PRELOAD` shim, an `strace`, or an access log are all the same
 move: stop modelling the consumer and go observe it. Heuristics are what you build
 when observation is impossible — not before you have tried.
+
+---
+
+## Chapter 66: The Buffer Was a Format, Not a Pile
+
+### What a hex dump showed that a scanner could not
+
+Every conclusion so far about the dialogue pool came from an ASCII scanner: walk the
+bytes, collect printable runs of 8+ characters, score them for English. That tool
+answers exactly one question — *where is text?* — and it silently discards everything
+that is not text. Which turned out to be the part that mattered.
+
+Opening the same region in a hex viewer:
+
+```
+424F054547  54 68 65 20 65 71 ... 62 75 74 0A 74 68 65 79   "The equipment's kinda crappy,but they got"
+424F054577  ... 74 79 2E 0A F2 23 00 00 00 F1 21 F2 05 FF   "ty.  #.. ! ..."
+424F0545D7  ... 4D 53 47 5F 30 30 31 5F 35 5F 30 00         "...MSG_001_5_0."
+424F054637  ... 49 74 27 73 20 70 61 79 ...                 "It's pay per visit, so you don'"
+424F054757  ... 4D 53 47 5F 30 30 32 5F 30 5F 30 00         "...MSG_002_0_0."
+424F0547E7  ... 53 45 4C 20 30 30 33 ...                    ".SEL 003"
+```
+
+This is not a heap of loose strings. It is Atlus's BMD message archive, decompressed,
+**with its symbol table intact**.
+
+### Three corrections, in increasing order of consequence
+
+**The separator is `0x0A`, not `0x00`.** Consecutive "slots" sat one byte apart, and I
+read that byte as a null terminator without checking it. It is a newline:
+
+```
+62 75 74 0A 74 68 65 79
+b  u  t  \n t  h  e  y
+```
+
+So `"The equipment's kinda crappy, but"` and `"they got tons of variety."` were never
+two strings. They are **one string with a line break** — the two rows of a single
+speech bubble. The scanner split on non-printable bytes and manufactured a boundary
+that does not exist in the data.
+
+That single byte explains a bug we had filed as unsolved: *both rows of the bubble
+show the same generated line.* Of course they do. We treat the halves as independent
+slots and write the same text into each. The fix is not per-slot targeting — it is to
+stop splitting, and write one string containing its own `\n`.
+
+**Each line is stored more than once.** The same three lines appear in two blocks, with
+different wording:
+
+```
+0x424F0544D0   "It's pay per visit though, so you don't ..."
+0x424F054637   "It's pay per visit, so you don't ..."        ← on screen
+```
+
+The heuristic scanner reported both as excellent dialogue, because both *are* excellent
+dialogue. Nothing in a similarity score can distinguish the take the game rendered from
+the take it did not. This is why the first watchpoint recorded zero accesses: it was
+armed on prose the renderer never reads.
+
+**The archive knows its own names.** `MSG_001_5_0`, `MSG_002_0_0`, `SEL 003` are
+labels, not text. The mod already logs `msgId=0x2C7 (711)` from the BF hook, and it has
+been carrying that number around with no way to spend it. A label table is exactly the
+thing an ID indexes into.
+
+### The shape of the mistake
+
+The scanner was written to answer *"is this English?"* and it answered well. The bug
+was mistaking an answer for **the** answer. `0x0A` is not English, so it was invisible;
+`F1 21 F2 05` is not English, so it was invisible; `MSG_002_0_0` failed the vowel test,
+so it was invisible. Every structural fact about the format lived precisely in the
+bytes the filter was designed to drop.
+
+The general form: a filter tuned to find signal will, by construction, hide the frame
+the signal sits in. When a heuristic keeps *almost* working — right region, wrong copy;
+right text, wrong boundaries — that is the signature of a format being read as a pile.
+Stop refining the score and go look at the raw bytes.
+
+### Where this leads
+
+Ranking regions by how much they look like dialogue was always a stand-in for parsing.
+With labels and control codes visible, the real path opens:
+
+```
+msgId (already have)  →  label table  →  message block  →  text + its \n
+```
+
+That is deterministic. No scores, no anchor, no twin, no 36-slot blast radius — and
+the blast radius is where the crash lived. The watchpoint hunt is still worth
+finishing, because the renderer's own read is the fastest confirmation that a block is
+live. But the destination changed: from *guess better* to *read the format*.
