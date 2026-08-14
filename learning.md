@@ -5315,3 +5315,86 @@ write: generation still happens once at scene start and fills every record with 
 sentence. Per-line generation is the next thing the hook makes possible, and it is a
 scheduling problem rather than a discovery one — which is a considerably better kind of
 problem to have.
+
+---
+
+## Chapter 70: Blast Radius Is a Scheduling Problem
+
+### The symptom, in the player's words
+
+The text log showed one generated sentence three times, at three different widths:
+
+```
+Ryuji   Your gym game's comin' along,
+        ain't ya?
+
+Ryuji   Your gym game's comin' along, ain't ya?
+
+Ryuji   Your gym game's comin' along,
+```
+
+The wrapping is correct — that is the previous chapter's fix working, one sentence
+flowing across two rows instead of the same sentence twice. What is wrong is that three
+*different messages* now hold the same text. The log says why:
+
+```
+[POOL] wrote 93 records across 2 regions <- "Your gym game's comin' along, ain't ya?"
+```
+
+Ninety-three records, one sentence. Every past and future line of the scene, overwritten
+with whatever was generated most recently.
+
+### Why it was ever written that way
+
+Not laziness — ignorance, of a specific and now-fixed kind. The mod could not tell which
+record the game would render, so it wrote all of them and let the renderer pick. That is
+a rational strategy when you cannot observe the consumer. It stops being rational the
+moment you can.
+
+But knowing *which* record is only half of it. The other half is *when*, and that
+question had never been asked. Timestamps answer it:
+
+```
+15:23:09.300  [MSG]   msgId=0x348                              dispatch
+15:23:10.883  [LLM]   "You still comin' here with me, then?"   +1.583s
+15:23:10.885  [POOL]  write                                    +0.002s
+15:23:12.299  [WATCH] record=0x421532EB82 rendered             +1.414s
+```
+
+Inference takes 1.6 seconds and the write lands 1.4 seconds before the renderer reads
+the bytes. There was never a race. The whole 93-record blast radius existed to cover a
+timing risk that measurement shows does not exist.
+
+That is the general shape worth keeping: **an over-broad write is often a scheduling
+question in disguise.** Before widening a fan-out to be safe, timestamp the actual
+sequence. "We write everything because we do not know which one" and "we write everything
+because we might be too late" are different problems, and only one of them was real here.
+
+### Which record is next
+
+Two facts from the log make the target unambiguous. Reads run monotonically upward
+through the region — `0x421532EB82` then `0x421532EC18` — so the record after the one
+just rendered is the next in address order. And the hook reports the record *base*, which
+sits a header ahead of the text, so matching is not containment but "the first record
+whose text begins at or just after this address".
+
+One subtlety costs a line if missed: the cursor advances **on render, not on write**. A
+write that never reaches the screen — the player skipped, the scene branched — must not
+consume a record, or the mod runs one line ahead of the game for the rest of the scene.
+And the cursor never moves backwards, because scrolling the backlog re-reads earlier
+records and that is not progress.
+
+### What one record buys
+
+Three problems close together, and they were never really three:
+
+- The text log stops repeating, because only the upcoming line is touched.
+- The blast radius becomes one record. The crash from Ch. 63 came from writing 211 slots
+  into a region containing a data table; a single-record write cannot reach one.
+- The write becomes cheap enough to do per line rather than once per scene, which is what
+  makes per-line *generation* the next step rather than a rewrite.
+
+The unifying point: precision about the target was worth more than any amount of care
+about the write itself. We had spent chapters making the write safer — bounds checks,
+word-boundary trimming, kill switches — while it was still aimed at ninety-three places
+at once.

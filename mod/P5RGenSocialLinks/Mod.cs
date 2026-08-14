@@ -117,6 +117,18 @@ public class Mod : IModV1
     private readonly System.Collections.Generic.List<(nuint Base, int Len, (int Off, int Len)[] Slots)>
         _heapPools = new();
 
+    // Slots grouped into records, one list per armed pool, and the index of the record
+    // each pool is expected to render next.
+    //
+    // Writing every record with one generated line is what makes the text log repeat the
+    // same sentence at three different widths: those are three records, all overwritten.
+    // Measured timing says we do not have to. The MSG dispatch fires ~3s before the
+    // renderer reads the record and the write completes ~1.4s before it, so there is room
+    // to write exactly the record that is about to be drawn.
+    private readonly System.Collections.Generic.List<System.Collections.Generic.List<(int Start, int Count)>>
+        _poolRecords = new();
+    private readonly System.Collections.Generic.List<int> _poolNextRecord = new();
+
     // UTF-16 hunt state. _utf16CpyLogged caps the memcpy log; the sweep cursor lets a
     // multi-GB heap scan resume across ticks instead of stalling one.
     private int   _utf16CpyLogged;
@@ -1620,6 +1632,8 @@ public class Mod : IModV1
         // pull in an unrelated structure, because a data table never shares a sample with
         // the scene's dialogue.
         _heapPools.Clear();
+        _poolRecords.Clear();
+        _poolNextRecord.Clear();
         string anchorSample = ranked[0].Sample;
 
         var selected = new System.Collections.Generic.List<int> { 0 };
@@ -1670,6 +1684,9 @@ public class Mod : IModV1
             var slots = CapturePoolSlotsSafe(c.Base, c.Len);
             if (slots.Length == 0) continue;
             _heapPools.Add((c.Base, c.Len, slots));
+            _poolRecords.Add(GroupSlotsIntoRecords(slots));
+            // -1 means nothing observed yet, so the next write targets record 0.
+            _poolNextRecord.Add(0);
             string why = i == 0 ? "anchor" : (c.Sample == anchorSample ? "twin" : "rank");
             _modLog!.Info(
                 $"[POOL] ARM #{i} ({why}) 0x{c.Base:X} len={c.Len} avg={c.Score / 100.0:F2} " +
@@ -1807,8 +1824,25 @@ public class Mod : IModV1
 
             // Write per record, not per slot. The unit the player sees is the bubble, and
             // a bubble spans every fragment up to the next header gap.
-            foreach ((int start, int count) in GroupSlotsIntoRecords(slots))
+            //
+            // And write one record, not all of them. The interpreter hook reports which
+            // record was last rendered, so the one about to be rendered is the next in
+            // address order — reads run monotonically through the region. Overwriting the
+            // rest is what fills the text log with the same sentence repeated at every
+            // width, and it is also the entire blast radius: a mis-ranked region can only
+            // damage what we write to.
+            var records = _poolRecords[r];
+            int target  = _poolNextRecord[r];
+            if (target < 0 || target >= records.Count)
             {
+                _modLog!.Info($"[POOL] region {r}: no record left to write (index {target} " +
+                              $"of {records.Count}) — scene may have run past the pool.");
+                continue;
+            }
+
+            {
+                (int start, int count) = records[target];
+
                 var widths = new int[count];
                 for (int k = 0; k < count; k++) widths[k] = slots[start + k].Len;
 
@@ -1830,6 +1864,9 @@ public class Mod : IModV1
                     // [off, off+len) and is never touched.
                     for (int i = wl; i < len; i++) p[off + i] = (byte)' ';
                 }
+
+                _modLog!.Info($"[POOL] region {r} record {target}/{records.Count} " +
+                              $"@0x{poolBase + (nuint)slots[start].Off:X} rows={count}");
                 wrote++;
             }
 
@@ -2544,17 +2581,54 @@ public class Mod : IModV1
             // Whether the record falls inside a region the pool heuristic armed is the
             // whole question this hook exists to answer. "in-pool" means the two agree; a
             // scene line reported as "elsewhere" means the ranking missed the live buffer.
-            string where = InArmedPool(record) ? "in-pool  " : "elsewhere";
+            string where = AdvancePoolCursor(record) ? "in-pool  " : "elsewhere";
 
             _modLog!.Info($"[WATCH] {where} record=0x{record:X} cursor=0x{cursor:X} \"{text}\"");
         }
     }
 
-    private bool InArmedPool(nuint addr)
+    /// <summary>
+    /// Point a pool at the record after the one just rendered. Returns whether
+    /// <paramref name="addr"/> landed in an armed pool at all.
+    ///
+    /// The hook reports the record's base, which sits a header ahead of the text — the
+    /// one measured live had its first character at +0x28. So the match is not
+    /// containment but "the first record whose text begins at or shortly after this
+    /// address", within a window wide enough to clear any header seen so far.
+    ///
+    /// Advancing on render rather than on write is deliberate. A write that never gets
+    /// displayed (the player skipped, the scene branched) must not consume a record, or
+    /// the mod would drift one line ahead of the game and stay there for the rest of the
+    /// scene.
+    /// </summary>
+    private bool AdvancePoolCursor(nuint addr)
     {
-        foreach ((nuint poolBase, int poolLen, _) in _heapPools)
-            if (addr >= poolBase && addr < poolBase + (nuint)poolLen) return true;
-        return false;
+        const int HeaderWindow = 0x80;
+        bool inPool = false;
+
+        for (int r = 0; r < _heapPools.Count; r++)
+        {
+            (nuint poolBase, int poolLen, (int Off, int Len)[] slots) = _heapPools[r];
+            if (addr < poolBase || addr >= poolBase + (nuint)poolLen) continue;
+            inPool = true;
+
+            int offset  = (int)(addr - poolBase);
+            var records = _poolRecords[r];
+
+            for (int i = 0; i < records.Count; i++)
+            {
+                int textOff = slots[records[i].Start].Off;
+                if (textOff < offset) continue;
+                if (textOff - offset > HeaderWindow) break;   // ordered; no closer match ahead
+
+                // Never move backwards. The backlog re-reads earlier records while the
+                // player scrolls it, and treating that as progress would rewind the write
+                // target onto lines already spoken.
+                if (i + 1 > _poolNextRecord[r]) _poolNextRecord[r] = i + 1;
+                break;
+            }
+        }
+        return inPool;
     }
 
     /// <summary>
@@ -2625,6 +2699,8 @@ public class Mod : IModV1
                     _poolWriteDone       = false;
                     _poolIsHeap          = false;
                     _heapPools.Clear();
+                    _poolRecords.Clear();
+                    _poolNextRecord.Clear();
                     // Cleared with the session: the next hang-out is a different scene,
                     // and a stale script would describe a conversation that already ended.
                     _sceneScript.Clear();
