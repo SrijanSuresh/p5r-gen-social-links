@@ -5120,3 +5120,108 @@ restart, a load, and walking back to a hang-out. When "sig OK" and "hook active"
 together and the game then misbehaves, you have two suspects and one expensive
 experiment. Split, and the first run answers "did the pattern survive this build?"
 before the second run asks anything harder.
+
+---
+
+## Chapter 68: Six Instructions in Somebody Else's Loop
+
+### The budget
+
+The hook goes here:
+
+```
+P5R.exe+17A3D1F   movsxd rdx, dword ptr [rbx+30]
+P5R.exe+17A3D23   mov    rax, [rbx+20]
+P5R.exe+17A3D27   movzx  edi, byte ptr [rdx+rax]   <- our stub runs just before this
+P5R.exe+17A3D2B   test   edi, edi
+P5R.exe+17A3D2D   jne    P5R.exe+17A367B
+```
+
+RAX holds the record pointer and RDX the cursor, so all we need is to copy two registers
+somewhere we can read them from C#:
+
+```asm
+push rcx
+mov  rcx, <slab>
+mov  [rcx],   rax
+mov  [rcx+8], rdx
+pop  rcx
+```
+
+Five instructions. Everything interesting about this step is a constraint on what those
+five are allowed to do.
+
+### Constraint 1: registers are borrowed, not owned
+
+We need a scratch register to hold the destination address, because x86-64 has no
+`mov [imm64], r64` — only RAX gets that privilege, and RAX is exactly what we are trying
+to save. So RCX gets pushed and popped.
+
+The instinct to grab "a register that looks free" is how these hooks go wrong. There is
+no free register. The function is mid-computation; every register belongs to the caller's
+plan. Push and pop is not defensive style, it is the only correct move.
+
+### Constraint 2: flags are a register too, and the loop reads them
+
+Look at what runs immediately after our stub returns control:
+
+```
+test edi, edi
+jne  <loop top>
+```
+
+`TEST` sets the flags and `JNE` consumes them. If the stub disturbed the flags register
+between the two, we would be steering the interpreter's control flow — not corrupting
+data, but rewriting the program's branches, which fails in a way no memory dump explains.
+
+The chosen five instructions do not touch flags: `PUSH`, `POP`, and `MOV` all leave them
+alone. That is not a happy accident, it is why the stub uses `mov` and not, say, `xor
+rcx, rcx` to zero a register, or `add` to compute an offset. In injected code, the flags
+register is part of the calling convention whether the ABI says so or not.
+
+### Constraint 3: this is a per-character loop
+
+The stub runs once for every byte of every message the game displays. That immediately
+rules out the obvious design — log from inside the hook — because a managed callback,
+a string format, and a file write would run tens of thousands of times a second inside a
+render path.
+
+So the split is: the stub writes two words to a fixed address and does nothing else, and
+a 500 ms poll tick reads that address and reports changes. The stub has no idea anyone is
+watching.
+
+The honest cost of sampling is that short-lived records are missed. For verification that
+is acceptable — what needs proving is that the pointer is real, in the heap, and changes
+line to line. It would be the wrong mechanism for driving writes, which have to key off
+the record changing, not off a timer.
+
+### Constraint 4: the slab outlives everything
+
+The destination address is an immediate operand baked into machine code:
+
+```asm
+mov rcx, 0x1F4A2C60      ; not a variable — a constant inside the instruction stream
+```
+
+Two things follow. It cannot be a managed array, even pinned, because the address has to
+stay valid for as long as the code exists rather than as long as a handle does — so it is
+`Marshal.AllocHGlobal`.
+
+And it must never be freed. `Dispose` disables the hook, which restores the original
+bytes, but restoring bytes does not evict threads already executing inside the stub.
+Freeing the slab there would trade 16 bytes for a write through a dangling pointer at
+process shutdown. The leak is the correct choice, and worth a comment saying so, because
+it will otherwise look like a bug to the next reader.
+
+### Where the risk actually is
+
+Everything above is reasoned, not tested; the first honest test is the game launching.
+That is why the hook is behind `msg_hook_enabled` with a default that can be turned off
+without a rebuild, and why installation is wrapped so an assembler failure degrades to
+the heap heuristic instead of aborting mod startup.
+
+A broad `catch` around exactly one call, with a written reason, is the right shape here:
+the assembler is third-party, its failure type is not part of the interface we reference,
+and every path downstream still works without the watch. Broad catches are bad when they
+hide failures you could have handled. This one converts an unknown failure into a named,
+logged degradation.
