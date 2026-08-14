@@ -64,6 +64,10 @@ public class Mod : IModV1
     // pointer, and the interpreter serves every string in the game, so this is what
     // keeps a menu label from being mistaken for the scene's dialogue pool.
     private volatile bool                _sessionActive;
+
+    // Consecutive dialogue reads landing outside the armed pool. Two means the scene
+    // moved to a different pool; one is a menu or a name plate passing through.
+    private int                          _outsideReads;
     private (nuint Addr, string Text)    _lastWatched;
 
     [Function(CallingConventions.Microsoft)]
@@ -2689,12 +2693,6 @@ public class Mod : IModV1
             if (_sessionActive && text.Length >= 12)
             {
                 TryArmFromRecord(record);
-
-                // The twin, once its offset is known. It is a second copy of the same
-                // script at a fixed distance, and the bubble reads one of the two — which
-                // one is not predictable, so both get written.
-                if (_twinDelta != 0 && _heapPools.Count == 1)
-                    TryArmFromRecord((nuint)((long)record - _twinDelta));
             }
 
             LearnTwinDelta(record, text);
@@ -2983,8 +2981,20 @@ public class Mod : IModV1
         const int MinRegion = 0x4000;         // 16 KB
         const int MaxRegion = 0x400000 * 8;   // 32 MB; a scene pool measured 266 KB - 1.4 MB
 
-        if (_heapPools.Count >= 2) return;
-        if (InArmedPool(record)) return;
+        if (InArmedPool(record) || IsTwinOfArmed(record))
+        {
+            _outsideReads = 0;
+            return;
+        }
+
+        // A hang-out is not one pool. The first scene of a session was a conversation on
+        // the street and armed 0x41DBE73000; the gym pool appeared fourteen seconds later
+        // at 0x4250C8B13C and never got a look, because arming had already happened.
+        //
+        // Reads landing outside the armed region are how a scene change announces itself.
+        // Two in a row, because one stray read is a menu or a name plate, while a scene
+        // that has genuinely moved keeps reading from its new pool.
+        if (_heapPools.Count > 0 && ++_outsideReads < 2) return;
 
         (bool ok, nuint regionBase, nuint regionSize, uint state, uint _) =
             MemoryGuard.QueryRegion(record);
@@ -3001,16 +3011,42 @@ public class Mod : IModV1
             return;
         }
 
+        // Exactly one region is armed, and it is replaced rather than added to. Arming two
+        // and writing the same record index into both assumed they were copies. They were
+        // not — 207 records against 180, two unrelated pools, so index N named a different
+        // line in each.
+        //
+        // The second copy is still written, by MirrorToTwin, which finds it at a learned
+        // offset and verifies byte-for-byte before touching anything. That is the
+        // mechanism that actually knows two addresses hold the same line.
+        _outsideReads = 0;
+        _heapPools.Clear();
+        _poolRecords.Clear();
+        _poolNextRecord.Clear();
+
         _heapPools.Add((regionBase, (int)regionSize, slots));
         _poolRecords.Add(GroupSlotsIntoRecords(slots));
         _poolNextRecord.Add(0);
         _poolIsHeap = true;
 
-        _modLog!.Info($"[ARM] region {_heapPools.Count - 1} 0x{regionBase:X} " +
-                      $"len={regionSize} slots={slots.Length} — from a live read, no scan");
+        _modLog!.Info($"[ARM] 0x{regionBase:X} len={regionSize} slots={slots.Length} " +
+                      "— from a live read, no scan");
 
-        // Only region 0 defines the plan; the second is the same script at a fixed offset.
-        if (_heapPools.Count == 1) BuildRecordPlan();
+        BuildRecordPlan();
+    }
+
+    /// <summary>
+    /// True when the address is the armed pool's second copy, at the learned offset.
+    ///
+    /// Without this every twin read looks like a read outside the armed region and would
+    /// trigger a re-arm onto the copy — the two pools then take turns evicting each other
+    /// for the length of the scene.
+    /// </summary>
+    private bool IsTwinOfArmed(nuint addr)
+    {
+        if (_twinDelta == 0) return false;
+        return InArmedPool((nuint)((long)addr + _twinDelta))
+            || InArmedPool((nuint)((long)addr - _twinDelta));
     }
 
     /// <summary>
