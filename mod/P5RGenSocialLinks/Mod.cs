@@ -2726,6 +2726,21 @@ public class Mod : IModV1
             if (record.State != RecordState.Ready || record.Generated is null) continue;
             if (!record.IsWritable) continue;
 
+            // Behind the player is not a write, it is vandalism of the backlog. Observed
+            // as "#0 written, -32 ahead of the player": the request was issued while the
+            // cursor was at 0, the player advanced 32 records during the round trip, and
+            // the answer arrived to overwrite a line spoken half a minute earlier.
+            //
+            // The freeze in AdvancePoolCursor catches this only for records the
+            // interpreter reported; a scene skipped fast enough leaves gaps it never saw.
+            if (record.Index < CurrentRecord())
+            {
+                record.State = RecordState.Rendered;   // out of the way for good
+                _modLog!.Info($"[PREGEN] #{record.Index} discarded — player is at " +
+                              $"{CurrentRecord()}");
+                continue;
+            }
+
             if (WriteRecord(record.Index, record.Generated) > 0)
             {
                 record.State = RecordState.Written;
