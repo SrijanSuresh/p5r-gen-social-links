@@ -5225,3 +5225,93 @@ the assembler is third-party, its failure type is not part of the interface we r
 and every path downstream still works without the watch. Broad catches are bad when they
 hide failures you could have handled. This one converts an unknown failure into a named,
 logged degradation.
+
+---
+
+## Chapter 69: The Hook Answers, and the Answers Rewrite the Model
+
+### What one log run replaced
+
+Eleven lines of a gym scene, each one caught at the moment the game read it:
+
+```
+[WATCH] in-pool   record=0x424CAC6BDC "Here we are... Protein Lovers gym!"
+[WATCH] in-pool   record=0x424CAC6E90 "It's pay per visit, so you don't gotta worry"
+[WATCH] in-pool   record=0x424CAC6F14 "The equipment's kinda crappy, but"
+...
+[WATCH] in-pool   record=0x424CAC74B8 "Anyways, let's head in."
+```
+
+Every one inside the region the heuristic armed, in the order they appeared on screen.
+Compare that to what the mod had before: a 1.4 GB heap scan producing a ranked list, an
+anchor whose address had been different in each of the last four runs of the same scene,
+and no way to tell a correct ranking from a lucky one.
+
+The point is not that the hook is faster. It is that the previous system could not be
+*checked*. `in-pool` versus `elsewhere` is the first line of output in this project's
+history that can falsify a claim about the dialogue buffer.
+
+### The twin was never a variant
+
+Each in-pool record arrived paired with one outside the pool, read within a millisecond:
+
+```
+0x424CAC6BDC - 0x42104BB2EC = 0x3C60B8F0    "Here we are..."
+0x424CAC6E90 - 0x42104BB5A0 = 0x3C60B8F0    "It's pay per visit..."
+0x424CAC7008 - 0x42104BB718 = 0x3C60B8F0    "Oh yeah! You bring..."
+0x424CAC70E8 - 0x42104BB7F8 = 0x3C60B8F0    "Nah, they'll lend..."
+0x424CAC74B8 - 0x42104BBBC8 = 0x3C60B8F0    "Anyways, let's head in."
+```
+
+A constant delta across every pair. The two regions are not two takes of the script and
+not two stages of a pipeline — they are parallel allocations with identical internal
+layout, where message *k* sits at the same offset in both.
+
+That retroactively explains an earlier fix. Arming the twin by matching sample text
+worked, and matching by rank never did, and the reason was structural: the copies are
+byte-identical, so content finds them and a similarity score has no reason to place them
+near each other. The fix was right for a reason we had not yet earned.
+
+### One byte, three bugs
+
+The oldest cosmetic complaint — both rows of the bubble showing the same sentence — came
+from a single misread byte:
+
+```
+0x4250B2FBC7 len=33  "The equipment's kinda crappy, but"
+0x4250B2FBE9 len=25  "they got tons of variety."
+```
+
+`0xFBC7 + 33 = 0xFBE8`, next run at `0xFBE9`. One byte between them, and it is `0x0A`.
+These were never two strings. They are one message with a line break, and the scanner
+manufactured the boundary by splitting on any non-printable byte.
+
+So the write was wrong at the level of *units*. It wrote the full generated line into
+fragment one, then the full generated line into fragment two, because it believed they
+were independent slots. They are rows of one bubble. Rows are not independent, so they
+cannot be written independently.
+
+Grouping is trivial once seen: consecutive runs one byte apart are one record; a genuine
+record boundary shows a gap of tens of bytes, because a header sits there. Then the
+generated line is word-wrapped *across* the fragment widths, and any fragment the text
+does not reach is blanked — a row of scripted dialogue under a row of generated dialogue
+is worse than a short line.
+
+### Checking a boundary without spending a restart
+
+There is no C# test project here, and every in-game verification costs a relaunch, a
+load, and a walk back to a hang-out. So the wrapping logic was mirrored in twenty lines
+of Python and run against the cases that actually break wrappers: exact fit, empty
+input, a word wider than its fragment, text far longer than all fragments combined.
+
+That is not a substitute for a test, and it does not live in CI. It is a way to spend
+thirty seconds instead of five minutes on the class of bug — off-by-one at a boundary —
+that is both the most likely and the least visible in a screenshot.
+
+### What is left
+
+The hook now reports the address of each line as it displays. It does not yet drive the
+write: generation still happens once at scene start and fills every record with the same
+sentence. Per-line generation is the next thing the hook makes possible, and it is a
+scheduling problem rather than a discovery one — which is a considerably better kind of
+problem to have.

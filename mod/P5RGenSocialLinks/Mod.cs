@@ -1706,20 +1706,80 @@ public class Mod : IModV1
     /// word-boundary cut would throw away most of the slot, and a hard cut carries
     /// more of the sentence.
     /// </remarks>
-    private static int FitToSlot(byte[] enc, int slotLen)
+    /// <summary>
+    /// Group slots that are one byte apart into a single record.
+    ///
+    /// The ASCII scanner reports printable runs, and it splits on any non-printable byte
+    /// — including 0x0A. A two-line speech bubble therefore arrives as two "slots" that
+    /// were never two strings: they are one message with a line break in the middle,
+    /// stored contiguously. Measured live:
+    ///
+    ///   0x4250B2FBC7 len=33  "The equipment's kinda crappy, but"
+    ///   0x4250B2FBE9 len=25  "they got tons of variety."
+    ///
+    /// 0xFBC7 + 33 = 0xFBE8, and the next run starts at 0xFBE9. Exactly one byte between
+    /// them, and that byte is the newline. Where a genuinely new record starts the gap is
+    /// tens of bytes of header instead.
+    ///
+    /// This is the fix for the oldest cosmetic bug in the mod: writing each fragment
+    /// independently put the whole generated line in row one and the same line again in
+    /// row two. Rows are not independent, so they cannot be written independently.
+    /// </summary>
+    private static System.Collections.Generic.List<(int Start, int Count)>
+        GroupSlotsIntoRecords((int Off, int Len)[] slots)
     {
-        int wl = Math.Min(enc.Length, slotLen);
-        if (wl <= 0) return 0;
-        if (wl == enc.Length) return wl;   // fits whole; nothing to trim
-
-        int lastSpace = -1;
-        for (int i = wl - 1; i > 0; i--)
+        var records = new System.Collections.Generic.List<(int, int)>();
+        int i = 0;
+        while (i < slots.Length)
         {
-            if (enc[i] == (byte)' ') { lastSpace = i; break; }
+            int start = i++;
+            while (i < slots.Length &&
+                   slots[i].Off == slots[i - 1].Off + slots[i - 1].Len + 1) i++;
+            records.Add((start, i - start));
         }
+        return records;
+    }
 
-        if (lastSpace > 0 && lastSpace * 100 >= wl * 60) return lastSpace;
-        return wl;
+    /// <summary>
+    /// Distribute <paramref name="text"/> across fragments of the given widths, breaking
+    /// on word boundaries.
+    ///
+    /// Each fragment is a fixed-length slot the renderer reads in place, so this is not
+    /// free-form wrapping: fragment k may hold at most widths[k] bytes, and any fragment
+    /// the text does not reach must come back empty so the caller can blank it. A bubble
+    /// whose second row still held the original dialogue would be worse than one that is
+    /// simply short.
+    /// </summary>
+    private static string[] WrapAcrossFragments(string text, int[] widths)
+    {
+        var lines = new string[widths.Length];
+        string[] words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        int w = 0;
+
+        for (int f = 0; f < widths.Length; f++)
+        {
+            var line = new System.Text.StringBuilder();
+            while (w < words.Length)
+            {
+                int need = line.Length == 0 ? words[w].Length : line.Length + 1 + words[w].Length;
+                if (need > widths[f]) break;
+                if (line.Length > 0) line.Append(' ');
+                line.Append(words[w]);
+                w++;
+            }
+
+            // A single word wider than the fragment would never fit, so the loop above
+            // would leave this fragment empty and every later one empty too — the whole
+            // line lost to one long word. Hard-cut it instead.
+            if (line.Length == 0 && w < words.Length)
+            {
+                line.Append(words[w][..Math.Min(words[w].Length, widths[f])]);
+                w++;
+            }
+
+            lines[f] = line.ToString();
+        }
+        return lines;
     }
 
     private unsafe int WriteAllHeapPools(string text)
@@ -1737,11 +1797,6 @@ public class Mod : IModV1
         {
             var (poolBase, poolLen, slots) = _heapPools[r];
 
-            // The "[Rn] " region tag has served its purpose: R0 was confirmed as the
-            // region that reaches the screen. Keeping it now costs ~5 of a ~44-char
-            // slot — over a tenth of the visible line — to display a debug marker.
-            byte[] enc = System.Text.Encoding.ASCII.GetBytes(text);
-
             // Validate the whole range, not just the first bytes. The region was captured
             // on an earlier tick and the game may have freed it since; writing through a
             // stale base would fault fatally the same way the scan did.
@@ -1749,19 +1804,39 @@ public class Mod : IModV1
 
             byte* p = (byte*)poolBase;
             int wrote = 0;
-            foreach ((int off, int len) in slots)
+
+            // Write per record, not per slot. The unit the player sees is the bubble, and
+            // a bubble spans every fragment up to the next header gap.
+            foreach ((int start, int count) in GroupSlotsIntoRecords(slots))
             {
-                int wl = FitToSlot(enc, len);
-                if (wl <= 0) continue;
-                fixed (byte* src = enc)
-                    System.Buffer.MemoryCopy(src, p + off, len, wl);
-                for (int i = wl; i < len; i++) p[off + i] = (byte)' ';
+                var widths = new int[count];
+                for (int k = 0; k < count; k++) widths[k] = slots[start + k].Len;
+
+                string[] lines = WrapAcrossFragments(text, widths);
+
+                for (int k = 0; k < count; k++)
+                {
+                    (int off, int len) = slots[start + k];
+                    byte[] enc = System.Text.Encoding.ASCII.GetBytes(lines[k]);
+                    int    wl  = Math.Min(enc.Length, len);
+
+                    if (wl > 0)
+                        fixed (byte* src = enc)
+                            System.Buffer.MemoryCopy(src, p + off, len, wl);
+
+                    // Blank the tail. Anything left unwritten is the original dialogue,
+                    // and a row of scripted text under a row of generated text reads far
+                    // worse than a short line. The newline between fragments is outside
+                    // [off, off+len) and is never touched.
+                    for (int i = wl; i < len; i++) p[off + i] = (byte)' ';
+                }
                 wrote++;
             }
+
             if (wrote > 0) { totalSlots += wrote; regions++; }
         }
 
-        _modLog!.Info($"[POOL] wrote {totalSlots} slots across {regions} regions ← " +
+        _modLog!.Info($"[POOL] wrote {totalSlots} records across {regions} regions ← " +
                       $"\"{text[..Math.Min(text.Length, 50)]}\"");
         return totalSlots;
     }
