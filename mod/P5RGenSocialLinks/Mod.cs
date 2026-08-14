@@ -47,6 +47,19 @@ public class Mod : IModV1
     // Scratch for previewing a watched record. Separate from _scanBuf so a preview can
     // never disturb a pool scan mid-walk, even though both run on the poll thread today.
     private readonly byte[]              _recordBuf = new byte[128];
+    private readonly byte[]              _mirrorBuf = new byte[128];
+
+    // Signed distance from a record in an armed pool to the same record in the copy the
+    // speech bubble reads, discovered by watching both be read within a millisecond of
+    // each other with identical text.
+    //
+    // The game keeps every scene's dialogue in two places at a constant offset, and which
+    // one the bubble reads is not something ranking can determine — measured at
+    // 0x3C60B8F0 one run and 0x2E67F270 the next. Twin arming by content match found it
+    // sometimes and missed it in the run that produced this field: one region armed, and
+    // every write landed in the text log while the bubble kept the script.
+    private long                         _twinDelta;
+    private (nuint Addr, string Text)    _lastWatched;
 
     [Function(CallingConventions.Microsoft)]
     public delegate nint CmmExecEventDelegate();
@@ -1848,11 +1861,19 @@ public class Mod : IModV1
 
                 string[] lines = WrapAcrossFragments(text, widths);
 
+                int mirrored = 0;
                 for (int k = 0; k < count; k++)
                 {
                     (int off, int len) = slots[start + k];
                     byte[] enc = System.Text.Encoding.ASCII.GetBytes(lines[k]);
                     int    wl  = Math.Min(enc.Length, len);
+
+                    // Snapshot before overwriting. The twin is identified by still holding
+                    // these exact bytes, so this has to be captured while they exist —
+                    // the same ordering constraint as the scene-script capture in Ch. 64.
+                    byte[] original = new byte[len];
+                    bool   haveOriginal = len <= _mirrorBuf.Length &&
+                                          MemoryGuard.TryRead(poolBase + (nuint)off, original, len);
 
                     if (wl > 0)
                         fixed (byte* src = enc)
@@ -1863,7 +1884,24 @@ public class Mod : IModV1
                     // worse than a short line. The newline between fragments is outside
                     // [off, off+len) and is never touched.
                     for (int i = wl; i < len; i++) p[off + i] = (byte)' ';
+
+                    if (haveOriginal && MirrorToTwin(poolBase + (nuint)off, original, len, p + off))
+                        mirrored++;
                 }
+
+                if (mirrored > 0)
+                    _modLog!.Info($"[TWIN] mirrored {mirrored}/{count} rows at delta " +
+                                  $"0x{Math.Abs(_twinDelta):X}");
+
+                // Consume the record. Advancing only on render was a mistake with a very
+                // visible symptom: between two renders, three consecutive generations all
+                // landed on the same record, and because that record was the one on screen
+                // the player watched the sentence change under them twice.
+                //
+                // A record is spent once written, whether or not it is ever displayed.
+                // Render observation still moves the cursor forward when the game gets
+                // ahead of us; it is a floor, not the only source of progress.
+                _poolNextRecord[r] = target + 1;
 
                 _modLog!.Info($"[POOL] region {r} record {target}/{records.Count} " +
                               $"@0x{poolBase + (nuint)slots[start].Off:X} rows={count}");
@@ -2567,6 +2605,13 @@ public class Mod : IModV1
     {
         if (_msgWatch is null) return;
 
+        // Opening the backlog re-reads every past line at once, which is a legitimate
+        // burst rather than a bug — but logging all of it drowns the console and puts
+        // dozens of writes on a tick the game is waiting behind. Every entry is still
+        // processed for the cursor and the twin delta; only the log is capped.
+        const int MaxLogged = 6;
+        int logged = 0, suppressed = 0;
+
         foreach ((nuint record, int cursor) in _msgWatch.DrainSeen())
         {
             if (record == _lastWatchedRecord) continue;
@@ -2583,8 +2628,74 @@ public class Mod : IModV1
             // scene line reported as "elsewhere" means the ranking missed the live buffer.
             string where = AdvancePoolCursor(record) ? "in-pool  " : "elsewhere";
 
-            _modLog!.Info($"[WATCH] {where} record=0x{record:X} cursor=0x{cursor:X} \"{text}\"");
+            LearnTwinDelta(record, text);
+
+            if (logged++ < MaxLogged)
+                _modLog!.Info($"[WATCH] {where} record=0x{record:X} cursor=0x{cursor:X} \"{text}\"");
+            else
+                suppressed++;
         }
+
+        if (suppressed > 0)
+            _modLog!.Info($"[WATCH] +{suppressed} more records this tick (backlog scroll)");
+    }
+
+    /// <summary>
+    /// Learn where the second copy of a record lives, from two reads of the same text.
+    ///
+    /// The interpreter reads both copies of a line within about a millisecond, and the
+    /// sampler catches the pair as two consecutive distinct records with identical
+    /// preview text. Their difference is the delta, and it has held constant across every
+    /// pair within a run.
+    ///
+    /// This replaces content-matched twin arming, which searched a ranked list for a
+    /// region with the same sample and missed entirely in one run — leaving a single
+    /// region armed, every write landing in the text log, and the bubble showing the
+    /// original script. Ranking cannot see a relationship the game never expresses as
+    /// similarity of score; the hook observes it directly.
+    /// </summary>
+    private void LearnTwinDelta(nuint record, string text)
+    {
+        // Short or empty previews are not evidence: control-code runs and blank records
+        // collide constantly, and a delta learned from one would aim writes at nothing.
+        if (text.Length >= 12 && text == _lastWatched.Text && record != _lastWatched.Addr)
+        {
+            long delta = (long)record - (long)_lastWatched.Addr;
+            if (delta != _twinDelta)
+            {
+                _twinDelta = delta;
+                _modLog!.Info($"[TWIN] delta={(delta < 0 ? "-" : "")}0x{Math.Abs(delta):X} " +
+                              $"from 0x{_lastWatched.Addr:X} / 0x{record:X} \"{text}\"");
+            }
+        }
+        _lastWatched = (record, text);
+    }
+
+    /// <summary>
+    /// Copy a just-written span into the twin, but only where the twin still holds what
+    /// the target held before the write.
+    ///
+    /// The delta comes from observation and observation can be wrong, so this never
+    /// writes on the strength of arithmetic alone. The caller passes the original bytes;
+    /// if the mirror does not match them byte for byte, the address is not the same line
+    /// and nothing is written. That check is what keeps a bad delta from turning into the
+    /// 211-slot data-table write of Ch. 63 by another route.
+    /// </summary>
+    private unsafe bool MirrorToTwin(nuint addr, byte[] original, int len, byte* written)
+    {
+        if (_twinDelta == 0 || len <= 0 || len > _mirrorBuf.Length) return false;
+
+        nuint mirror = (nuint)((long)addr - _twinDelta);
+        if (!MemoryGuard.TryRead(mirror, _mirrorBuf, len)) return false;
+
+        for (int i = 0; i < len; i++)
+            if (_mirrorBuf[i] != original[i]) return false;
+
+        if (!MemoryGuard.IsWritable(mirror, len)) return false;
+
+        byte* dst = (byte*)mirror;
+        for (int i = 0; i < len; i++) dst[i] = written[i];
+        return true;
     }
 
     /// <summary>
