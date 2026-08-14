@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
+using System.Threading;
 using Reloaded.Hooks.Definitions;
 using Reloaded.Hooks.Definitions.Enums;
 
@@ -77,8 +79,69 @@ internal sealed class MsgInterpreterWatch : IDisposable
     /// <summary>Byte offset the interpreter last read at, within <see cref="RecordPtr"/>.</summary>
     internal int Cursor => (int)Marshal.ReadInt64(_slab, CursorOffset);
 
+    // --- sampling ------------------------------------------------------------------
+    //
+    // The slab holds one value: whatever the interpreter read most recently. Reading it
+    // on the 500 ms poll tick therefore does not observe messages, it observes a clock —
+    // a line that comes and goes between two ticks leaves no trace, and the log ends up
+    // showing whichever records happened to survive until a tick landed.
+    //
+    // A dedicated thread reading at 5 ms turns a snapshot back into a sequence. It stays
+    // separate from the poll loop because the poll loop does real work per tick (chain
+    // resolution, heap scans) and cannot be sped up to match.
+
+    private readonly ConcurrentQueue<(nuint Record, int Cursor)> _seen = new();
+    private CancellationTokenSource? _samplerCts;
+    private Thread?                  _sampler;
+
+    /// Beyond this the queue is dropped rather than grown: nobody draining it means the
+    /// consumer is gone, and an unbounded queue behind a 5 ms producer is a leak.
+    private const int MaxQueued = 512;
+
+    internal void StartSampling(int intervalMs = 5)
+    {
+        if (_sampler is not null) return;
+
+        _samplerCts = new CancellationTokenSource();
+        CancellationToken token = _samplerCts.Token;
+
+        _sampler = new Thread(() =>
+        {
+            nuint last = 0;
+            while (!token.IsCancellationRequested)
+            {
+                nuint record = RecordPtr;
+                if (record != 0 && record != last)
+                {
+                    last = record;
+                    if (_seen.Count < MaxQueued) _seen.Enqueue((record, Cursor));
+                }
+                Thread.Sleep(intervalMs);
+            }
+        })
+        {
+            IsBackground = true,          // must never hold up process exit
+            Name         = "P5RGen.MsgSampler",
+            Priority     = ThreadPriority.BelowNormal,  // never compete with the renderer
+        };
+        _sampler.Start();
+    }
+
+    /// <summary>
+    /// Hand over every distinct record seen since the last call, oldest first.
+    /// </summary>
+    internal (nuint Record, int Cursor)[] DrainSeen()
+    {
+        var drained = new System.Collections.Generic.List<(nuint, int)>();
+        while (_seen.TryDequeue(out (nuint Record, int Cursor) item)) drained.Add(item);
+        return drained.ToArray();
+    }
+
     public void Dispose()
     {
+        _samplerCts?.Cancel();
+        _sampler?.Join(TimeSpan.FromMilliseconds(200));
+        _samplerCts?.Dispose();
         _hook.Disable();
 
         // The slab is deliberately never freed. Its address is an immediate operand inside
