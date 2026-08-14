@@ -89,3 +89,51 @@ def test_backend_failure_propagates_as_llama_server_error() -> None:
     pipeline, _ = _pipeline(handler)
     with pytest.raises(LlamaServerUnavailableError):
         pipeline.generate(RYUJI_ID, 4, "gym")
+
+
+# --- per-record length budget -------------------------------------------------
+
+
+class _CapturingBackend:
+    """Records the messages it was handed, and returns a fixed over-long line."""
+
+    def __init__(self, reply: str = "A" * 200) -> None:
+        self.messages: list[dict[str, str]] = []
+        self._reply = reply
+
+    def create_chat_completion(self, messages, **kwargs):  # type: ignore[no-untyped-def]
+        self.messages = messages
+        return {"choices": [{"message": {"content": self._reply}}]}
+
+
+def test_generate_clips_to_the_record_budget() -> None:
+    from inference.config import ModelConfig
+    from inference.pipeline import InferencePipeline
+
+    backend = _CapturingBackend()
+    pipeline = InferencePipeline(backend, ModelConfig())
+    assert len(pipeline.generate(8, 4, "at the gym", max_chars=30)) <= 30
+
+
+def test_generate_falls_back_to_configured_budget() -> None:
+    """None means "no record in hand", not "no limit"."""
+    from inference.config import ModelConfig
+    from inference.pipeline import InferencePipeline
+
+    cfg = ModelConfig()
+    backend = _CapturingBackend()
+    pipeline = InferencePipeline(backend, cfg)
+    assert len(pipeline.generate(8, 4, "at the gym")) <= cfg.max_response_chars
+
+
+def test_budget_reaches_the_prompt_not_only_the_clip() -> None:
+    """
+    Clipping alone would leave the model writing to a length it was never told about,
+    so every short record would end mid-word instead of ending early.
+    """
+    from inference.config import ModelConfig
+    from inference.pipeline import InferencePipeline
+
+    backend = _CapturingBackend(reply="Yo.")
+    InferencePipeline(backend, ModelConfig()).generate(8, 4, "gym", max_chars=30)
+    assert "30 characters" in backend.messages[0]["content"]

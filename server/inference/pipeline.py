@@ -36,8 +36,26 @@ class InferencePipeline:
         self._model = model
         self._cfg   = cfg
 
-    def generate(self, confidant_id: int, rank: int, context: str) -> str:
-        system_prompt, user_prompt = build_prompt(confidant_id, rank, context)
+    def generate(
+        self,
+        confidant_id: int,
+        rank: int,
+        context: str,
+        max_chars: int | None = None,
+    ) -> str:
+        """
+        Produce one line, clipped to what the destination can actually display.
+
+        ``max_chars`` is the capacity of the specific message record the mod is about to
+        overwrite, and it varies per line: a one-row record holds about 30 characters, a
+        two-row one about 75. A fixed budget therefore cannot be right. Generating 53
+        characters for a 30-character record produced "You're finally here, I've been"
+        on screen, which reads as a bug rather than as a short line.
+
+        None keeps the configured default, for callers that have no record in hand.
+        """
+        budget = self._cfg.max_response_chars if max_chars is None else max_chars
+        system_prompt, user_prompt = build_prompt(confidant_id, rank, context, budget)
 
         response = self._model.create_chat_completion(
             messages=[
@@ -51,4 +69,4 @@ class InferencePipeline:
         )
 
         raw = response["choices"][0]["message"]["content"].strip()
-        return clean_response(raw, self._cfg.max_response_chars)
+        return clean_response(raw, budget)

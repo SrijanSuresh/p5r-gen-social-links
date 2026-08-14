@@ -76,3 +76,39 @@ def test_all_confidants_build_prompt_without_error() -> None:
         system, user = build_prompt(cid, 5, "test context")
         assert len(system) > 50
         assert len(user) > 10
+
+
+# --- per-record length budget -------------------------------------------------
+#
+# The line is written into one specific message record, and records differ: one row
+# holds roughly 30 characters, two rows roughly 75. A fixed budget overran the short
+# ones — "You're finally here, I've been" reached the screen with the rest cut off.
+
+
+def test_budget_appears_in_the_system_prompt() -> None:
+    system, _ = build_prompt(8, 4, "at the gym", max_chars=30)
+    assert "30 characters" in system
+
+
+def test_budget_is_also_given_in_words() -> None:
+    """Models count words far more reliably than characters."""
+    system, _ = build_prompt(8, 4, "at the gym", max_chars=50)
+    assert "10 words" in system
+
+
+def test_word_budget_never_drops_below_three() -> None:
+    """A tiny record must still ask for a sentence, not for one word."""
+    system, _ = build_prompt(8, 4, "at the gym", max_chars=8)
+    assert "3 words" in system
+
+
+def test_two_records_of_different_size_get_different_budgets() -> None:
+    narrow, _ = build_prompt(8, 4, "at the gym", max_chars=30)
+    wide,   _ = build_prompt(8, 4, "at the gym", max_chars=75)
+    assert narrow != wide
+
+
+def test_default_budget_is_used_when_none_given() -> None:
+    """Callers with no record in hand must still get a usable prompt."""
+    system, _ = build_prompt(8, 4, "at the gym")
+    assert "characters" in system

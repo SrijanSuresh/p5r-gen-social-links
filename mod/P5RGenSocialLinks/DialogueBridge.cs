@@ -52,7 +52,14 @@ internal sealed class DialogueBridge
     /// base is available; falls back to console logging otherwise.
     /// On timeout or error, the original scripted dialogue remains untouched.
     /// </summary>
-    internal bool DispatchAsync(SocialLinkSnapshot snap, string contextText, int lineIndex = 0)
+    /// <param name="maxChars">
+    /// Capacity of the record this line will be written into, or 0 when it is not known.
+    /// The caller picks the target record before asking for the line, so the budget is
+    /// available here and varies per line — roughly 30 characters for a one-row record
+    /// and 75 for two. A fixed budget clipped short records mid-sentence.
+    /// </param>
+    internal bool DispatchAsync(SocialLinkSnapshot snap, string contextText,
+                                int lineIndex = 0, int maxChars = 0)
     {
         DateTimeOffset now = DateTimeOffset.UtcNow;
         if (now - _lastDispatch < _minInterval)
@@ -87,6 +94,7 @@ internal sealed class DialogueBridge
                     Rank          = snap.RankLevel,
                     Context       = fullCtx,
                     CharacterName = ConfidantNames.Resolve(snap.ConfidantId),
+                    MaxChars      = maxChars > 0 ? maxChars : null,
                 };
 
                 string text = await _llm.GenerateAsync(request, cts.Token);

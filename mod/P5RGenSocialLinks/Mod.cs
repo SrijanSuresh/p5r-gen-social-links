@@ -549,7 +549,9 @@ public class Mod : IModV1
                 }
             }
 
-            bool dispatched = _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap), lineIndex: fireCount);
+            bool dispatched = _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap),
+                                                       lineIndex: fireCount,
+                                                       maxChars: NextRecordCapacity());
             if (!dispatched)
                 _modLog!.Info($"[P5RGenSocialLinks] CmmExec #{fireCount}: throttled.");
         }
@@ -2641,6 +2643,32 @@ public class Mod : IModV1
     }
 
     /// <summary>
+    /// Characters the next record to be written can hold, or 0 when there is no target.
+    ///
+    /// This is the sum of the record's fragment widths plus one per join: fragments are
+    /// the rows of one bubble and the generated line is wrapped across all of them, so
+    /// the budget is the whole bubble rather than its first row.
+    ///
+    /// Region 0 decides. The armed regions are copies of the same script and their
+    /// records have identical widths, so asking any one of them gives the same answer.
+    /// </summary>
+    private int NextRecordCapacity()
+    {
+        if (_poolRecords.Count == 0 || _heapPools.Count == 0) return 0;
+
+        var records = _poolRecords[0];
+        int target  = _poolNextRecord[0];
+        if (target < 0 || target >= records.Count) return 0;
+
+        (int start, int count) = records[target];
+        (_, _, (int Off, int Len)[] slots) = _heapPools[0];
+
+        int capacity = 0;
+        for (int k = 0; k < count; k++) capacity += slots[start + k].Len;
+        return capacity + (count - 1);   // the newline between rows carries a word break
+    }
+
+    /// <summary>
     /// Learn where the second copy of a record lives, from two reads of the same text.
     ///
     /// The interpreter reads both copies of a line within about a millisecond, and the
@@ -2840,7 +2868,9 @@ public class Mod : IModV1
 
                 // Fallback dispatch if hook isn't active.
                 if (!_hookActive)
-                    _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap), lineIndex: 0);
+                    _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap),
+                                          lineIndex: 0,
+                                          maxChars: NextRecordCapacity());
 
                 continue;
             }

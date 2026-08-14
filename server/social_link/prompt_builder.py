@@ -52,8 +52,9 @@ Relationship tier ({rank}/10): {tier_note}
 
 Rules:
 - Respond as {name} in ONE short sentence of in-character dialogue only.
-- Keep it under 12 words. The game's speech bubble overwrites a fixed-length
-  slot, so anything longer is cut off mid-thought and never reaches the player.
+- Keep it under {max_chars} characters, about {max_words} words. The speech bubble
+  is a fixed-size slot in the game's memory and anything past that is cut off
+  mid-thought, so a shorter line that finishes always beats a longer one that does not.
 - Do NOT break character, reference that you are an AI, or use meta-commentary.
 - Do NOT start your response with the character's own name.
 - Match the emotional closeness appropriate for rank {rank}/10.
@@ -65,8 +66,17 @@ def build_prompt(
     confidant_id: int,
     rank: int,
     context: str,
+    max_chars: int = 56,
 ) -> tuple[str, str]:
-    """Return (system_prompt, user_prompt) for the LLM."""
+    """
+    Return (system_prompt, user_prompt) for the LLM.
+
+    ``max_chars`` is the capacity of the exact message record this line will be written
+    into, so it changes from line to line. Stating it in the prompt is not a substitute
+    for clipping the result — the model treats a length rule as a strong suggestion — but
+    a model aiming at 30 characters overruns by a word, while one aiming at 56 overruns
+    by a clause.
+    """
     confidant: Confidant = get_confidant(confidant_id)
     system = SYSTEM_TEMPLATE.format(
         name=confidant.name,
@@ -75,6 +85,10 @@ def build_prompt(
         world_grounding=_world_grounding(confidant),
         rank=rank,
         tier_note=_tier_note(rank),
+        max_chars=max_chars,
+        # Roughly five characters per word including the space. Words are what the model
+        # can actually count; characters it can only estimate.
+        max_words=max(3, max_chars // 5),
     )
     user = f"[Scene context: {context}]\n{confidant.name}:"
     return system, user
