@@ -44,6 +44,10 @@ public class Mod : IModV1
     // interesting event is the value changing, not the value existing.
     private nuint                        _lastWatchedRecord;
 
+    // Scratch for previewing a watched record. Separate from _scanBuf so a preview can
+    // never disturb a pool scan mid-walk, even though both run on the poll thread today.
+    private readonly byte[]              _recordBuf = new byte[128];
+
     [Function(CallingConventions.Microsoft)]
     public delegate nint CmmExecEventDelegate();
 
@@ -437,7 +441,8 @@ public class Mod : IModV1
             try
             {
                 _msgWatch = new MsgInterpreterWatch(_hooks, _msgByteFetch);
-                _modLog!.Always("[P5RGenSocialLinks] Msg watch ACTIVE.");
+                _msgWatch.StartSampling();
+                _modLog!.Always("[P5RGenSocialLinks] Msg watch ACTIVE (sampling at 5ms).");
             }
             catch (Exception ex)
             {
@@ -2450,17 +2455,66 @@ public class Mod : IModV1
     {
         if (_msgWatch is null) return;
 
-        nuint record = _msgWatch.RecordPtr;
-        if (record == 0 || record == _lastWatchedRecord) return;
-        _lastWatchedRecord = record;
+        foreach ((nuint record, int cursor) in _msgWatch.DrainSeen())
+        {
+            if (record == _lastWatchedRecord) continue;
+            _lastWatchedRecord = record;
 
-        // The cursor is sampled separately from the pointer and the two are not written
-        // atomically as a pair, so it is a hint about where the interpreter had reached,
-        // not a value to compute with.
-        int    cursor = _msgWatch.Cursor;
-        string text   = AsciiPreview(record + (nuint)cursor, 64);
+            // Preview from the record base, not from record+cursor. The two are captured
+            // at slightly different points and are not a coherent pair: the cursor has
+            // usually run on to wherever that message ended, which is trailing control
+            // bytes rather than text. The base is the stable half.
+            string text = ReadRecordPreview(record);
 
-        _modLog!.Info($"[WATCH] record=0x{record:X} cursor=0x{cursor:X} \"{text}\"");
+            // Whether the record falls inside a region the pool heuristic armed is the
+            // whole question this hook exists to answer. "in-pool" means the two agree; a
+            // scene line reported as "elsewhere" means the ranking missed the live buffer.
+            string where = InArmedPool(record) ? "in-pool  " : "elsewhere";
+
+            _modLog!.Info($"[WATCH] {where} record=0x{record:X} cursor=0x{cursor:X} \"{text}\"");
+        }
+    }
+
+    private bool InArmedPool(nuint addr)
+    {
+        foreach ((nuint poolBase, int poolLen, _) in _heapPools)
+            if (addr >= poolBase && addr < poolBase + (nuint)poolLen) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// First readable English run at or shortly after <paramref name="record"/>.
+    ///
+    /// Read through ReadProcessMemory rather than by dereferencing. The pointer arrives
+    /// from a stub that captured it inside the game's own loop, and by the time the poll
+    /// tick looks at it the message may have been freed — checking IsReadable and then
+    /// walking raw bytes races the allocator in exactly the way that killed the scan in
+    /// Ch. 61, and an access violation there is uncatchable.
+    ///
+    /// The scan starts at the base and skips forward because a record begins with a
+    /// header: the one measured live had its text at +0x28, and that offset is not
+    /// guaranteed to be constant across message kinds.
+    /// </summary>
+    private string ReadRecordPreview(nuint record)
+    {
+        const int Window = 128;
+        if (!MemoryGuard.TryRead(record, _recordBuf, Window)) return "";
+
+        for (int start = 0; start < Window; start++)
+        {
+            if (!IsPrintable(_recordBuf[start])) continue;
+
+            int end = start;
+            while (end < Window && IsPrintable(_recordBuf[end])) end++;
+            if (end - start < 8) { start = end; continue; }
+
+            var sb = new System.Text.StringBuilder(end - start);
+            for (int i = start; i < end; i++) sb.Append((char)_recordBuf[i]);
+            string candidate = sb.ToString();
+            if (IsEnglishString(candidate)) return candidate;
+            start = end;
+        }
+        return "";
     }
 
     private async Task PollLoopAsync(CancellationToken ct)
