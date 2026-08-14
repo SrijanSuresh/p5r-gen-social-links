@@ -55,7 +55,10 @@
   // never reach; the server handles one request at a time.
   //
   // 0 restores the old reactive behaviour (generate when the line is dispatched).
-  "pregen_lookahead": 3,
+  // Measured: inference sustains ~0.7 lines/sec, a reader advances at up to ~1.7, so a
+  // shallow window covers only 16 of 22 records in a briskly-read scene. The queue can
+  // never win a sprint; it can only bank a buffer during pauses, which needs depth.
+  "pregen_lookahead": 8,
 
   // Inject an assembly hook into the BMD message interpreter (P5R.exe+17A3D27) to
   // capture the record P5R is currently rendering, instead of inferring it by scanning

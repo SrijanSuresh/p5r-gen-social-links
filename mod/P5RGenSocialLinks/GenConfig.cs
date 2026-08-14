@@ -78,9 +78,14 @@ internal sealed class GenConfig
     ///
     /// 0 disables pre-generation and restores the reactive path, which is the fallback
     /// if pre-generated lines ever read as disconnected from the scene.
+    ///
+    /// Raised from 3 to 8 after a measured scene covered 16 of 22 records. Inference
+    /// sustains about 0.7 lines per second and the player read at 1.7, so the queue can
+    /// never win a sustained sprint — it can only bank a buffer during pauses, and a
+    /// window of 3 is too shallow to bank anything.
     /// </summary>
     [JsonPropertyName("pregen_lookahead")]
-    public int PregenLookahead { get; init; } = 3;
+    public int PregenLookahead { get; init; } = 8;
 
     /// <summary>
     /// When true, inject an assembly hook into the BMD message interpreter's byte-fetch

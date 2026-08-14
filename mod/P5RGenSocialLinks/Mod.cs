@@ -2750,6 +2750,37 @@ public class Mod : IModV1
         }
     }
 
+    /// <summary>
+    /// Report how much of a scene was actually replaced, and which records were not.
+    ///
+    /// Coverage is the number that says whether this works, and it had to be counted by
+    /// hand from the log until now — 16 of 22, with the gaps at 3-6 and 14-15. Both gaps
+    /// were bursts where the player advanced faster than inference could keep up, which is
+    /// a fact about pace rather than a fault, and it is invisible without this line.
+    /// </summary>
+    private void LogSceneCoverage()
+    {
+        if (_plan.Count == 0) return;
+
+        int written = 0, pending = 0;
+        var gaps = new System.Text.StringBuilder();
+        foreach (RecordPlan record in _plan)
+        {
+            bool replaced = record.Generated is not null &&
+                            record.State is RecordState.Written or RecordState.Rendered;
+            if (replaced) { written++; continue; }
+            if (record.Original.Length < 8) continue;   // never a candidate
+
+            pending++;
+            if (gaps.Length < 60) gaps.Append(gaps.Length > 0 ? ", " : "").Append('#').Append(record.Index);
+        }
+
+        int candidates = written + pending;
+        int percent    = candidates == 0 ? 0 : written * 100 / candidates;
+        _modLog!.Info($"[SCENE] replaced {written}/{candidates} records ({percent}%)" +
+                      (gaps.Length > 0 ? $" — missed {gaps}" : ""));
+    }
+
     /// Index the player is currently at, as far as the interpreter has told us.
     private int CurrentRecord() =>
         _poolNextRecord.Count > 0 ? Math.Max(0, _poolNextRecord[0] - 1) : 0;
@@ -3257,6 +3288,7 @@ public class Mod : IModV1
                     _lastLlmText         = null;
                     lock (_largeCopyLock) _largeCopyDsts.Clear();
                     _sessionActive = false;
+                    LogSceneCoverage();
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
                 }
                 lastSession = 0;
