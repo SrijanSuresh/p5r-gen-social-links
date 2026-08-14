@@ -3014,6 +3014,16 @@ public class Mod : IModV1
                 // player scrolls it, and treating that as progress would rewind the write
                 // target onto lines already spoken.
                 if (i + 1 > _poolNextRecord[r]) _poolNextRecord[r] = i + 1;
+
+                // Freeze it. Once the interpreter has read a record the player has seen
+                // it, and rewriting it is the bug they described as the text switching.
+                // Backlog re-reads freeze too, which is correct — a line in the log has
+                // certainly been shown.
+                if (i < _plan.Count && _plan[i].State != RecordState.Rendered)
+                {
+                    _plan[i].State = RecordState.Rendered;
+                    _modLog!.Info($"[PLAN] #{i} rendered — frozen");
+                }
                 break;
             }
         }
