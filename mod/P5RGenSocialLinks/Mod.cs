@@ -2484,9 +2484,22 @@ public class Mod : IModV1
         }
     }
 
+    /// <summary>
+    /// The reactive generation, fired by a message dispatch. Inert while pre-generation
+    /// is on.
+    ///
+    /// Leaving both running does not merely waste inference — the server answers one
+    /// request at a time and 429s the rest, so a dispatch arriving mid-queue would take
+    /// the slot the queue was about to use and neither path would keep up. Worse, this
+    /// path fires for every msgId including ones that are not spoken lines: msgId 0x348
+    /// recurred through a whole hang-out and consumed a record each time, which is how a
+    /// 22-record scene ran out at 22/22 with lines still to come.
+    /// </summary>
     private async System.Threading.Tasks.Task DispatchMsgLlmAsync(
         SocialLinkSnapshot snap, ushort msgId, nuint session)
     {
+        if (_cfg.PregenLookahead > 0) return;
+
         using var cts = new System.Threading.CancellationTokenSource(
             TimeSpan.FromSeconds(_cfg.TimeoutSeconds));
         try
