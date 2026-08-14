@@ -1728,7 +1728,7 @@ public class Mod : IModV1
         _modLog!.Info($"[POOL] {_heapPools.Count} regions armed for write");
 
         string? pending = _lastLlmText;
-        if (pending != null) WriteAllHeapPools(pending);
+        if (pending != null) WriteNextRecordReactive(pending);
     }
 
     /// <summary>
@@ -1828,7 +1828,42 @@ public class Mod : IModV1
         return lines;
     }
 
-    private unsafe int WriteAllHeapPools(string text)
+    /// <summary>
+    /// The reactive write: put <paramref name="text"/> in whatever record comes next and
+    /// step past it.
+    ///
+    /// Kept for <c>pregen_lookahead = 0</c>, and used by nothing else. When
+    /// pre-generation is on, both paths writing would have them competing for the same
+    /// records with different text — so the reactive path stands down rather than being
+    /// deleted, because it is the fallback if pre-generated lines ever read as
+    /// disconnected from the scene.
+    /// </summary>
+    private int WriteNextRecordReactive(string text)
+    {
+        if (_cfg.PregenLookahead > 0) return 0;
+        if (_poolNextRecord.Count == 0) return 0;
+
+        int target  = _poolNextRecord[0];
+        int written = WriteRecord(target, text);
+        if (written > 0)
+            for (int r = 0; r < _poolNextRecord.Count; r++) _poolNextRecord[r] = target + 1;
+        return written;
+    }
+
+    /// <summary>
+    /// Write one record, by index, into every armed region.
+    ///
+    /// The index is the same in all regions because they are copies of one script with
+    /// identical record widths. Letting each region track its own cursor produced exactly
+    /// the drift you would expect — region 0 writing record 8 while region 1 wrote record
+    /// 7 — which puts the same sentence on two different lines of the same scene.
+    ///
+    /// Write per record, not per slot: the unit the player sees is the bubble, and a
+    /// bubble spans every fragment up to the next header gap. And one record, not all of
+    /// them — that breadth is what filled the text log with a single sentence repeated at
+    /// every width, and it was also the entire blast radius.
+    /// </summary>
+    private unsafe int WriteRecord(int index, string text)
     {
         if (!_cfg.PoolWriteEnabled)
         {
@@ -1851,23 +1886,9 @@ public class Mod : IModV1
             byte* p = (byte*)poolBase;
             int wrote = 0;
 
-            // Write per record, not per slot. The unit the player sees is the bubble, and
-            // a bubble spans every fragment up to the next header gap.
-            //
-            // And write one record, not all of them. The interpreter hook reports which
-            // record was last rendered, so the one about to be rendered is the next in
-            // address order — reads run monotonically through the region. Overwriting the
-            // rest is what fills the text log with the same sentence repeated at every
-            // width, and it is also the entire blast radius: a mis-ranked region can only
-            // damage what we write to.
             var records = _poolRecords[r];
-            int target  = _poolNextRecord[r];
-            if (target < 0 || target >= records.Count)
-            {
-                _modLog!.Info($"[POOL] region {r}: no record left to write (index {target} " +
-                              $"of {records.Count}) — scene may have run past the pool.");
-                continue;
-            }
+            int target  = index;
+            if (target < 0 || target >= records.Count) continue;
 
             {
                 (int start, int count) = records[target];
@@ -1909,16 +1930,11 @@ public class Mod : IModV1
                     _modLog!.Info($"[TWIN] mirrored {mirrored}/{count} rows at delta " +
                                   $"0x{Math.Abs(_twinDelta):X}");
 
-                // Consume the record. Advancing only on render was a mistake with a very
-                // visible symptom: between two renders, three consecutive generations all
-                // landed on the same record, and because that record was the one on screen
-                // the player watched the sentence change under them twice.
-                //
-                // A record is spent once written, whether or not it is ever displayed.
-                // Render observation still moves the cursor forward when the game gets
-                // ahead of us; it is a floor, not the only source of progress.
-                _poolNextRecord[r] = target + 1;
-
+                // The cursor no longer moves here. With a plan, which record to write is
+                // chosen by index rather than taken from the cursor, so writing must not
+                // also mean "the player advanced" — that conflation is what made three
+                // generations land on the record the player was reading. The cursor now
+                // means one thing only: how far the interpreter has actually got.
                 _modLog!.Info($"[POOL] region {r} record {target}/{records.Count} " +
                               $"@0x{poolBase + (nuint)slots[start].Off:X} rows={count}");
                 wrote++;
@@ -2497,7 +2513,7 @@ public class Mod : IModV1
             _modLog!.Info($"[LLM] msgId=0x{msgId:X}: \"{text[..Math.Min(text.Length, 100)]}\"");
             bool wrote      = TryWriteToBmd(msgId, text);
             int  poolWrites = WritePoolStrings(text);
-            int  heapWrites = WriteAllHeapPools(text);
+            int  heapWrites = WriteNextRecordReactive(text);
             _modLog!.Info($"[LLM] msgId=0x{msgId:X} — ptrWrite={(wrote ? "OK" : "skip")} " +
                           $"poolWrites={poolWrites} heapWrites={heapWrites}");
         }
@@ -2655,6 +2671,38 @@ public class Mod : IModV1
         if (suppressed > 0)
             _modLog!.Info($"[WATCH] +{suppressed} more records this tick (backlog scroll)");
     }
+
+    /// <summary>
+    /// Write every record whose text has arrived but has not reached game memory yet.
+    ///
+    /// Split from generation because the two fail differently and at different times: a
+    /// 503 loses the text, a freed region loses the write. Keeping them separate means a
+    /// write that fails on one tick is simply retried on the next, with the generated
+    /// line still in hand.
+    ///
+    /// Records already read by the interpreter are skipped. That is the Ch. 71 bug
+    /// restated as a rule — overwriting what the player is looking at is what made the
+    /// sentence change under them.
+    /// </summary>
+    private void FlushReadyRecords()
+    {
+        foreach (RecordPlan record in _plan)
+        {
+            if (record.State != RecordState.Ready || record.Generated is null) continue;
+            if (!record.IsWritable) continue;
+
+            if (WriteRecord(record.Index, record.Generated) > 0)
+            {
+                record.State = RecordState.Written;
+                _modLog!.Info($"[PREGEN] #{record.Index} written, " +
+                              $"{record.Index - CurrentRecord()} ahead of the player");
+            }
+        }
+    }
+
+    /// Index the player is currently at, as far as the interpreter has told us.
+    private int CurrentRecord() =>
+        _poolNextRecord.Count > 0 ? Math.Max(0, _poolNextRecord[0] - 1) : 0;
 
     /// <summary>
     /// Context for one specific record: the scene, the line being replaced, and what has
