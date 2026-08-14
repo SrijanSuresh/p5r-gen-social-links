@@ -1140,6 +1140,12 @@ public class Mod : IModV1
     /// Hunting that address by string-scanning the process is possible but slow and
     /// ambiguous — the same line exists in several copies. The mod already holds the
     /// exact offsets, so printing them turns a search into a paste.
+    ///
+    /// The list has to cover the whole region, not just the head. A watchpoint catches
+    /// only reads that happen after it is armed, and the renderer reads a slot once, on
+    /// the transition into that line — so the useful target is always a line that has
+    /// not been displayed yet. Logging the first 8 slots meant the player had to hand-read
+    /// memory as soon as the scene got past them.
     /// </summary>
     private void LogWatchpointTargets(nuint poolBase, (int Off, int Len)[] slots, int maxSlots)
     {
@@ -1582,7 +1588,7 @@ public class Mod : IModV1
             _modLog!.Info(
                 $"[POOL] ARM #{i} ({why}) 0x{c.Base:X} len={c.Len} avg={c.Score / 100.0:F2} " +
                 $"slots={slots.Length}: \"{c.Sample}\"");
-            if (i == 0) LogWatchpointTargets(c.Base, slots, maxSlots: 8);
+            if (i == 0) LogWatchpointTargets(c.Base, slots, maxSlots: 40);
         }
 
         if (_heapPools.Count == 0) return;
