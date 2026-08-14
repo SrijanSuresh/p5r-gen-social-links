@@ -5592,3 +5592,73 @@ reactive.
 
 Being early is not free, and it is worth naming the trade rather than discovering it
 later as a vague sense that the dialogue feels less connected.
+
+---
+
+## Chapter 73: Deleting the Search
+
+### What the scan cost
+
+```
+15:33:54  Hang-out begins
+15:34:27  [POOL] scanned 4030 regions, 1433 MB, 18 scored
+15:34:27  [POOL] ARM #0 (anchor) 0x42098F1000
+```
+
+Thirty-three seconds, 1.4 GB walked, to end up with a ranked list whose top entry was
+right most of the time. During those thirty-three seconds the scene was playing and
+nothing could be written, so the opening lines were always the scripted ones. That was
+never a bug report, because it looks exactly like "the mod warming up".
+
+The scan also could not start until a message had been dispatched, since that was the
+only signal that a conversation existed. So the latency was structural: discover late,
+then discover slowly.
+
+### The replacement is one call
+
+```csharp
+(bool ok, nuint regionBase, nuint regionSize, uint state, uint _) =
+    MemoryGuard.QueryRegion(record);
+```
+
+`VirtualQuery` on an address the interpreter just read. Microseconds, and exact rather
+than ranked, because the address came from the game reading it.
+
+The interesting part is not the speed. It is that the question changed. The scan asked
+*"which of 4030 regions looks most like dialogue?"* — a search, answered with a
+similarity heuristic that had to be tuned, budgeted, and periodically re-explained when
+it picked a data table. The hook asks *"what region is this address in?"* — a lookup,
+answered by the operating system.
+
+Searching for a thing you can be handed is the expensive kind of mistake, because it
+does not feel like a mistake. It feels like engineering: there is a scoring function to
+improve, a budget to tune, a ranking to inspect. All of that work was real and none of
+it was necessary once something else in the system knew the answer.
+
+### Validation is not the same as searching
+
+Removing the search does not remove the need to be careful. The interpreter serves every
+string in the game — menu labels, item names, the newspaper — so the first record it
+reads is not necessarily dialogue. Four gates remain:
+
+- an active hang-out,
+- a preview at least twelve characters long, because a scene line is a sentence,
+- a committed, writable region of plausible size,
+- at least six text runs inside it.
+
+That looks like the old heuristic and is doing something different. The scan used
+scoring to *choose among thousands of candidates*; this uses thresholds to *reject one
+candidate the game pointed at*. The first needs to be right about relative ranking across
+a huge space and is fragile in proportion. The second only has to notice that a menu is
+not a conversation.
+
+### Keeping the corpse warm
+
+The scan is switched off, not deleted, for one release. The hook path has been exercised
+on exactly one scene, and a slow, occasionally-wrong pool beats no pool at all in a scene
+it turns out to miss.
+
+That is a real judgement rather than sentiment, and it comes with an expiry: it goes when
+the hook has been through a few more scenes. Dead code kept "just in case" with no
+condition for removal is how a codebase accumulates two ways of doing everything, and the
+second way rots until the day someone needs it.
