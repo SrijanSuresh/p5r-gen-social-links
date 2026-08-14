@@ -45,17 +45,28 @@ _ASCII_FOLD = str.maketrans({
 
 
 def _truncate_at_sentence(text: str, max_chars: int) -> str:
-    """Truncate at the last sentence boundary before max_chars."""
+    """
+    Truncate at the last sentence boundary before max_chars, or give up.
+
+    Giving up is the important part. The word-boundary fallback this used to end with
+    produced lines like "Yeah, membership's pretty" and "Where'd I put those extra" —
+    grammatically severed mid-thought, and visibly broken in a speech bubble in a way the
+    original scripted line never is.
+
+    Records get as small as fifteen characters, and no amount of prompting reliably gets
+    a complete sentence into fifteen characters. When one does not arrive, returning
+    nothing is correct: the mod leaves the record alone and the player reads canon
+    dialogue, which is a good line rather than a wrong one.
+    """
     if len(text) <= max_chars:
         return text
+
     chunk = text[:max_chars]
-    # Walk backwards to find the last sentence-ending punctuation
     for i in range(len(chunk) - 1, -1, -1):
         if chunk[i] in ".!?":
             return chunk[: i + 1]
-    # No sentence boundary found — fall back to word boundary
-    last_space = chunk.rfind(" ")
-    return chunk[:last_space] if last_space > 0 else chunk
+
+    return ""
 
 
 def clean_response(raw: str, max_chars: int = 200) -> str:

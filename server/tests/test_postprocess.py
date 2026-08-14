@@ -10,9 +10,14 @@ def test_strips_ooc_commentary() -> None:
 
 
 def test_truncates_to_max_chars() -> None:
-    # Old behaviour: hard truncate; new: sentence boundary, may be < max_chars
-    result = clean_response("A" * 300, max_chars=200)
-    assert len(result) <= 200
+    # A 300-character run with no punctuation has no sentence boundary to cut back to,
+    # so it is rejected outright rather than sliced.
+    assert clean_response("A" * 300, max_chars=200) == ""
+
+
+def test_long_text_with_punctuation_keeps_whole_sentences() -> None:
+    text = "First one here. " + "B" * 300
+    assert clean_response(text, max_chars=200) == "First one here."
 
 
 def test_strips_ai_disclosure() -> None:
@@ -41,11 +46,32 @@ def test_truncate_at_sentence_boundary() -> None:
     assert result == "First sentence."
 
 
-def test_truncate_falls_back_to_word_boundary() -> None:
-    text = "No punctuation at all just words here"
-    result = _truncate_at_sentence(text, max_chars=15)
-    assert not result.endswith(" ")
-    assert len(result) <= 15
+def test_no_sentence_boundary_yields_nothing() -> None:
+    """
+    Reverses an earlier expectation. This used to assert a word-boundary fallback, and
+    its assertions -- "does not end with a space", "is not longer than the limit" -- are
+    both satisfied by the empty string, so it could never have caught the change.
+
+    Word-boundary truncation shipped "Yeah, membership's pretty" and "Where'd I put those
+    extra" into speech bubbles: severed mid-thought, and worse to read than the scripted
+    line they replaced. With nothing returned the mod leaves the record alone and the
+    player gets canon dialogue.
+    """
+    assert _truncate_at_sentence("No punctuation at all just words here", max_chars=15) == ""
+
+
+def test_partial_sentence_after_a_complete_one_is_dropped() -> None:
+    text = "Yo. Now here comes a much longer clause that will not fit"
+    assert _truncate_at_sentence(text, max_chars=30) == "Yo."
+
+
+def test_short_record_rejects_an_overlong_line() -> None:
+    """A fifteen-character bubble cannot hold a sentence, so it must get none."""
+    assert clean_response("Yeah, membership is pretty reasonable", max_chars=15) == ""
+
+
+def test_a_line_that_fits_is_untouched_by_the_new_rule() -> None:
+    assert clean_response("Yo, let's go!", max_chars=30) == "Yo, let's go!"
 
 
 def test_short_text_not_truncated() -> None:
