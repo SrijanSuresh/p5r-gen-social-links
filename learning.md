@@ -5028,3 +5028,95 @@ That is deterministic. No scores, no anchor, no twin, no 36-slot blast radius �
 the blast radius is where the crash lived. The watchpoint hunt is still worth
 finishing, because the renderer's own read is the fastest confirmation that a block is
 live. But the destination changed: from *guess better* to *read the format*.
+
+---
+
+## Chapter 67: A Signature Is a Claim About the Whole Binary
+
+### What a debugger actually told us
+
+Cheat Engine reported an instruction at `P5R.exe+17A3D27` that reads the message being
+rendered. Turning that into something the mod can use at runtime means writing down the
+bytes around it:
+
+```
+48 63 53 30    movsxd rdx, dword ptr [rbx+30]
+48 8B 43 20    mov    rax, [rbx+20]
+0F B6 3C 02    movzx  edi, byte ptr [rdx+rax]
+85 FF          test   edi, edi
+0F 85          jne    <loop>
+```
+
+The reason this indirection exists at all is ASLR. `0x1417A3D27` was true for one
+launch and will be false for the next: Windows rebases the image every time, so the
+only durable fact is the *offset*, and the only way to recover an offset without a
+symbol table is to search for the bytes.
+
+### The sample-of-one problem
+
+Here is the trap. `Scanner.FindPattern` returns `PatternScanResult`, which has `Found`
+and `Offset` — and nothing else. It stops at the first hit. So a pattern occurring twice
+is indistinguishable at runtime from a pattern occurring once: both resolve, both look
+successful, and one of them hooks an instruction you have never seen.
+
+Worse, the failure is quiet and late. The scan succeeds at load. The hook activates. The
+log says `sig OK`. The wrongness only shows up as garbage data much later, in a code
+path with no obvious link to a scan that happened at startup.
+
+A signature is not "bytes that match my target". It is a claim that **no other point in
+386 MB of image matches**. Nothing at runtime checks that claim, so it has to be checked
+somewhere else.
+
+### Checking it offline
+
+`scripts/verify-signature.py` reads the PE from disk and counts every occurrence:
+
+```
+occurrences  1
+  file 0x17A331F -> p5r.exe+17A3D1F  (section .sdata)
+```
+
+One hit. And run against the older `CmmExecEvent` pattern it independently reproduces
+`p5r.exe+E0D0B0`, which matches the `0x140E0D0B0` recorded in that signature's comment
+from a Ghidra session months ago — the tool validated against a known answer before
+being trusted on an unknown one.
+
+Two details in that output are worth reading carefully. `p5r.exe+17A3D1F` is the RVA, not
+the file offset (`0x17A331F`) — sections are laid out differently on disk than in memory,
+so the two differ by the section's own delta, and comparing the wrong one against a
+disassembler produces a confident mismatch. And `.sdata` holding executable code is odd
+enough to notice; what matters for us is that the bytes are present in the file rather
+than produced at runtime by a packer, which the successful match proves.
+
+### What to wildcard, and what not to
+
+The usual advice is to wildcard anything that might shift between builds: RIP-relative
+displacements, jump targets, compiler-chosen stack slots. That is right, but it is only
+half a rule, because every wildcard also widens the match.
+
+Here nothing is wildcarded except by omission — the pattern stops at the `0F 85` opcode
+and excludes the jump displacement that follows. The struct offsets `0x20` and `0x30`
+are deliberately literal, and that is the important decision:
+
+```
+48 8B 43 20    mov rax, [rbx+0x20]     <- 0x20 is the record pointer field
+48 63 53 30    movsxd rdx, [rbx+0x30]  <- 0x30 is the cursor field
+```
+
+Those two bytes are not incidental encoding, they are *the thing we learned*. If a game
+update moves the record pointer to `+0x28`, a wildcarded pattern still matches — and the
+mod then reads a neighbouring field and dereferences whatever it finds. A literal
+pattern fails the scan loudly instead, and the mod falls back to the heuristic it
+already has.
+
+So: wildcard what you do not care about, and pin what you are relying on. A signature
+that cannot fail is not robust, it is just silent.
+
+### Separating resolution from hooking
+
+The scan and the hook land as two commits, not one, and the first logs an address
+without touching it. This is not tidiness — it is that each attempt costs a game
+restart, a load, and walking back to a hang-out. When "sig OK" and "hook active" appear
+together and the game then misbehaves, you have two suspects and one expensive
+experiment. Split, and the first run answers "did the pattern survive this build?"
+before the second run asks anything harder.
