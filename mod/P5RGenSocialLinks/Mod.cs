@@ -1718,7 +1718,7 @@ public class Mod : IModV1
             var slots = CapturePoolSlotsSafe(c.Base, c.Len);
             if (slots.Length == 0) continue;
             _heapPools.Add((c.Base, c.Len, slots));
-            _poolRecords.Add(GroupSlotsIntoRecords(slots));
+            _poolRecords.Add(GroupSlotsIntoRecords(c.Base, slots));
             // -1 means nothing observed yet, so the next write targets record 0.
             _poolNextRecord.Add(0);
             string why = i == 0 ? "anchor" : (c.Sample == anchorSample ? "twin" : "rank");
@@ -1780,19 +1780,55 @@ public class Mod : IModV1
     /// independently put the whole generated line in row one and the same line again in
     /// row two. Rows are not independent, so they cannot be written independently.
     /// </summary>
-    private static System.Collections.Generic.List<(int Start, int Count)>
-        GroupSlotsIntoRecords((int Off, int Len)[] slots)
+    private System.Collections.Generic.List<(int Start, int Count)>
+        GroupSlotsIntoRecords(nuint poolBase, (int Off, int Len)[] slots)
     {
         var records = new System.Collections.Generic.List<(int, int)>();
+        var gap     = new byte[MaxJoinGap];
         int i = 0;
         while (i < slots.Length)
         {
             int start = i++;
-            while (i < slots.Length &&
-                   slots[i].Off == slots[i - 1].Off + slots[i - 1].Len + 1) i++;
+            while (i < slots.Length && SameRecord(poolBase, slots[i - 1], slots[i], gap)) i++;
             records.Add((start, i - start));
         }
         return records;
+    }
+
+    private const int MaxJoinGap = 32;
+
+    /// <summary>
+    /// Whether two adjacent text runs belong to the same speech bubble.
+    ///
+    /// Decided by what is in the gap, not by how wide it is. Measured on a live scene:
+    ///
+    ///   27B  0A F2 23 00 00 F1 21 F2 05 FF FF F1 41 F7 61 09 ...   message boundary
+    ///   12B  0A 79 6F 75 20 67 6F 74 74 61 83 D2                   same bubble
+    ///
+    /// The second is a newline, the word "you gotta", and a two-byte Shift-JIS dash — no
+    /// control codes at all. The first is a block of them: F2 23, F1 21, F2 05 FF FF,
+    /// F1 41, F7.
+    ///
+    /// The previous rule joined runs exactly one byte apart, so it split that bubble in
+    /// two, wrote the generated line into the first half, and left "you gotta— Wait, that
+    /// ain't it!" showing underneath. Widening it to twelve would have worked on this
+    /// scene and been luck: 12 against 27 is a property of these two samples, while the
+    /// presence of an F1/F2 control block is a property of the format.
+    /// </summary>
+    private bool SameRecord(nuint poolBase, (int Off, int Len) prev, (int Off, int Len) next,
+                            byte[] buf)
+    {
+        int gapStart = prev.Off + prev.Len;
+        int gap      = next.Off - gapStart;
+
+        if (gap < 1) return false;
+        if (gap == 1) return true;              // the bare newline between two rows
+        if (gap > MaxJoinGap) return false;     // far enough apart to be padding
+
+        if (!MemoryGuard.TryRead(poolBase + (nuint)gapStart, buf, gap)) return false;
+        foreach (byte b in new System.ReadOnlySpan<byte>(buf, 0, gap))
+            if (b is 0xF1 or 0xF2 or 0xF7) return false;   // BMD function code: new message
+        return true;
     }
 
     /// <summary>
@@ -3161,7 +3197,7 @@ public class Mod : IModV1
         _poolNextRecord.Clear();
 
         _heapPools.Add((regionBase, (int)regionSize, slots));
-        _poolRecords.Add(GroupSlotsIntoRecords(slots));
+        _poolRecords.Add(GroupSlotsIntoRecords(regionBase, slots));
         _poolNextRecord.Add(0);
         _poolIsHeap = true;
 
