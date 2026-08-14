@@ -5398,3 +5398,92 @@ The unifying point: precision about the target was worth more than any amount of
 about the write itself. We had spent chapters making the write safer — bounds checks,
 word-boundary trimming, kill switches — while it was still aimed at ninety-three places
 at once.
+
+---
+
+## Chapter 71: Three Symptoms, Three Different Bugs
+
+A single play session produced three complaints — the text changed under the player, the
+generated lines stopped reaching the bubble, and the game hitched when the backlog
+opened. It is tempting to look for the one cause behind all three. There wasn't one.
+They shared a session, not a mechanism, and each needed its own fix.
+
+### Symptom 1: the sentence changed while it was on screen
+
+```
+15:34:32.729  [POOL] region 0 record 8/22   <- "You're really gonna start comin' here..."
+15:34:36.535  [POOL] region 0 record 8/22   <- "This gym's not bad for the price, though."
+15:34:39.098  [POOL] region 0 record 8/22   <- "Your gym skills are gettin' better, Joker!"
+```
+
+Same record, three times, four seconds apart. Whatever was displaying record 8 got
+rewritten twice under the player.
+
+The cause is a design decision from the previous chapter, and the reasoning behind it was
+sound: advance the write cursor **on render**, so that a line which never reaches the
+screen cannot leave the mod permanently one record ahead of the game. That protects
+against drift. What it does not do is stop the *next* write landing in the same place
+when no render happens in between.
+
+The fix is to treat both as floors. A record is spent when it is written, whether or not
+it is ever displayed; render observation still pushes the cursor forward when the game
+gets ahead. Progress has two sources and the cursor takes the larger.
+
+The general lesson: "advance on X" is rarely a complete rule. Ask what happens when X
+does not occur, because that is the branch the bug lives in.
+
+### Symptom 2: the bubble kept the original script
+
+```
+[POOL] 1 regions armed for write
+...
+15:34:42.469  [WATCH] elsewhere record=0x41DB1930C8  "Oh yeah! You bring your stuff?"
+15:34:42.470  [WATCH] in-pool   record=0x4209925338  "Oh yeah! You bring your stuff?"
+```
+
+Two copies of the line, read a millisecond apart, and only one of them inside an armed
+region. The write went to the copy the text log reads; the bubble read the other and
+showed the script.
+
+This is the twin problem, which we thought was solved by arming any region whose sample
+text matched the anchor's. It resolved in earlier runs and silently failed in this one —
+`1 regions armed`. Ranking never had a way to find the twin: the relationship between the
+two copies is a fixed address offset, not a similarity of score, and no amount of tuning
+a text-similarity metric will surface a fact the metric does not measure.
+
+The hook does measure it. Two consecutive distinct records with identical preview text
+are the pair, and their difference is the delta — `0x3C60B8F0` in one run, `0x2E67F270`
+in the next, constant within each. So the twin is now learned by observation and written
+by arithmetic.
+
+Arithmetic on an address is exactly where a bad assumption becomes a memory corruption,
+so the mirror write never trusts the delta alone. The original bytes are captured before
+the target is overwritten, and the mirror is written only if it still contains them, byte
+for byte. A wrong delta fails the comparison and writes nothing. This is the Ch. 64
+ordering constraint reappearing in a new place: the evidence you need is destroyed by the
+operation you are about to perform, so capture it first.
+
+### Symptom 3: the game hitched when the backlog opened
+
+The backlog re-reads every past line at once. That is not a bug — but each read produced
+a log line, and each log line opened the file, appended, and closed it.
+
+That per-line open was a deliberate earlier choice: a buffered writer loses its tail
+exactly when the process crashes, which is when the tail matters most. The reasoning was
+right and the conclusion was wrong, because `AutoFlush` on a held-open writer provides the
+same crash-safety without the syscall per line. The cost was invisible at a 500 ms tick
+and became a stutter under a burst.
+
+The log volume needed capping too, but note which fix goes where: the *processing* of
+every record still happens — cursor, twin delta — and only the *reporting* is limited to
+six per tick with a count of the rest. Throttling the work would have introduced a third
+bug to fix later.
+
+### Why they looked like one bug
+
+All three surfaced in the same minute, and two of them made the mod's output look wrong
+in the same way. The instinct to find a common root is usually right and was wrong here,
+and the thing that separated them was timestamped evidence: three writes to one record
+is a cursor problem, two addresses holding one line is a coverage problem, and a burst
+correlated with a keypress is a cost problem. Without the log they would have been one
+vague report of "it's glitchy", and any single fix would have left two of them live.
