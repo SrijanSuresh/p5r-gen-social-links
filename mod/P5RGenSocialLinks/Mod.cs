@@ -59,6 +59,11 @@ public class Mod : IModV1
     // sometimes and missed it in the run that produced this field: one region armed, and
     // every write landed in the text log while the bubble kept the script.
     private long                         _twinDelta;
+
+    // True between a hang-out starting and ending. Arming reads the interpreter's own
+    // pointer, and the interpreter serves every string in the game, so this is what
+    // keeps a menu label from being mistaken for the scene's dialogue pool.
+    private volatile bool                _sessionActive;
     private (nuint Addr, string Text)    _lastWatched;
 
     [Function(CallingConventions.Microsoft)]
@@ -2673,6 +2678,25 @@ public class Mod : IModV1
             // scene line reported as "elsewhere" means the ranking missed the live buffer.
             string where = AdvancePoolCursor(record) ? "in-pool  " : "elsewhere";
 
+            // Arm from the read itself. Gated on an active hang-out because the
+            // interpreter serves every string in the game — menus, item names, the
+            // newspaper — and arming on the first record seen anywhere would point the
+            // writer at a UI buffer.
+            //
+            // Requiring a dialogue-length preview is the second gate: a scene line is a
+            // sentence, and a twelve-character floor rejects labels without pretending to
+            // be a classifier.
+            if (_sessionActive && text.Length >= 12)
+            {
+                TryArmFromRecord(record);
+
+                // The twin, once its offset is known. It is a second copy of the same
+                // script at a fixed distance, and the bubble reads one of the two — which
+                // one is not predictable, so both get written.
+                if (_twinDelta != 0 && _heapPools.Count == 1)
+                    TryArmFromRecord((nuint)((long)record - _twinDelta));
+            }
+
             LearnTwinDelta(record, text);
 
             if (logged++ < MaxLogged)
@@ -2931,6 +2955,64 @@ public class Mod : IModV1
         return capacity + (count - 1);   // the newline between rows carries a word break
     }
 
+    /// True when the address lies inside a region already armed for writing.
+    private bool InArmedPool(nuint addr)
+    {
+        foreach ((nuint poolBase, int poolLen, _) in _heapPools)
+            if (addr >= poolBase && addr < poolBase + (nuint)poolLen) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Arm the region containing a record the interpreter just read.
+    ///
+    /// This replaces the heap scan, and the difference is not an optimisation — it is a
+    /// different question. The scan asked "which of 4030 regions looks most like
+    /// dialogue?", walked 1.4 GB scoring English, and took 33 seconds, during which the
+    /// first six lines of the scene played untouched. This asks "what region is that
+    /// address in?", which VirtualQuery answers in microseconds, about an address the
+    /// game supplied by reading it.
+    ///
+    /// Validation still happens, because the interpreter serves every string in the game
+    /// and the first record seen could be a menu label. But validating one candidate the
+    /// game pointed at is a different problem from searching for it.
+    /// </summary>
+    private void TryArmFromRecord(nuint record)
+    {
+        const int MinSlots  = 6;
+        const int MinRegion = 0x4000;         // 16 KB
+        const int MaxRegion = 0x400000 * 8;   // 32 MB; a scene pool measured 266 KB - 1.4 MB
+
+        if (_heapPools.Count >= 2) return;
+        if (InArmedPool(record)) return;
+
+        (bool ok, nuint regionBase, nuint regionSize, uint state, uint _) =
+            MemoryGuard.QueryRegion(record);
+        const uint MEM_COMMIT = 0x1000;
+        if (!ok || state != MEM_COMMIT) return;
+        if (regionSize < MinRegion || regionSize > MaxRegion) return;
+        if (!MemoryGuard.IsWritable(regionBase, (int)Math.Min(regionSize, 0x1000))) return;
+
+        var slots = CapturePoolSlotsSafe(regionBase, (int)regionSize);
+        if (slots.Length < MinSlots)
+        {
+            _modLog!.Info($"[ARM] 0x{regionBase:X} rejected — {slots.Length} text runs, " +
+                          $"below {MinSlots}. Not a dialogue pool.");
+            return;
+        }
+
+        _heapPools.Add((regionBase, (int)regionSize, slots));
+        _poolRecords.Add(GroupSlotsIntoRecords(slots));
+        _poolNextRecord.Add(0);
+        _poolIsHeap = true;
+
+        _modLog!.Info($"[ARM] region {_heapPools.Count - 1} 0x{regionBase:X} " +
+                      $"len={regionSize} slots={slots.Length} — from a live read, no scan");
+
+        // Only region 0 defines the plan; the second is the same script at a fixed offset.
+        if (_heapPools.Count == 1) BuildRecordPlan();
+    }
+
     /// <summary>
     /// Learn where the second copy of a record lives, from two reads of the same text.
     ///
@@ -3123,6 +3205,7 @@ public class Mod : IModV1
                     _heapSweepDone       = false;
                     _lastLlmText         = null;
                     lock (_largeCopyLock) _largeCopyDsts.Clear();
+                    _sessionActive = false;
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
                 }
                 lastSession = 0;
@@ -3139,6 +3222,7 @@ public class Mod : IModV1
 
                 _modLog!.Info(
                     $"[P5RGenSocialLinks] Hang-out: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber} (0x{session:X})");
+                _sessionActive = true;
 
                 // Fallback dispatch if hook isn't active.
                 if (!_hookActive)
