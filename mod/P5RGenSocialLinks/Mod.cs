@@ -3053,7 +3053,17 @@ public class Mod : IModV1
     {
         const int MinSlots  = 6;
         const int MinRegion = 0x4000;         // 16 KB
-        const int MaxRegion = 0x400000 * 8;   // 32 MB; a scene pool measured 266 KB - 1.4 MB
+        const int MaxRegion = 0x400000 * 8;   // 32 MB; scene pools measured 45 KB - 1.4 MB
+
+        // A scene's script is small. Measured across five sessions the gym pool held 36
+        // text runs every time, while the pool the game reads alongside it — menu prompts,
+        // "AHang out with him", "ACheck bond with Ryuji" — held 340 to 409.
+        //
+        // Without this the two take turns arming each other. Reads interleave between them
+        // all through a scene, so consecutive outside reads happen constantly, and every
+        // flip rebuilt the plan and discarded everything generated so far. Coverage fell to
+        // 50%, with records 0-6 written and then wiped.
+        const int MaxSceneSlots = 120;
 
         if (InArmedPool(record) || IsTwinOfArmed(record))
         {
@@ -3078,10 +3088,18 @@ public class Mod : IModV1
         if (!MemoryGuard.IsWritable(regionBase, (int)Math.Min(regionSize, 0x1000))) return;
 
         var slots = CapturePoolSlotsSafe(regionBase, (int)regionSize);
-        if (slots.Length < MinSlots)
+        if (slots.Length < MinSlots || slots.Length > MaxSceneSlots)
         {
             _modLog!.Info($"[ARM] 0x{regionBase:X} rejected — {slots.Length} text runs, " +
-                          $"below {MinSlots}. Not a dialogue pool.");
+                          $"outside {MinSlots}-{MaxSceneSlots}. Not a scene script.");
+            return;
+        }
+
+        // Re-arming the region already armed would rebuild the plan and throw away every
+        // line generated for it — the same damage as a flip, from a no-op.
+        if (_heapPools.Count > 0 && _heapPools[0].Base == regionBase)
+        {
+            _outsideReads = 0;
             return;
         }
 
