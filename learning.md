@@ -5662,3 +5662,90 @@ That is a real judgement rather than sentiment, and it comes with an expiry: it 
 the hook has been through a few more scenes. Dead code kept "just in case" with no
 condition for removal is how a codebase accumulates two ways of doing everything, and the
 second way rots until the day someone needs it.
+
+---
+
+## Chapter 74: A Session Is Not a Scene
+
+### The wrong pool, armed confidently
+
+The hook-driven arming worked exactly as designed and produced a completely wrong result:
+
+```
+16:51:43  [ARM] 0x41DBE73000 len=552960 slots=402
+16:51:43  [PLAN] 207 records
+16:51:43  [PLAN]   #0 "Just believe in yourself, dude!"
+...
+16:51:57  [TWIN] ... 0x4250C8B13C "Here we are... Protein Lovers gym!"
+```
+
+The armed pool is the street conversation that opens the hang-out. The gym pool appears
+fourteen seconds later and is never armed, because arming had already happened.
+
+The bug is a modelling error, not a coding one. `_sessionActive` was treated as the unit
+of work — one hang-out, one pool, arm once — and a hang-out turns out to contain several
+scenes, each with its own pool. Every assumption downstream inherited it: the plan, the
+cursor, the whole generation queue, all bound to a buffer the player had walked away from.
+
+The fix is to stop asking "have we armed yet" and start asking "is the game still reading
+from what we armed". Reads landing outside the armed region are the scene change
+announcing itself. Two in a row, because one stray read is a menu or a name plate while a
+genuinely moved scene keeps reading from its new pool.
+
+One subtlety makes or breaks that rule: the twin copy is always outside the armed region,
+so without excluding it explicitly the pool and its copy take turns evicting each other
+for the length of the scene. A re-arm trigger has to know which "outside" reads do not
+count.
+
+### Two regions were never copies
+
+```
+[POOL] region 0 record 0/207
+[POOL] region 1 record 0/180
+```
+
+Arming two regions and writing the same record index into both assumed they held the same
+script. 207 records against 180 says otherwise — two unrelated pools, where index N names
+a different line in each.
+
+What makes this worth recording is that the correct mechanism was already present and
+working. `MirrorToTwin` locates the copy at a learned offset and verifies byte-for-byte
+before writing. The second armed region was a second, weaker answer to a question that
+already had a good one, kept because it had been written first.
+
+Two mechanisms for one job is not redundancy. The weaker one runs too, and its failures
+are attributed to the system rather than to itself.
+
+### Late answers land in the past
+
+```
+[PREGEN] #0 written, -32 ahead of the player
+```
+
+The request went out with the cursor at 0. The player advanced thirty-two records during
+the round trip. The answer arrived and overwrote a line spoken half a minute earlier.
+
+There was already a guard for this — records freeze once the interpreter reports reading
+them. It did not fire, because the interpreter only reports what it actually read, and a
+scene moved through quickly leaves gaps nobody looked at. The freeze is a record of
+observation, not a claim about everything behind the cursor.
+
+So the write path needs its own floor: never write behind the cursor, regardless of what
+was observed. Two guards for one hazard is fine when they fail differently — unlike two
+mechanisms for one job, which is the previous section's problem.
+
+### The pattern across all three
+
+Each of these is the same shape: a rule that was true when written and quietly stopped
+being true.
+
+- "One session, one pool" was true while every test was a single scene.
+- "The armed regions are copies" was true for the run where content matching found a
+  genuine twin.
+- "Freezing on render covers everything behind the player" was true while the player read
+  every line.
+
+None of them failed loudly. They produced confident, well-logged, wrong behaviour — which
+is the argument for logging the *reasoning* and not only the outcome. `record 0/207`
+against `record 0/180` is the entire second bug, visible in one line, and only because
+the log prints the denominator.
