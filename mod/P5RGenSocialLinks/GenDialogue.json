@@ -37,6 +37,16 @@
   // dialogue. Keep at 1 unless diagnosing why the scene is not being found.
   "max_write_regions": 1,
 
+  // Inject an assembly hook into the BMD message interpreter (P5R.exe+17A3D27) to
+  // capture the record P5R is currently rendering, instead of inferring it by scanning
+  // the heap and scoring regions for English.
+  //
+  // This is the most invasive thing the mod does: six instructions inside a loop that
+  // runs once per character of every message in the game. If P5R fails to launch or
+  // dies on the first line of dialogue, set this false first — the pool heuristic still
+  // works without it.
+  "msg_hook_enabled": true,
+
   // Log every pointer chain step with address + dereferenced value.
   // Enable when TryResolve() fails and you need to find the broken link.
   // Leave false in normal play — fires every 500ms poll tick.

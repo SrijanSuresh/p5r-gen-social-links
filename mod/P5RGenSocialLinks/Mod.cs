@@ -38,6 +38,11 @@ public class Mod : IModV1
     // Address of the interpreter's MOVZX, resolved by signature at load. Zero means the
     // scan did not find it and the pool heuristic remains the only path to the text.
     private nuint                        _msgByteFetch;
+    private MsgInterpreterWatch?         _msgWatch;
+
+    // Last record pointer reported to the log. The hook fires once per character, so the
+    // interesting event is the value changing, not the value existing.
+    private nuint                        _lastWatchedRecord;
 
     [Function(CallingConventions.Microsoft)]
     public delegate nint CmmExecEventDelegate();
@@ -416,6 +421,33 @@ public class Mod : IModV1
             _logger!.WriteLine(
                 $"[P5RGenSocialLinks] MsgByteFetch sig OK: P5R.exe+{rva:X} " +
                 $"(abs 0x{addr.Value:X}, movzx at 0x{_msgByteFetch:X})");
+
+            if (!_cfg.MsgHookEnabled)
+            {
+                _logger.WriteLine("[P5RGenSocialLinks] Msg watch disabled by config.");
+                return;
+            }
+            if (_hooks is null)
+            {
+                _logger.WriteLine("[P5RGenSocialLinks] Msg watch skipped — IReloadedHooks null.");
+                return;
+            }
+
+            try
+            {
+                _msgWatch = new MsgInterpreterWatch(_hooks, _msgByteFetch);
+                _logger.WriteLine("[P5RGenSocialLinks] Msg watch ACTIVE.");
+            }
+            catch (Exception ex)
+            {
+                // Deliberately broad, and only around this one call. Assembling the stub
+                // runs through a third-party assembler whose failure type is not part of
+                // the interface we reference, and every path after this point still works
+                // without the watch — so an unknown assembler error must degrade to the
+                // pool heuristic rather than abort mod startup.
+                _logger.WriteLine($"[P5RGenSocialLinks] Msg watch FAILED to install: {ex.Message}");
+                _msgWatch = null;
+            }
         }
         catch (InvalidOperationException ex)
         {
@@ -2399,12 +2431,45 @@ public class Mod : IModV1
         _pollTask = Task.Run(() => PollLoopAsync(_cts.Token));
     }
 
+    /// <summary>
+    /// Log the record the interpreter is reading, whenever it changes.
+    ///
+    /// Sampling on the poll tick rather than logging from the stub is not a shortcut: the
+    /// hook fires once per character of every message in the game, so anything managed on
+    /// that path would run tens of thousands of times a second. The stub writes two words
+    /// to a fixed buffer and nothing else; this reads the buffer at 500 ms and reports
+    /// only transitions.
+    ///
+    /// The consequence is that short-lived records can be missed entirely. That is fine
+    /// for verification — what needs proving is that the pointer is real, in the heap, and
+    /// changes line to line — and it is the wrong mechanism for actually driving writes,
+    /// which will key off the record changing rather than a timer.
+    /// </summary>
+    private void ReportWatchedRecord()
+    {
+        if (_msgWatch is null) return;
+
+        nuint record = _msgWatch.RecordPtr;
+        if (record == 0 || record == _lastWatchedRecord) return;
+        _lastWatchedRecord = record;
+
+        // The cursor is sampled separately from the pointer and the two are not written
+        // atomically as a pair, so it is a hint about where the interpreter had reached,
+        // not a value to compute with.
+        int    cursor = _msgWatch.Cursor;
+        string text   = AsciiPreview(record + (nuint)cursor, 64);
+
+        _modLog!.Info($"[WATCH] record=0x{record:X} cursor=0x{cursor:X} \"{text}\"");
+    }
+
     private async Task PollLoopAsync(CancellationToken ct)
     {
         nuint lastSession = 0;
 
         while (await _timer!.WaitForNextTickAsync(ct))
         {
+            ReportWatchedRecord();
+
             if (!_reader!.TryResolve(out nuint session))
             {
                 if (lastSession != 0)
@@ -2545,6 +2610,8 @@ public class Mod : IModV1
         _conversationHook?.Disable();
         _memcpyHook?.Disable();
         _bfDispatchHook?.Disable();
+        _msgWatch?.Dispose();
+        _msgWatch = null;
         _diffScanner.Reset();
         _logger?.WriteLine("[P5RGenSocialLinks] Unloaded.");
     }

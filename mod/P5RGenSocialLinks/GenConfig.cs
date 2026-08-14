@@ -52,6 +52,19 @@ internal sealed class GenConfig
     public int MaxWriteRegions { get; init; } = 1;
 
     /// <summary>
+    /// When true, inject an assembly hook into the BMD message interpreter's byte-fetch
+    /// loop to capture the record the game is currently rendering.
+    ///
+    /// This is the replacement for the heap heuristic: instead of scanning a gigabyte and
+    /// scoring regions for English, the game hands over the pointer. It is also the most
+    /// invasive thing the mod does — six injected instructions inside a loop that runs per
+    /// character of every message in the game — so it gets its own switch. If P5R fails to
+    /// start or dies on the first line of dialogue, set this false first.
+    /// </summary>
+    [JsonPropertyName("msg_hook_enabled")]
+    public bool MsgHookEnabled { get; init; } = true;
+
+    /// <summary>
     /// When true, PointerChainResolver logs each chain step with address and dereferenced value.
     /// Useful for diagnosing broken pointer chains after a game patch; leave false in production.
     /// </summary>
