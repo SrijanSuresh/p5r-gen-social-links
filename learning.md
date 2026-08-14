@@ -4814,3 +4814,127 @@ When output is generically correct but contextually hollow, the question is not 
 model or which sampling parameters. It is what the model was given. Trace the inputs
 before touching the generation, and check specifically whether the thing you need is
 being thrown away somewhere upstream — most often by the very step that needed it.
+
+---
+
+## Chapter 65: Ask the Consumer, Not the Heap
+
+### What is still wrong
+
+The pipeline works end to end. A generated line reaches the speech bubble. But three
+symptoms survived, and they are all the same bug wearing different clothes:
+
+1. **Both rows of the bubble show the same line.** We write all 36 slots in the region,
+   because we do not know which one is live.
+2. **The ranking picks a different buffer between sessions.** One run rendered from
+   `0x421167C000` (266 KB); the next from `0x41EF589000` (1 MB). Same scene, same
+   build.
+3. **The twin arming fired in one run and not the other.** Content matching found a
+   second copy once, and once did not need to.
+
+Every one of these traces to the same root: *we are inferring which bytes the renderer
+reads by scoring how much they look like dialogue.* Similarity is a heuristic. It
+ranked `ternTableOffset: -1` above the live scene once, and that crashed the game.
+
+### The inversion
+
+There is a source of truth we have not asked. The renderer *knows* which address it
+reads — it reads it, every frame, with a specific instruction at a specific offset in
+a specific module. We have been guessing the answer to a question the CPU can be made
+to answer exactly.
+
+That is the whole idea behind "Find out what accesses this address":
+
+```
+guessing:  scan heap → score regions → rank → hope #0 is the live one
+asking:    pick the address that is on screen → break on reads → read the instruction
+```
+
+The second one cannot be wrong about which buffer matters, because the evidence *is*
+the read.
+
+### How the CPU does this
+
+x86-64 has four debug address registers, `DR0`–`DR3`, plus a control register `DR7`.
+Each `DRn` holds a linear address; `DR7` says, per slot, what access triggers a fault
+and over what width (1, 2, 4, or 8 bytes):
+
+```
+DR0 = 0x421167C0A0      ← the address of the line in the bubble
+DR7 = ...R/W bits: 11   ← 11 = break on read or write, 01 = write only
+      ...LEN bits: 11   ← 8 bytes wide
+```
+
+When the CPU executes an instruction that touches that range, it raises `#DB`, and the
+debugger — Cheat Engine, here — records `RIP`, the register file, and moves on.
+
+Two consequences fall directly out of that mechanism:
+
+- **There are exactly four.** Hardware breakpoints are a fixed CPU resource, not a
+  software list. Watch a fifth address and something must be evicted.
+- **It costs nothing until it fires.** Unlike a software breakpoint (which rewrites
+  the target instruction to `0xCC`), a hardware watchpoint modifies no memory. The
+  game does not know it is being watched, and unmodified code paths run at full speed.
+
+### Why "accesses", not "writes"
+
+Cheat Engine offers both, and the wrong one produces a confident, useless answer.
+
+- **"Find out what *writes* to this address"** catches the *producer* — whatever
+  filled the buffer from the MSG archive. That code runs once, before the scene, and
+  tells us nothing about which of two copies the renderer prefers.
+- **"Find out what *accesses* this address"** catches reads too, and the renderer is a
+  reader. It is the only one of the two that answers our actual question.
+
+This distinction is the payoff of Chapter 60's finding that the renderer reads the
+buffer **in place** — there is no `memcpy` into a render-side scratch buffer to
+intercept. In-place reading is why the write works at all, and it is also why a read
+watchpoint is the correct instrument.
+
+### Reading the results
+
+The access list will not be one entry. Expect noise, and expect it to be
+distinguishable by *frequency*:
+
+| Pattern | What it usually is | Useful? |
+|---|---|---|
+| Thousands of hits/sec, `movzx` byte loops | `strlen`, `memcpy`, CRT internals | No |
+| A handful per frame, `[rcx+rdx*1+0x20]`-style | Layout / glyph iteration | **Yes** |
+| One or two hits *only when the line advances* | The dispatch that binds a slot | **Best** |
+
+The last row is the prize. An instruction that fires exactly once per line advance is
+reading the slot *as a choice* — which means the register arithmetic in that
+instruction contains the index we have been unable to compute.
+
+`[rcx+rdx*1+0x20]` is not decoration; it is the answer written out. `rcx` is the pool
+base, `0x20` is the header, and `rdx` is the slot index we have been brute-forcing
+across all 36 slots. Hook that instruction and `rdx` hands us the live slot for free.
+
+### Why the module + offset matters more than the address
+
+Cheat Engine will report something like `P5R.exe+1A3F2C`. The absolute address is
+worthless across runs — ASLR rebases the module every launch. The *offset* is stable
+for a given build, and that is exactly what `Reloaded.Memory.SigScan` consumes: we
+turn the bytes at that offset into a signature, scan for it at load, and hook the
+result. The address is a fact about today; the offset is a fact about the binary.
+
+### What this buys, concretely
+
+All three symptoms collapse at once:
+
+- Duplicated rows: gone, because we write one slot instead of 36.
+- Ranking instability: gone, because we stop ranking. The instruction tells us the
+  base.
+- Blast radius: gone. A single-slot write cannot arm a data table by accident, so the
+  crash class from Chapter 63 stops being reachable.
+
+And the scene-script capture gets sharper too: instead of the whole pool deduped down
+to 12 lines, we get the actual preceding line, in order.
+
+### The general lesson
+
+When you are scoring candidates to guess which one a system uses, check first whether
+the system will simply tell you. Runtime has information static inspection does not,
+and a watchpoint, a `LD_PRELOAD` shim, an `strace`, or an access log are all the same
+move: stop modelling the consumer and go observe it. Heuristics are what you build
+when observation is impossible — not before you have tried.
