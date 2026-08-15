@@ -3102,6 +3102,11 @@ public class Mod : IModV1
             }
 
             record.State = RecordState.InFlight;
+
+            // Logged at issue, not only on arrival. Without both timestamps a slow line
+            // is indistinguishable from a line that was never asked for, and a 19-second
+            // gap between arming and the first result could have been either.
+            _modLog!.Info($"[PREGEN] #{record.Index} requested (cap={record.Capacity})");
             RequestForRecord(snap, record);
             return;   // one per tick
         }
