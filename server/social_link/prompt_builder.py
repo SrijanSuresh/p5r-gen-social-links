@@ -68,9 +68,9 @@ Relationship tier ({rank}/10): {tier_note}
 
 Rules:
 - Respond as {name} in ONE short sentence of in-character dialogue only.
-- Keep it under {max_chars} characters, about {max_words} words. The speech bubble
-  is a fixed-size slot in the game's memory and anything past that is cut off
-  mid-thought, so a shorter line that finishes always beats a longer one that does not.
+- You will be given a length limit with each scene. The speech bubble is a
+  fixed-size slot in the game's memory and anything past it is cut off mid-thought,
+  so a shorter line that finishes always beats a longer one that does not.
 - Do NOT break character, reference that you are an AI, or use meta-commentary.
 - Do NOT start your response with the character's own name.
 - Match the emotional closeness appropriate for rank {rank}/10.
@@ -110,10 +110,24 @@ def build_prompt(
         profanity=PROFANITY_ALLOWED if confidant.swears else PROFANITY_FORBIDDEN,
         rank=rank,
         tier_note=_tier_note(rank),
-        max_chars=max_chars,
-        # Roughly five characters per word including the space. Words are what the model
-        # can actually count; characters it can only estimate.
-        max_words=max(3, max_chars // 5),
     )
-    user = f"[Scene context: {context}]\n{confidant.name}:"
+
+    # The length limit lives in the user half, and that placement is a throughput
+    # decision rather than a stylistic one.
+    #
+    # llama-server reuses the KV cache for the longest identical prefix between requests,
+    # and the system prompt is that prefix — byte-identical for every line of a hang-out,
+    # unless a per-record number is baked into it. With max_chars in the rules, every
+    # request differed from its first token, nothing was reusable, and generation went
+    # from ~1.5s to ~3.5s once the prompt grew a voice section and four lines of history.
+    # Moving one number to the tail restores the entire prefix.
+    #
+    # Roughly five characters per word including the space. Words are what the model can
+    # actually count; characters it can only estimate.
+    max_words = max(3, max_chars // 5)
+    user = (
+        f"[Scene context: {context}]\n"
+        f"[Hard limit: {max_chars} characters, about {max_words} words.]\n"
+        f"{confidant.name}:"
+    )
     return system, user

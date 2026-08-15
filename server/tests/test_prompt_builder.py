@@ -85,33 +85,54 @@ def test_all_confidants_build_prompt_without_error() -> None:
 # ones — "You're finally here, I've been" reached the screen with the rest cut off.
 
 
-def test_budget_appears_in_the_system_prompt() -> None:
-    system, _ = build_prompt(8, 4, "at the gym", max_chars=30)
-    assert "30 characters" in system
+def test_budget_appears_in_the_user_prompt() -> None:
+    _, user = build_prompt(8, 4, "at the gym", max_chars=30)
+    assert "30 characters" in user
 
 
 def test_budget_is_also_given_in_words() -> None:
     """Models count words far more reliably than characters."""
-    system, _ = build_prompt(8, 4, "at the gym", max_chars=50)
-    assert "10 words" in system
+    _, user = build_prompt(8, 4, "at the gym", max_chars=50)
+    assert "10 words" in user
 
 
 def test_word_budget_never_drops_below_three() -> None:
     """A tiny record must still ask for a sentence, not for one word."""
-    system, _ = build_prompt(8, 4, "at the gym", max_chars=8)
-    assert "3 words" in system
+    _, user = build_prompt(8, 4, "at the gym", max_chars=8)
+    assert "3 words" in user
 
 
 def test_two_records_of_different_size_get_different_budgets() -> None:
-    narrow, _ = build_prompt(8, 4, "at the gym", max_chars=30)
-    wide,   _ = build_prompt(8, 4, "at the gym", max_chars=75)
+    _, narrow = build_prompt(8, 4, "at the gym", max_chars=30)
+    _, wide   = build_prompt(8, 4, "at the gym", max_chars=75)
     assert narrow != wide
+
+
+def test_the_system_prompt_does_not_vary_with_the_budget() -> None:
+    """
+    The point of moving the limit out of the system prompt.
+
+    llama-server reuses the KV cache for the longest identical prefix between requests,
+    and the system prompt is that prefix. Baking a per-record number into it made every
+    request differ from the first token, so nothing was reusable and generation slowed
+    from ~1.5s to ~3.5s once the prompt grew a voice section and four lines of history.
+    """
+    narrow, _ = build_prompt(8, 4, "at the gym", max_chars=30)
+    wide,   _ = build_prompt(8, 4, "at the gym", max_chars=98)
+    assert narrow == wide
+
+
+def test_the_system_prompt_is_stable_across_scenes() -> None:
+    """Only the user half may change within one hang-out, or the cache is worthless."""
+    a, _ = build_prompt(8, 4, "at the gym", max_chars=40)
+    b, _ = build_prompt(8, 4, "somewhere else entirely", max_chars=60)
+    assert a == b
 
 
 def test_default_budget_is_used_when_none_given() -> None:
     """Callers with no record in hand must still get a usable prompt."""
-    system, _ = build_prompt(8, 4, "at the gym")
-    assert "characters" in system
+    _, user = build_prompt(8, 4, "at the gym")
+    assert "characters" in user
 
 
 # --- replacing a specific line ------------------------------------------------

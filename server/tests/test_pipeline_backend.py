@@ -136,4 +136,6 @@ def test_budget_reaches_the_prompt_not_only_the_clip() -> None:
 
     backend = _CapturingBackend(reply="Yo.")
     InferencePipeline(backend, ModelConfig()).generate(8, 4, "gym", max_chars=30)
-    assert "30 characters" in backend.messages[0]["content"]
+    # The user half, not the system half: the system prompt is the cache prefix and has
+    # to stay identical between requests.
+    assert "30 characters" in backend.messages[1]["content"]
