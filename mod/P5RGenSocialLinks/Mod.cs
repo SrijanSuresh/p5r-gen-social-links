@@ -3536,10 +3536,24 @@ public class Mod : IModV1
                 if (textOff < offset) continue;
                 if (textOff - offset > HeaderWindow) break;   // ordered; no closer match ahead
 
-                // Never move backwards. The backlog re-reads earlier records while the
-                // player scrolls it, and treating that as progress would rewind the write
-                // target onto lines already spoken.
-                if (i + 1 > _poolNextRecord[r]) _poolNextRecord[r] = i + 1;
+                // Never move backwards, and never leap forwards.
+                //
+                // Backwards is the backlog: scrolling it re-reads earlier records, and
+                // treating that as progress would rewind the write target onto lines
+                // already spoken.
+                //
+                // Forwards needs a limit too, which a 36-slot gym pool never revealed. A
+                // Takemi scene armed a 109-slot region holding several scenes, the game
+                // read it out of order, and one stray read three seconds in put the cursor
+                // at record 63 of 64 — every subsequent line was discarded as "behind the
+                // player" and the scene generated nothing at all.
+                //
+                // Reading advances one record at a time. A jump of sixty is not a player,
+                // it is a different part of the pool being touched for its own reasons.
+                const int MaxCursorJump = 8;
+                int next = i + 1;
+                if (next > _poolNextRecord[r] && next - _poolNextRecord[r] <= MaxCursorJump)
+                    _poolNextRecord[r] = next;
 
                 // Freeze it. Once the interpreter has read a record the player has seen
                 // it, and rewriting it is the bug they described as the text switching.
