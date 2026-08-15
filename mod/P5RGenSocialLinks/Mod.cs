@@ -2761,6 +2761,18 @@ public class Mod : IModV1
         const int MaxLogged = 6;
         int logged = 0, suppressed = 0;
 
+        // Outside a hang-out none of this is useful: no pool to arm, no plan to advance,
+        // no twin worth learning. The interpreter is busiest exactly then — the title
+        // screen, save loading and menus push far more text than a conversation does — and
+        // previewing every record through ReadProcessMemory and logging it was enough to
+        // be felt as stutter during boot. Draining without inspecting keeps the sampler's
+        // queue from filling while costing nothing.
+        if (!_sessionActive)
+        {
+            _msgWatch.DrainSeen();
+            return;
+        }
+
         foreach ((nuint record, int cursor) in _msgWatch.DrainSeen())
         {
             if (record == _lastWatchedRecord) continue;
