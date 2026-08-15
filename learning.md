@@ -4814,3 +4814,938 @@ When output is generically correct but contextually hollow, the question is not 
 model or which sampling parameters. It is what the model was given. Trace the inputs
 before touching the generation, and check specifically whether the thing you need is
 being thrown away somewhere upstream — most often by the very step that needed it.
+
+---
+
+## Chapter 65: Ask the Consumer, Not the Heap
+
+### What is still wrong
+
+The pipeline works end to end. A generated line reaches the speech bubble. But three
+symptoms survived, and they are all the same bug wearing different clothes:
+
+1. **Both rows of the bubble show the same line.** We write all 36 slots in the region,
+   because we do not know which one is live.
+2. **The ranking picks a different buffer between sessions.** One run rendered from
+   `0x421167C000` (266 KB); the next from `0x41EF589000` (1 MB). Same scene, same
+   build.
+3. **The twin arming fired in one run and not the other.** Content matching found a
+   second copy once, and once did not need to.
+
+Every one of these traces to the same root: *we are inferring which bytes the renderer
+reads by scoring how much they look like dialogue.* Similarity is a heuristic. It
+ranked `ternTableOffset: -1` above the live scene once, and that crashed the game.
+
+### The inversion
+
+There is a source of truth we have not asked. The renderer *knows* which address it
+reads — it reads it, every frame, with a specific instruction at a specific offset in
+a specific module. We have been guessing the answer to a question the CPU can be made
+to answer exactly.
+
+That is the whole idea behind "Find out what accesses this address":
+
+```
+guessing:  scan heap → score regions → rank → hope #0 is the live one
+asking:    pick the address that is on screen → break on reads → read the instruction
+```
+
+The second one cannot be wrong about which buffer matters, because the evidence *is*
+the read.
+
+### How the CPU does this
+
+x86-64 has four debug address registers, `DR0`–`DR3`, plus a control register `DR7`.
+Each `DRn` holds a linear address; `DR7` says, per slot, what access triggers a fault
+and over what width (1, 2, 4, or 8 bytes):
+
+```
+DR0 = 0x421167C0A0      ← the address of the line in the bubble
+DR7 = ...R/W bits: 11   ← 11 = break on read or write, 01 = write only
+      ...LEN bits: 11   ← 8 bytes wide
+```
+
+When the CPU executes an instruction that touches that range, it raises `#DB`, and the
+debugger — Cheat Engine, here — records `RIP`, the register file, and moves on.
+
+Two consequences fall directly out of that mechanism:
+
+- **There are exactly four.** Hardware breakpoints are a fixed CPU resource, not a
+  software list. Watch a fifth address and something must be evicted.
+- **It costs nothing until it fires.** Unlike a software breakpoint (which rewrites
+  the target instruction to `0xCC`), a hardware watchpoint modifies no memory. The
+  game does not know it is being watched, and unmodified code paths run at full speed.
+
+### Why "accesses", not "writes"
+
+Cheat Engine offers both, and the wrong one produces a confident, useless answer.
+
+- **"Find out what *writes* to this address"** catches the *producer* — whatever
+  filled the buffer from the MSG archive. That code runs once, before the scene, and
+  tells us nothing about which of two copies the renderer prefers.
+- **"Find out what *accesses* this address"** catches reads too, and the renderer is a
+  reader. It is the only one of the two that answers our actual question.
+
+This distinction is the payoff of Chapter 60's finding that the renderer reads the
+buffer **in place** — there is no `memcpy` into a render-side scratch buffer to
+intercept. In-place reading is why the write works at all, and it is also why a read
+watchpoint is the correct instrument.
+
+### Reading the results
+
+The access list will not be one entry. Expect noise, and expect it to be
+distinguishable by *frequency*:
+
+| Pattern | What it usually is | Useful? |
+|---|---|---|
+| Thousands of hits/sec, `movzx` byte loops | `strlen`, `memcpy`, CRT internals | No |
+| A handful per frame, `[rcx+rdx*1+0x20]`-style | Layout / glyph iteration | **Yes** |
+| One or two hits *only when the line advances* | The dispatch that binds a slot | **Best** |
+
+The last row is the prize. An instruction that fires exactly once per line advance is
+reading the slot *as a choice* — which means the register arithmetic in that
+instruction contains the index we have been unable to compute.
+
+`[rcx+rdx*1+0x20]` is not decoration; it is the answer written out. `rcx` is the pool
+base, `0x20` is the header, and `rdx` is the slot index we have been brute-forcing
+across all 36 slots. Hook that instruction and `rdx` hands us the live slot for free.
+
+### Why the module + offset matters more than the address
+
+Cheat Engine will report something like `P5R.exe+1A3F2C`. The absolute address is
+worthless across runs — ASLR rebases the module every launch. The *offset* is stable
+for a given build, and that is exactly what `Reloaded.Memory.SigScan` consumes: we
+turn the bytes at that offset into a signature, scan for it at load, and hook the
+result. The address is a fact about today; the offset is a fact about the binary.
+
+### What this buys, concretely
+
+All three symptoms collapse at once:
+
+- Duplicated rows: gone, because we write one slot instead of 36.
+- Ranking instability: gone, because we stop ranking. The instruction tells us the
+  base.
+- Blast radius: gone. A single-slot write cannot arm a data table by accident, so the
+  crash class from Chapter 63 stops being reachable.
+
+And the scene-script capture gets sharper too: instead of the whole pool deduped down
+to 12 lines, we get the actual preceding line, in order.
+
+### The general lesson
+
+When you are scoring candidates to guess which one a system uses, check first whether
+the system will simply tell you. Runtime has information static inspection does not,
+and a watchpoint, a `LD_PRELOAD` shim, an `strace`, or an access log are all the same
+move: stop modelling the consumer and go observe it. Heuristics are what you build
+when observation is impossible — not before you have tried.
+
+---
+
+## Chapter 66: The Buffer Was a Format, Not a Pile
+
+### What a hex dump showed that a scanner could not
+
+Every conclusion so far about the dialogue pool came from an ASCII scanner: walk the
+bytes, collect printable runs of 8+ characters, score them for English. That tool
+answers exactly one question — *where is text?* — and it silently discards everything
+that is not text. Which turned out to be the part that mattered.
+
+Opening the same region in a hex viewer:
+
+```
+424F054547  54 68 65 20 65 71 ... 62 75 74 0A 74 68 65 79   "The equipment's kinda crappy,but they got"
+424F054577  ... 74 79 2E 0A F2 23 00 00 00 F1 21 F2 05 FF   "ty.  #.. ! ..."
+424F0545D7  ... 4D 53 47 5F 30 30 31 5F 35 5F 30 00         "...MSG_001_5_0."
+424F054637  ... 49 74 27 73 20 70 61 79 ...                 "It's pay per visit, so you don'"
+424F054757  ... 4D 53 47 5F 30 30 32 5F 30 5F 30 00         "...MSG_002_0_0."
+424F0547E7  ... 53 45 4C 20 30 30 33 ...                    ".SEL 003"
+```
+
+This is not a heap of loose strings. It is Atlus's BMD message archive, decompressed,
+**with its symbol table intact**.
+
+### Three corrections, in increasing order of consequence
+
+**The separator is `0x0A`, not `0x00`.** Consecutive "slots" sat one byte apart, and I
+read that byte as a null terminator without checking it. It is a newline:
+
+```
+62 75 74 0A 74 68 65 79
+b  u  t  \n t  h  e  y
+```
+
+So `"The equipment's kinda crappy, but"` and `"they got tons of variety."` were never
+two strings. They are **one string with a line break** — the two rows of a single
+speech bubble. The scanner split on non-printable bytes and manufactured a boundary
+that does not exist in the data.
+
+That single byte explains a bug we had filed as unsolved: *both rows of the bubble
+show the same generated line.* Of course they do. We treat the halves as independent
+slots and write the same text into each. The fix is not per-slot targeting — it is to
+stop splitting, and write one string containing its own `\n`.
+
+**Each line is stored more than once.** The same three lines appear in two blocks, with
+different wording:
+
+```
+0x424F0544D0   "It's pay per visit though, so you don't ..."
+0x424F054637   "It's pay per visit, so you don't ..."        ← on screen
+```
+
+The heuristic scanner reported both as excellent dialogue, because both *are* excellent
+dialogue. Nothing in a similarity score can distinguish the take the game rendered from
+the take it did not. This is why the first watchpoint recorded zero accesses: it was
+armed on prose the renderer never reads.
+
+**The archive knows its own names.** `MSG_001_5_0`, `MSG_002_0_0`, `SEL 003` are
+labels, not text. The mod already logs `msgId=0x2C7 (711)` from the BF hook, and it has
+been carrying that number around with no way to spend it. A label table is exactly the
+thing an ID indexes into.
+
+### The shape of the mistake
+
+The scanner was written to answer *"is this English?"* and it answered well. The bug
+was mistaking an answer for **the** answer. `0x0A` is not English, so it was invisible;
+`F1 21 F2 05` is not English, so it was invisible; `MSG_002_0_0` failed the vowel test,
+so it was invisible. Every structural fact about the format lived precisely in the
+bytes the filter was designed to drop.
+
+The general form: a filter tuned to find signal will, by construction, hide the frame
+the signal sits in. When a heuristic keeps *almost* working — right region, wrong copy;
+right text, wrong boundaries — that is the signature of a format being read as a pile.
+Stop refining the score and go look at the raw bytes.
+
+### Where this leads
+
+Ranking regions by how much they look like dialogue was always a stand-in for parsing.
+With labels and control codes visible, the real path opens:
+
+```
+msgId (already have)  →  label table  →  message block  →  text + its \n
+```
+
+That is deterministic. No scores, no anchor, no twin, no 36-slot blast radius — and
+the blast radius is where the crash lived. The watchpoint hunt is still worth
+finishing, because the renderer's own read is the fastest confirmation that a block is
+live. But the destination changed: from *guess better* to *read the format*.
+
+---
+
+## Chapter 67: A Signature Is a Claim About the Whole Binary
+
+### What a debugger actually told us
+
+Cheat Engine reported an instruction at `P5R.exe+17A3D27` that reads the message being
+rendered. Turning that into something the mod can use at runtime means writing down the
+bytes around it:
+
+```
+48 63 53 30    movsxd rdx, dword ptr [rbx+30]
+48 8B 43 20    mov    rax, [rbx+20]
+0F B6 3C 02    movzx  edi, byte ptr [rdx+rax]
+85 FF          test   edi, edi
+0F 85          jne    <loop>
+```
+
+The reason this indirection exists at all is ASLR. `0x1417A3D27` was true for one
+launch and will be false for the next: Windows rebases the image every time, so the
+only durable fact is the *offset*, and the only way to recover an offset without a
+symbol table is to search for the bytes.
+
+### The sample-of-one problem
+
+Here is the trap. `Scanner.FindPattern` returns `PatternScanResult`, which has `Found`
+and `Offset` — and nothing else. It stops at the first hit. So a pattern occurring twice
+is indistinguishable at runtime from a pattern occurring once: both resolve, both look
+successful, and one of them hooks an instruction you have never seen.
+
+Worse, the failure is quiet and late. The scan succeeds at load. The hook activates. The
+log says `sig OK`. The wrongness only shows up as garbage data much later, in a code
+path with no obvious link to a scan that happened at startup.
+
+A signature is not "bytes that match my target". It is a claim that **no other point in
+386 MB of image matches**. Nothing at runtime checks that claim, so it has to be checked
+somewhere else.
+
+### Checking it offline
+
+`scripts/verify-signature.py` reads the PE from disk and counts every occurrence:
+
+```
+occurrences  1
+  file 0x17A331F -> p5r.exe+17A3D1F  (section .sdata)
+```
+
+One hit. And run against the older `CmmExecEvent` pattern it independently reproduces
+`p5r.exe+E0D0B0`, which matches the `0x140E0D0B0` recorded in that signature's comment
+from a Ghidra session months ago — the tool validated against a known answer before
+being trusted on an unknown one.
+
+Two details in that output are worth reading carefully. `p5r.exe+17A3D1F` is the RVA, not
+the file offset (`0x17A331F`) — sections are laid out differently on disk than in memory,
+so the two differ by the section's own delta, and comparing the wrong one against a
+disassembler produces a confident mismatch. And `.sdata` holding executable code is odd
+enough to notice; what matters for us is that the bytes are present in the file rather
+than produced at runtime by a packer, which the successful match proves.
+
+### What to wildcard, and what not to
+
+The usual advice is to wildcard anything that might shift between builds: RIP-relative
+displacements, jump targets, compiler-chosen stack slots. That is right, but it is only
+half a rule, because every wildcard also widens the match.
+
+Here nothing is wildcarded except by omission — the pattern stops at the `0F 85` opcode
+and excludes the jump displacement that follows. The struct offsets `0x20` and `0x30`
+are deliberately literal, and that is the important decision:
+
+```
+48 8B 43 20    mov rax, [rbx+0x20]     <- 0x20 is the record pointer field
+48 63 53 30    movsxd rdx, [rbx+0x30]  <- 0x30 is the cursor field
+```
+
+Those two bytes are not incidental encoding, they are *the thing we learned*. If a game
+update moves the record pointer to `+0x28`, a wildcarded pattern still matches — and the
+mod then reads a neighbouring field and dereferences whatever it finds. A literal
+pattern fails the scan loudly instead, and the mod falls back to the heuristic it
+already has.
+
+So: wildcard what you do not care about, and pin what you are relying on. A signature
+that cannot fail is not robust, it is just silent.
+
+### Separating resolution from hooking
+
+The scan and the hook land as two commits, not one, and the first logs an address
+without touching it. This is not tidiness — it is that each attempt costs a game
+restart, a load, and walking back to a hang-out. When "sig OK" and "hook active" appear
+together and the game then misbehaves, you have two suspects and one expensive
+experiment. Split, and the first run answers "did the pattern survive this build?"
+before the second run asks anything harder.
+
+---
+
+## Chapter 68: Six Instructions in Somebody Else's Loop
+
+### The budget
+
+The hook goes here:
+
+```
+P5R.exe+17A3D1F   movsxd rdx, dword ptr [rbx+30]
+P5R.exe+17A3D23   mov    rax, [rbx+20]
+P5R.exe+17A3D27   movzx  edi, byte ptr [rdx+rax]   <- our stub runs just before this
+P5R.exe+17A3D2B   test   edi, edi
+P5R.exe+17A3D2D   jne    P5R.exe+17A367B
+```
+
+RAX holds the record pointer and RDX the cursor, so all we need is to copy two registers
+somewhere we can read them from C#:
+
+```asm
+push rcx
+mov  rcx, <slab>
+mov  [rcx],   rax
+mov  [rcx+8], rdx
+pop  rcx
+```
+
+Five instructions. Everything interesting about this step is a constraint on what those
+five are allowed to do.
+
+### Constraint 1: registers are borrowed, not owned
+
+We need a scratch register to hold the destination address, because x86-64 has no
+`mov [imm64], r64` — only RAX gets that privilege, and RAX is exactly what we are trying
+to save. So RCX gets pushed and popped.
+
+The instinct to grab "a register that looks free" is how these hooks go wrong. There is
+no free register. The function is mid-computation; every register belongs to the caller's
+plan. Push and pop is not defensive style, it is the only correct move.
+
+### Constraint 2: flags are a register too, and the loop reads them
+
+Look at what runs immediately after our stub returns control:
+
+```
+test edi, edi
+jne  <loop top>
+```
+
+`TEST` sets the flags and `JNE` consumes them. If the stub disturbed the flags register
+between the two, we would be steering the interpreter's control flow — not corrupting
+data, but rewriting the program's branches, which fails in a way no memory dump explains.
+
+The chosen five instructions do not touch flags: `PUSH`, `POP`, and `MOV` all leave them
+alone. That is not a happy accident, it is why the stub uses `mov` and not, say, `xor
+rcx, rcx` to zero a register, or `add` to compute an offset. In injected code, the flags
+register is part of the calling convention whether the ABI says so or not.
+
+### Constraint 3: this is a per-character loop
+
+The stub runs once for every byte of every message the game displays. That immediately
+rules out the obvious design — log from inside the hook — because a managed callback,
+a string format, and a file write would run tens of thousands of times a second inside a
+render path.
+
+So the split is: the stub writes two words to a fixed address and does nothing else, and
+a 500 ms poll tick reads that address and reports changes. The stub has no idea anyone is
+watching.
+
+The honest cost of sampling is that short-lived records are missed. For verification that
+is acceptable — what needs proving is that the pointer is real, in the heap, and changes
+line to line. It would be the wrong mechanism for driving writes, which have to key off
+the record changing, not off a timer.
+
+### Constraint 4: the slab outlives everything
+
+The destination address is an immediate operand baked into machine code:
+
+```asm
+mov rcx, 0x1F4A2C60      ; not a variable — a constant inside the instruction stream
+```
+
+Two things follow. It cannot be a managed array, even pinned, because the address has to
+stay valid for as long as the code exists rather than as long as a handle does — so it is
+`Marshal.AllocHGlobal`.
+
+And it must never be freed. `Dispose` disables the hook, which restores the original
+bytes, but restoring bytes does not evict threads already executing inside the stub.
+Freeing the slab there would trade 16 bytes for a write through a dangling pointer at
+process shutdown. The leak is the correct choice, and worth a comment saying so, because
+it will otherwise look like a bug to the next reader.
+
+### Where the risk actually is
+
+Everything above is reasoned, not tested; the first honest test is the game launching.
+That is why the hook is behind `msg_hook_enabled` with a default that can be turned off
+without a rebuild, and why installation is wrapped so an assembler failure degrades to
+the heap heuristic instead of aborting mod startup.
+
+A broad `catch` around exactly one call, with a written reason, is the right shape here:
+the assembler is third-party, its failure type is not part of the interface we reference,
+and every path downstream still works without the watch. Broad catches are bad when they
+hide failures you could have handled. This one converts an unknown failure into a named,
+logged degradation.
+
+---
+
+## Chapter 69: The Hook Answers, and the Answers Rewrite the Model
+
+### What one log run replaced
+
+Eleven lines of a gym scene, each one caught at the moment the game read it:
+
+```
+[WATCH] in-pool   record=0x424CAC6BDC "Here we are... Protein Lovers gym!"
+[WATCH] in-pool   record=0x424CAC6E90 "It's pay per visit, so you don't gotta worry"
+[WATCH] in-pool   record=0x424CAC6F14 "The equipment's kinda crappy, but"
+...
+[WATCH] in-pool   record=0x424CAC74B8 "Anyways, let's head in."
+```
+
+Every one inside the region the heuristic armed, in the order they appeared on screen.
+Compare that to what the mod had before: a 1.4 GB heap scan producing a ranked list, an
+anchor whose address had been different in each of the last four runs of the same scene,
+and no way to tell a correct ranking from a lucky one.
+
+The point is not that the hook is faster. It is that the previous system could not be
+*checked*. `in-pool` versus `elsewhere` is the first line of output in this project's
+history that can falsify a claim about the dialogue buffer.
+
+### The twin was never a variant
+
+Each in-pool record arrived paired with one outside the pool, read within a millisecond:
+
+```
+0x424CAC6BDC - 0x42104BB2EC = 0x3C60B8F0    "Here we are..."
+0x424CAC6E90 - 0x42104BB5A0 = 0x3C60B8F0    "It's pay per visit..."
+0x424CAC7008 - 0x42104BB718 = 0x3C60B8F0    "Oh yeah! You bring..."
+0x424CAC70E8 - 0x42104BB7F8 = 0x3C60B8F0    "Nah, they'll lend..."
+0x424CAC74B8 - 0x42104BBBC8 = 0x3C60B8F0    "Anyways, let's head in."
+```
+
+A constant delta across every pair. The two regions are not two takes of the script and
+not two stages of a pipeline — they are parallel allocations with identical internal
+layout, where message *k* sits at the same offset in both.
+
+That retroactively explains an earlier fix. Arming the twin by matching sample text
+worked, and matching by rank never did, and the reason was structural: the copies are
+byte-identical, so content finds them and a similarity score has no reason to place them
+near each other. The fix was right for a reason we had not yet earned.
+
+### One byte, three bugs
+
+The oldest cosmetic complaint — both rows of the bubble showing the same sentence — came
+from a single misread byte:
+
+```
+0x4250B2FBC7 len=33  "The equipment's kinda crappy, but"
+0x4250B2FBE9 len=25  "they got tons of variety."
+```
+
+`0xFBC7 + 33 = 0xFBE8`, next run at `0xFBE9`. One byte between them, and it is `0x0A`.
+These were never two strings. They are one message with a line break, and the scanner
+manufactured the boundary by splitting on any non-printable byte.
+
+So the write was wrong at the level of *units*. It wrote the full generated line into
+fragment one, then the full generated line into fragment two, because it believed they
+were independent slots. They are rows of one bubble. Rows are not independent, so they
+cannot be written independently.
+
+Grouping is trivial once seen: consecutive runs one byte apart are one record; a genuine
+record boundary shows a gap of tens of bytes, because a header sits there. Then the
+generated line is word-wrapped *across* the fragment widths, and any fragment the text
+does not reach is blanked — a row of scripted dialogue under a row of generated dialogue
+is worse than a short line.
+
+### Checking a boundary without spending a restart
+
+There is no C# test project here, and every in-game verification costs a relaunch, a
+load, and a walk back to a hang-out. So the wrapping logic was mirrored in twenty lines
+of Python and run against the cases that actually break wrappers: exact fit, empty
+input, a word wider than its fragment, text far longer than all fragments combined.
+
+That is not a substitute for a test, and it does not live in CI. It is a way to spend
+thirty seconds instead of five minutes on the class of bug — off-by-one at a boundary —
+that is both the most likely and the least visible in a screenshot.
+
+### What is left
+
+The hook now reports the address of each line as it displays. It does not yet drive the
+write: generation still happens once at scene start and fills every record with the same
+sentence. Per-line generation is the next thing the hook makes possible, and it is a
+scheduling problem rather than a discovery one — which is a considerably better kind of
+problem to have.
+
+---
+
+## Chapter 70: Blast Radius Is a Scheduling Problem
+
+### The symptom, in the player's words
+
+The text log showed one generated sentence three times, at three different widths:
+
+```
+Ryuji   Your gym game's comin' along,
+        ain't ya?
+
+Ryuji   Your gym game's comin' along, ain't ya?
+
+Ryuji   Your gym game's comin' along,
+```
+
+The wrapping is correct — that is the previous chapter's fix working, one sentence
+flowing across two rows instead of the same sentence twice. What is wrong is that three
+*different messages* now hold the same text. The log says why:
+
+```
+[POOL] wrote 93 records across 2 regions <- "Your gym game's comin' along, ain't ya?"
+```
+
+Ninety-three records, one sentence. Every past and future line of the scene, overwritten
+with whatever was generated most recently.
+
+### Why it was ever written that way
+
+Not laziness — ignorance, of a specific and now-fixed kind. The mod could not tell which
+record the game would render, so it wrote all of them and let the renderer pick. That is
+a rational strategy when you cannot observe the consumer. It stops being rational the
+moment you can.
+
+But knowing *which* record is only half of it. The other half is *when*, and that
+question had never been asked. Timestamps answer it:
+
+```
+15:23:09.300  [MSG]   msgId=0x348                              dispatch
+15:23:10.883  [LLM]   "You still comin' here with me, then?"   +1.583s
+15:23:10.885  [POOL]  write                                    +0.002s
+15:23:12.299  [WATCH] record=0x421532EB82 rendered             +1.414s
+```
+
+Inference takes 1.6 seconds and the write lands 1.4 seconds before the renderer reads
+the bytes. There was never a race. The whole 93-record blast radius existed to cover a
+timing risk that measurement shows does not exist.
+
+That is the general shape worth keeping: **an over-broad write is often a scheduling
+question in disguise.** Before widening a fan-out to be safe, timestamp the actual
+sequence. "We write everything because we do not know which one" and "we write everything
+because we might be too late" are different problems, and only one of them was real here.
+
+### Which record is next
+
+Two facts from the log make the target unambiguous. Reads run monotonically upward
+through the region — `0x421532EB82` then `0x421532EC18` — so the record after the one
+just rendered is the next in address order. And the hook reports the record *base*, which
+sits a header ahead of the text, so matching is not containment but "the first record
+whose text begins at or just after this address".
+
+One subtlety costs a line if missed: the cursor advances **on render, not on write**. A
+write that never reaches the screen — the player skipped, the scene branched — must not
+consume a record, or the mod runs one line ahead of the game for the rest of the scene.
+And the cursor never moves backwards, because scrolling the backlog re-reads earlier
+records and that is not progress.
+
+### What one record buys
+
+Three problems close together, and they were never really three:
+
+- The text log stops repeating, because only the upcoming line is touched.
+- The blast radius becomes one record. The crash from Ch. 63 came from writing 211 slots
+  into a region containing a data table; a single-record write cannot reach one.
+- The write becomes cheap enough to do per line rather than once per scene, which is what
+  makes per-line *generation* the next step rather than a rewrite.
+
+The unifying point: precision about the target was worth more than any amount of care
+about the write itself. We had spent chapters making the write safer — bounds checks,
+word-boundary trimming, kill switches — while it was still aimed at ninety-three places
+at once.
+
+---
+
+## Chapter 71: Three Symptoms, Three Different Bugs
+
+A single play session produced three complaints — the text changed under the player, the
+generated lines stopped reaching the bubble, and the game hitched when the backlog
+opened. It is tempting to look for the one cause behind all three. There wasn't one.
+They shared a session, not a mechanism, and each needed its own fix.
+
+### Symptom 1: the sentence changed while it was on screen
+
+```
+15:34:32.729  [POOL] region 0 record 8/22   <- "You're really gonna start comin' here..."
+15:34:36.535  [POOL] region 0 record 8/22   <- "This gym's not bad for the price, though."
+15:34:39.098  [POOL] region 0 record 8/22   <- "Your gym skills are gettin' better, Joker!"
+```
+
+Same record, three times, four seconds apart. Whatever was displaying record 8 got
+rewritten twice under the player.
+
+The cause is a design decision from the previous chapter, and the reasoning behind it was
+sound: advance the write cursor **on render**, so that a line which never reaches the
+screen cannot leave the mod permanently one record ahead of the game. That protects
+against drift. What it does not do is stop the *next* write landing in the same place
+when no render happens in between.
+
+The fix is to treat both as floors. A record is spent when it is written, whether or not
+it is ever displayed; render observation still pushes the cursor forward when the game
+gets ahead. Progress has two sources and the cursor takes the larger.
+
+The general lesson: "advance on X" is rarely a complete rule. Ask what happens when X
+does not occur, because that is the branch the bug lives in.
+
+### Symptom 2: the bubble kept the original script
+
+```
+[POOL] 1 regions armed for write
+...
+15:34:42.469  [WATCH] elsewhere record=0x41DB1930C8  "Oh yeah! You bring your stuff?"
+15:34:42.470  [WATCH] in-pool   record=0x4209925338  "Oh yeah! You bring your stuff?"
+```
+
+Two copies of the line, read a millisecond apart, and only one of them inside an armed
+region. The write went to the copy the text log reads; the bubble read the other and
+showed the script.
+
+This is the twin problem, which we thought was solved by arming any region whose sample
+text matched the anchor's. It resolved in earlier runs and silently failed in this one —
+`1 regions armed`. Ranking never had a way to find the twin: the relationship between the
+two copies is a fixed address offset, not a similarity of score, and no amount of tuning
+a text-similarity metric will surface a fact the metric does not measure.
+
+The hook does measure it. Two consecutive distinct records with identical preview text
+are the pair, and their difference is the delta — `0x3C60B8F0` in one run, `0x2E67F270`
+in the next, constant within each. So the twin is now learned by observation and written
+by arithmetic.
+
+Arithmetic on an address is exactly where a bad assumption becomes a memory corruption,
+so the mirror write never trusts the delta alone. The original bytes are captured before
+the target is overwritten, and the mirror is written only if it still contains them, byte
+for byte. A wrong delta fails the comparison and writes nothing. This is the Ch. 64
+ordering constraint reappearing in a new place: the evidence you need is destroyed by the
+operation you are about to perform, so capture it first.
+
+### Symptom 3: the game hitched when the backlog opened
+
+The backlog re-reads every past line at once. That is not a bug — but each read produced
+a log line, and each log line opened the file, appended, and closed it.
+
+That per-line open was a deliberate earlier choice: a buffered writer loses its tail
+exactly when the process crashes, which is when the tail matters most. The reasoning was
+right and the conclusion was wrong, because `AutoFlush` on a held-open writer provides the
+same crash-safety without the syscall per line. The cost was invisible at a 500 ms tick
+and became a stutter under a burst.
+
+The log volume needed capping too, but note which fix goes where: the *processing* of
+every record still happens — cursor, twin delta — and only the *reporting* is limited to
+six per tick with a count of the rest. Throttling the work would have introduced a third
+bug to fix later.
+
+### Why they looked like one bug
+
+All three surfaced in the same minute, and two of them made the mod's output look wrong
+in the same way. The instinct to find a common root is usually right and was wrong here,
+and the thing that separated them was timestamped evidence: three writes to one record
+is a cursor problem, two addresses holding one line is a coverage problem, and a burst
+correlated with a keypress is a cost problem. Without the log they would have been one
+vague report of "it's glitchy", and any single fix would have left two of them live.
+
+---
+
+## Chapter 72: Generate Ahead, Because You Cannot Outrun a Button
+
+### The problem latency actually creates
+
+The pipeline today is reactive:
+
+```
+[MSG] dispatch  ->  generate (1.6-2.2s)  ->  write the next record  ->  player reads it
+```
+
+That works while the player reads at a human pace and falls apart the moment they do
+not. Hold fast-forward and the write lands after the line is drawn. Skip a scene and the
+record is consumed without ever being seen. Read slowly and nothing is wrong, which is
+the trap: the bug is invisible in exactly the conditions you test under.
+
+The instinct is to make generation faster. Two seconds is already good for an 8B model on
+a laptop GPU, and it will never beat a held button. Latency is not the problem; *waiting
+until the last moment to start* is.
+
+### What the hook changed about what is knowable
+
+Before the interpreter hook, reacting was the only option, because the buffer was
+discovered as it was used. That is no longer true. At arm time the mod holds:
+
+- every record in the scene, in order,
+- each record's exact capacity in characters,
+- each record's original scripted text.
+
+Nothing in that list requires the player to have reached the line. There is no reason to
+wait for a dispatch event to know what Ryuji says four lines from now — the script is
+already in memory, and so is the space his replacement has to fit into.
+
+So the design inverts. Instead of *an event triggering a generation*, a background
+scheduler keeps the next few records filled, and the player's arrival is merely when the
+work becomes visible:
+
+```
+arm  ->  plan all 22 records
+     ->  keep K ahead generating
+     ->  each result written seconds or minutes early
+     ->  player pacing stops mattering
+```
+
+### Why this does not preclude reacting to the player
+
+The obvious objection is that the end goal is the player typing something and Ryuji
+answering — which is reactive by definition, and cannot be pre-generated.
+
+Both fit, because the two cases are disjoint and the reactive one is where latency is
+free:
+
+| Case | Player input | Time available | Strategy |
+|---|---|---|---|
+| Ryuji monologue | none | ~0, they can hold FFWD | pre-generate |
+| Choice prompt (`SEL`) | menu navigation | 1-3s | reactive |
+| Typed line | typing a sentence | 5-15s | reactive |
+
+The player can only outrun inference when they are contributing nothing. The moment they
+contribute, they have spent seconds doing it. You cannot fast-forward through your own
+typing.
+
+And the two compose rather than compete, because the hook reports when a record has been
+*read*:
+
+```
+pre-generated line sits in record N            <- floor
+player types; reactive generation starts
+  arrives before N is reported rendered        -> overwrite
+  arrives after                                -> discard; the floor stands
+```
+
+That second branch is the "text changed under the player" bug from Ch. 71, restated as a
+rule: **a record is writable until the hook says it was read, and frozen afterwards.** The
+bug becomes the safety property.
+
+### The state a record needs
+
+Pre-generation means a record is no longer something written once at an event. It has a
+life cycle, and every transition matters:
+
+```
+Pending  -> InFlight -> Ready -> Written -> Rendered
+   ^                                          |
+   |                    (never goes backwards)|
+```
+
+`Ready` is separate from `Written` because generation completing and the bytes landing
+are different moments with different failure modes. `Rendered` is the freeze point. And
+the arrows only run one way — Ch. 71 was two bugs caused by a cursor that could be moved
+by the wrong event, so this one advances on explicit transitions and never recomputes
+itself from a timer.
+
+### The cost of being early
+
+Pre-generation buys pacing-independence and gives up immediacy: a line written four lines
+ahead cannot respond to what happened three lines ago. For scripted monologue that costs
+almost nothing, because the model is working from the scene script either way. It would
+cost a great deal for a reply to player input — which is precisely the case that stays
+reactive.
+
+Being early is not free, and it is worth naming the trade rather than discovering it
+later as a vague sense that the dialogue feels less connected.
+
+---
+
+## Chapter 73: Deleting the Search
+
+### What the scan cost
+
+```
+15:33:54  Hang-out begins
+15:34:27  [POOL] scanned 4030 regions, 1433 MB, 18 scored
+15:34:27  [POOL] ARM #0 (anchor) 0x42098F1000
+```
+
+Thirty-three seconds, 1.4 GB walked, to end up with a ranked list whose top entry was
+right most of the time. During those thirty-three seconds the scene was playing and
+nothing could be written, so the opening lines were always the scripted ones. That was
+never a bug report, because it looks exactly like "the mod warming up".
+
+The scan also could not start until a message had been dispatched, since that was the
+only signal that a conversation existed. So the latency was structural: discover late,
+then discover slowly.
+
+### The replacement is one call
+
+```csharp
+(bool ok, nuint regionBase, nuint regionSize, uint state, uint _) =
+    MemoryGuard.QueryRegion(record);
+```
+
+`VirtualQuery` on an address the interpreter just read. Microseconds, and exact rather
+than ranked, because the address came from the game reading it.
+
+The interesting part is not the speed. It is that the question changed. The scan asked
+*"which of 4030 regions looks most like dialogue?"* — a search, answered with a
+similarity heuristic that had to be tuned, budgeted, and periodically re-explained when
+it picked a data table. The hook asks *"what region is this address in?"* — a lookup,
+answered by the operating system.
+
+Searching for a thing you can be handed is the expensive kind of mistake, because it
+does not feel like a mistake. It feels like engineering: there is a scoring function to
+improve, a budget to tune, a ranking to inspect. All of that work was real and none of
+it was necessary once something else in the system knew the answer.
+
+### Validation is not the same as searching
+
+Removing the search does not remove the need to be careful. The interpreter serves every
+string in the game — menu labels, item names, the newspaper — so the first record it
+reads is not necessarily dialogue. Four gates remain:
+
+- an active hang-out,
+- a preview at least twelve characters long, because a scene line is a sentence,
+- a committed, writable region of plausible size,
+- at least six text runs inside it.
+
+That looks like the old heuristic and is doing something different. The scan used
+scoring to *choose among thousands of candidates*; this uses thresholds to *reject one
+candidate the game pointed at*. The first needs to be right about relative ranking across
+a huge space and is fragile in proportion. The second only has to notice that a menu is
+not a conversation.
+
+### Keeping the corpse warm
+
+The scan is switched off, not deleted, for one release. The hook path has been exercised
+on exactly one scene, and a slow, occasionally-wrong pool beats no pool at all in a scene
+it turns out to miss.
+
+That is a real judgement rather than sentiment, and it comes with an expiry: it goes when
+the hook has been through a few more scenes. Dead code kept "just in case" with no
+condition for removal is how a codebase accumulates two ways of doing everything, and the
+second way rots until the day someone needs it.
+
+---
+
+## Chapter 74: A Session Is Not a Scene
+
+### The wrong pool, armed confidently
+
+The hook-driven arming worked exactly as designed and produced a completely wrong result:
+
+```
+16:51:43  [ARM] 0x41DBE73000 len=552960 slots=402
+16:51:43  [PLAN] 207 records
+16:51:43  [PLAN]   #0 "Just believe in yourself, dude!"
+...
+16:51:57  [TWIN] ... 0x4250C8B13C "Here we are... Protein Lovers gym!"
+```
+
+The armed pool is the street conversation that opens the hang-out. The gym pool appears
+fourteen seconds later and is never armed, because arming had already happened.
+
+The bug is a modelling error, not a coding one. `_sessionActive` was treated as the unit
+of work — one hang-out, one pool, arm once — and a hang-out turns out to contain several
+scenes, each with its own pool. Every assumption downstream inherited it: the plan, the
+cursor, the whole generation queue, all bound to a buffer the player had walked away from.
+
+The fix is to stop asking "have we armed yet" and start asking "is the game still reading
+from what we armed". Reads landing outside the armed region are the scene change
+announcing itself. Two in a row, because one stray read is a menu or a name plate while a
+genuinely moved scene keeps reading from its new pool.
+
+One subtlety makes or breaks that rule: the twin copy is always outside the armed region,
+so without excluding it explicitly the pool and its copy take turns evicting each other
+for the length of the scene. A re-arm trigger has to know which "outside" reads do not
+count.
+
+### Two regions were never copies
+
+```
+[POOL] region 0 record 0/207
+[POOL] region 1 record 0/180
+```
+
+Arming two regions and writing the same record index into both assumed they held the same
+script. 207 records against 180 says otherwise — two unrelated pools, where index N names
+a different line in each.
+
+What makes this worth recording is that the correct mechanism was already present and
+working. `MirrorToTwin` locates the copy at a learned offset and verifies byte-for-byte
+before writing. The second armed region was a second, weaker answer to a question that
+already had a good one, kept because it had been written first.
+
+Two mechanisms for one job is not redundancy. The weaker one runs too, and its failures
+are attributed to the system rather than to itself.
+
+### Late answers land in the past
+
+```
+[PREGEN] #0 written, -32 ahead of the player
+```
+
+The request went out with the cursor at 0. The player advanced thirty-two records during
+the round trip. The answer arrived and overwrote a line spoken half a minute earlier.
+
+There was already a guard for this — records freeze once the interpreter reports reading
+them. It did not fire, because the interpreter only reports what it actually read, and a
+scene moved through quickly leaves gaps nobody looked at. The freeze is a record of
+observation, not a claim about everything behind the cursor.
+
+So the write path needs its own floor: never write behind the cursor, regardless of what
+was observed. Two guards for one hazard is fine when they fail differently — unlike two
+mechanisms for one job, which is the previous section's problem.
+
+### The pattern across all three
+
+Each of these is the same shape: a rule that was true when written and quietly stopped
+being true.
+
+- "One session, one pool" was true while every test was a single scene.
+- "The armed regions are copies" was true for the run where content matching found a
+  genuine twin.
+- "Freezing on render covers everything behind the player" was true while the player read
+  every line.
+
+None of them failed loudly. They produced confident, well-logged, wrong behaviour — which
+is the argument for logging the *reasoning* and not only the outcome. `record 0/207`
+against `record 0/180` is the entire second bug, visible in one line, and only because
+the log prints the denominator.

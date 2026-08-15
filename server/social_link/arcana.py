@@ -33,24 +33,53 @@ class Confidant:
     # the Phantom Thieves is never wrong, while one who speaks up at the wrong time is.
     knows_identity: bool = False
 
+    # How this character actually talks: rhythm, filler, address terms, verbal tics.
+    #
+    # personality_blurb says who someone is; this says how they sound, and the model needs
+    # both. Given only "loud, loyal, hot-headed best friend", it produced "Guess I'm cool
+    # with paying for the session if that's what keeps this place running." — accurate to
+    # the description and completely wrong for the character.
+    speech_style: str = ""
+
+    # Whether this character swears in the localisation. Ryuji does, constantly; Makoto
+    # does not. Applying one profanity setting to everyone would break more characters
+    # than it fixed, so it lives per confidant.
+    swears: bool = False
+
 
 CONFIDANTS: dict[int, Confidant] = {
     # ── Confirmed IDs (verified from live game memory or user-provided ID table) ──
     1:  Confidant(1,  "Igor",                  "Fool",        "Mysterious velvet room attendant; cryptic and formal.", False, True),
     2:  Confidant(2,  "Morgana",               "Magician",    "Sarcastic cat/human; self-appointed leader, secretly insecure.", True, True),
-    3:  Confidant(3,  "Makoto Niijima",        "Priestess",   "Studious student council president; measured, analytical.", True, True),
+    3:  Confidant(3,  "Makoto Niijima",        "Priestess",   "Studious student council president; measured, analytical.", True, True,
+                   speech_style="Precise and a little formal, then suddenly blunt when she drops the student-council register. Structures her thoughts aloud. Says 'I see', 'That is to say'. Earnest, slightly stiff, unexpectedly competitive."),
     4:  Confidant(4,  "Haru Okumura",          "Empress",     "Gentle, privileged; hides inner strength behind politeness.", True, True),
-    5:  Confidant(5,  "Yusuke Kitagawa",       "Emperor",     "Eccentric artist; speaks in lofty, aesthetic metaphors.", True, True),
-    6:  Confidant(6,  "Sojiro Sakura",         "Hierophant",  "Gruff but caring guardian; old-school pragmatist.", False, True),
-    7:  Confidant(7,  "Ann Takamaki",          "Lovers",      "Empathetic, fashionable; grapples with identity and self-worth.", True, True),
-    8:  Confidant(8,  "Ryuji Sakamoto",        "Chariot",     "Loud, loyal, hot-headed best friend; talks in street slang.", True, True),
+    5:  Confidant(5,  "Yusuke Kitagawa",       "Emperor",     "Eccentric artist; speaks in lofty, aesthetic metaphors.", True, True,
+                   speech_style="Lofty and theatrical. Speaks of beauty, form and inspiration in ordinary situations. Long clauses where a short one would do, sudden absolute declarations. Oblivious to how odd he sounds. Calls Joker by name rather than a nickname."),
+    6:  Confidant(6,  "Sojiro Sakura",         "Hierophant",  "Gruff but caring guardian; old-school pragmatist.", False, True,
+                   speech_style="Gruff, economical, world-weary. Sighs before answering. Calls Joker 'kid'. Talks about coffee and curry as if they settle arguments. Affection arrives disguised as complaint."),
+    7:  Confidant(7,  "Ann Takamaki",          "Lovers",      "Empathetic, fashionable; grapples with identity and self-worth.", True, True,
+                   speech_style="Warm and direct, thinks out loud. Uses 'like', 'seriously', 'ugh', 'totally'. Swings from bubbly to genuinely hurt in one breath. Calls people out when they are being unfair. Fashion and food come up unprompted."),
+    8:  Confidant(8,  "Ryuji Sakamoto",        "Chariot",     "Loud, loyal, hot-headed best friend; talks in street slang.", True, True,
+                   speech_style=(
+                       "Drops the g from -ing (talkin', goin', effin'). Calls Joker 'bro', "
+                       "'dude' or 'man'. Opens with 'Yo', 'Hell yeah', 'For real?', "
+                       "'Dude!', 'Aw, c'mon'. Uses 'ain't', 'gonna', 'gotta', 'lemme', "
+                       "''cause', 'sh---y'. Blunt and loud, short bursts rather than "
+                       "clauses, enthusiasm over precision. Never formal, never polite, "
+                       "never uses a word like 'therefore' or 'regarding'."
+                   ),
+                   swears=True),
     9:  Confidant(9,  "Goro Akechi",           "Justice",     "Charming detective; carefully controlled public persona.", True, True),
-    10: Confidant(10, "Futaba Sakura",         "Hermit",      "Hikikomori tech genius; uses gamer/internet slang.", True, True),
+    10: Confidant(10, "Futaba Sakura",         "Hermit",      "Hikikomori tech genius; uses gamer/internet slang.", True, True,
+                   speech_style="Fast, sharp, internet-brained. Gamer and otaku references, 'lol', 'noob', 'target acquired'. Bold from behind a screen and shy in person. Jumps topic mid-sentence when something better occurs to her."),
     11: Confidant(11, "Chihaya Mifune",        "Fortune",     "Earnest fortune teller struggling against a manipulative organization."),
     12: Confidant(12, "Justine and Caroline",  "Strength",    "Twin velvet room wardens; Justine cold and precise, Caroline loud and brash.", False, True),
     13: Confidant(13, "Munehisa Iwai",         "Hanged Man",  "Taciturn arms dealer with a hidden paternal side."),
-    14: Confidant(14, "Tae Takemi",            "Death",       "Unconventional doctor; sardonic, tests experimental medicine on Joker."),
-    15: Confidant(15, "Sadayo Kawakami",       "Temperance",  "Overworked homeroom teacher with a moonlighting secret."),
+    14: Confidant(14, "Tae Takemi",            "Death",       "Unconventional doctor; sardonic, tests experimental medicine on Joker.",
+                   speech_style="Dry, unhurried, faintly amused. Calls Joker 'guinea pig' or 'kid'. Teases with a flat delivery and never exclaims. Drops medical words in casually. States a hard thing plainly and lets it sit. Sardonic rather than warm, and never gushes."),
+    15: Confidant(15, "Sadayo Kawakami",       "Temperance",  "Overworked homeroom teacher with a moonlighting secret.",
+                   speech_style="Tired and apologetic in class, conspiratorial outside it. Trails off, laughs at herself, over-explains when nervous. Slips between teacher voice and something far more casual."),
     16: Confidant(16, "Ichiko Ohya",           "Devil",       "Hard-drinking journalist doggedly chasing a story about the Phantom Thieves."),
     17: Confidant(17, "Shinya Oda",            "Tower",       "Competitive boy genius at Akihabara's arcade; hides deep insecurity."),
     18: Confidant(18, "Hifumi Togo",           "Star",        "Shogi prodigy; disciplined, learns to think beyond the board."),

@@ -84,6 +84,11 @@ class GenerateRequest(BaseModel):
     context: str = Field(..., max_length=1024)
     character_name: str = Field(..., max_length=64)
 
+    # Capacity of the message record this line will overwrite, in characters. Records
+    # differ: one row holds ~30, two rows ~75. Optional so an older mod build keeps
+    # working against a newer server and simply gets the configured default.
+    max_chars: int | None = Field(default=None, ge=8, le=512)
+
 
 class GenerateResponse(BaseModel):
     text: str
@@ -161,6 +166,7 @@ async def generate(req: GenerateRequest) -> GenerateResponse:
             req.confidant_id,
             req.rank,
             req.context,
+            req.max_chars,
         )
 
     try:

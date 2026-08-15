@@ -14,6 +14,19 @@ internal sealed class GenerateRequest
     public int    Rank          { get; init; }
     public string Context       { get; init; } = string.Empty;
     public string CharacterName { get; init; } = string.Empty;
+
+    /// <summary>
+    /// Characters the destination record can display, or null when it is not known yet.
+    ///
+    /// The mod picks the target record before it asks for a line, so it knows exactly how
+    /// much room the answer has: about 30 characters for a one-row record and 75 for two.
+    /// Sending a fixed budget produced "You're finally here, I've been" on screen — a
+    /// 53-character line clipped into a 30-character slot.
+    ///
+    /// Nullable so a request made before a record is chosen still works, and the server
+    /// falls back to its configured default.
+    /// </summary>
+    public int?   MaxChars      { get; init; }
 }
 
 internal sealed class GenerateResponse

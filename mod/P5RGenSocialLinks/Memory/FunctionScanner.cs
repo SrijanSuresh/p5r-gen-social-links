@@ -14,6 +14,13 @@ internal sealed class FunctionScanner : IDisposable
     private readonly Scanner _scanner;
     private readonly nuint   _moduleBase;
 
+    /// <summary>
+    /// Base address p5r.exe was loaded at this run. Absolute addresses are meaningless
+    /// across launches because of ASLR; subtracting this turns one into the module
+    /// offset, which is the form that can be compared against a disassembler.
+    /// </summary>
+    internal nuint ModuleBase => _moduleBase;
+
     internal FunctionScanner()
     {
         Process process = Process.GetCurrentProcess();

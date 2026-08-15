@@ -52,6 +52,55 @@ internal sealed class GenConfig
     public int MaxWriteRegions { get; init; } = 1;
 
     /// <summary>
+    /// Fall back to scanning the heap for the dialogue pool.
+    ///
+    /// Superseded by the interpreter hook, which gets the region from an address the game
+    /// itself read — microseconds against 33 seconds, and exactly right rather than
+    /// ranked. The scan also could not run until a message had been dispatched, so the
+    /// opening lines of every scene played before anything could be written.
+    ///
+    /// Kept behind a switch for one release rather than deleted outright: the hook path
+    /// has been exercised on one scene, and a scan that is slow and occasionally wrong is
+    /// still better than no pool at all in a scene it turns out to miss. It goes when the
+    /// hook has been through a few more.
+    /// </summary>
+    [JsonPropertyName("heap_scan_enabled")]
+    public bool HeapScanEnabled { get; init; } = false;
+
+    /// <summary>
+    /// How many records ahead of the player to keep generated.
+    ///
+    /// This is what makes pacing irrelevant: at a lookahead of 3, a line is written two
+    /// or three bubbles before the player reaches it, so holding fast-forward no longer
+    /// beats a 2-second round trip. It cannot be raised without cost — the server runs
+    /// one request at a time, so a deep queue spends inference on records the player may
+    /// never see if the scene branches.
+    ///
+    /// 0 disables pre-generation and restores the reactive path, which is the fallback
+    /// if pre-generated lines ever read as disconnected from the scene.
+    ///
+    /// Raised from 3 to 8 after a measured scene covered 16 of 22 records. Inference
+    /// sustains about 0.7 lines per second and the player read at 1.7, so the queue can
+    /// never win a sustained sprint — it can only bank a buffer during pauses, and a
+    /// window of 3 is too shallow to bank anything.
+    /// </summary>
+    [JsonPropertyName("pregen_lookahead")]
+    public int PregenLookahead { get; init; } = 8;
+
+    /// <summary>
+    /// When true, inject an assembly hook into the BMD message interpreter's byte-fetch
+    /// loop to capture the record the game is currently rendering.
+    ///
+    /// This is the replacement for the heap heuristic: instead of scanning a gigabyte and
+    /// scoring regions for English, the game hands over the pointer. It is also the most
+    /// invasive thing the mod does — six injected instructions inside a loop that runs per
+    /// character of every message in the game — so it gets its own switch. If P5R fails to
+    /// start or dies on the first line of dialogue, set this false first.
+    /// </summary>
+    [JsonPropertyName("msg_hook_enabled")]
+    public bool MsgHookEnabled { get; init; } = true;
+
+    /// <summary>
     /// When true, PointerChainResolver logs each chain step with address and dereferenced value.
     /// Useful for diagnosing broken pointer chains after a game patch; leave false in production.
     /// </summary>

@@ -76,3 +76,167 @@ def test_all_confidants_build_prompt_without_error() -> None:
         system, user = build_prompt(cid, 5, "test context")
         assert len(system) > 50
         assert len(user) > 10
+
+
+# --- per-record length budget -------------------------------------------------
+#
+# The line is written into one specific message record, and records differ: one row
+# holds roughly 30 characters, two rows roughly 75. A fixed budget overran the short
+# ones — "You're finally here, I've been" reached the screen with the rest cut off.
+
+
+def test_the_stated_target_sits_below_the_real_capacity() -> None:
+    """
+    The model overshoots whatever number it is given, and an overshoot is discarded
+    whole rather than trimmed — the clip only keeps text ending on a sentence boundary.
+    Aiming below capacity leaves room for the overshoot to land inside it.
+    """
+    _, user = build_prompt(8, 4, "at the gym", max_chars=30)
+    assert "30 characters" not in user
+    assert "25 characters" in user      # 85% of 30
+
+
+def test_the_target_never_collapses_on_a_tiny_record() -> None:
+    _, user = build_prompt(8, 4, "at the gym", max_chars=12)
+    assert "12 characters" in user
+
+
+def test_the_prompt_asks_for_a_finished_sentence() -> None:
+    """An unfinished line is thrown away, so finishing matters more than length."""
+    _, user = build_prompt(8, 4, "at the gym", max_chars=40)
+    assert "Finish the sentence" in user
+
+
+def test_budget_is_also_given_in_words() -> None:
+    """Models count words far more reliably than characters."""
+    _, user = build_prompt(8, 4, "at the gym", max_chars=50)
+    assert "8 words" in user      # 85% of 50 is 42, at ~5 chars a word
+
+
+def test_word_budget_never_drops_below_three() -> None:
+    """A tiny record must still ask for a sentence, not for one word."""
+    _, user = build_prompt(8, 4, "at the gym", max_chars=8)
+    assert "3 words" in user
+
+
+def test_two_records_of_different_size_get_different_budgets() -> None:
+    _, narrow = build_prompt(8, 4, "at the gym", max_chars=30)
+    _, wide   = build_prompt(8, 4, "at the gym", max_chars=75)
+    assert narrow != wide
+
+
+def test_the_system_prompt_does_not_vary_with_the_budget() -> None:
+    """
+    The point of moving the limit out of the system prompt.
+
+    llama-server reuses the KV cache for the longest identical prefix between requests,
+    and the system prompt is that prefix. Baking a per-record number into it made every
+    request differ from the first token, so nothing was reusable and generation slowed
+    from ~1.5s to ~3.5s once the prompt grew a voice section and four lines of history.
+    """
+    narrow, _ = build_prompt(8, 4, "at the gym", max_chars=30)
+    wide,   _ = build_prompt(8, 4, "at the gym", max_chars=98)
+    assert narrow == wide
+
+
+def test_the_system_prompt_is_stable_across_scenes() -> None:
+    """Only the user half may change within one hang-out, or the cache is worthless."""
+    a, _ = build_prompt(8, 4, "at the gym", max_chars=40)
+    b, _ = build_prompt(8, 4, "somewhere else entirely", max_chars=60)
+    assert a == b
+
+
+def test_default_budget_is_used_when_none_given() -> None:
+    """Callers with no record in hand must still get a usable prompt."""
+    _, user = build_prompt(8, 4, "at the gym")
+    assert "characters" in user
+
+
+# --- replacing a specific line ------------------------------------------------
+#
+# Pre-generation hands the model the scripted line it is displacing, so the rules have
+# to say what to do with it. Without this, two consecutive records came back as "You
+# comin' back here every week like me now?" and "You comin' here more often now?" — one
+# sentence twice, because every request carried the same scene blurb and nothing else.
+
+
+def test_rules_mention_replacing_a_line() -> None:
+    system, _ = build_prompt(8, 4, "at the gym")
+    assert "replacing" in system
+
+
+def test_rules_forbid_restating_an_earlier_line() -> None:
+    system, _ = build_prompt(8, 4, "at the gym")
+    assert "already said" in system
+
+
+def test_context_reaches_the_user_prompt_verbatim() -> None:
+    """The line being replaced travels in the context, so it must survive intact."""
+    original = 'The line you are replacing is: "A towel?"'
+    _, user = build_prompt(8, 4, original)
+    assert original in user
+
+
+# --- voice ---------------------------------------------------------------------
+#
+# personality_blurb alone produced "Guess I'm cool with paying for the session if that's
+# what keeps this place running." from Ryuji: true to the description, and nothing like
+# the character. How someone sounds is separate information from who they are.
+
+
+def test_ryuji_gets_his_speech_style() -> None:
+    system, _ = build_prompt(8, 4, "at the gym")
+    assert "bro" in system
+    assert "ain't" in system
+
+
+def test_ryuji_is_allowed_to_swear() -> None:
+    system, _ = build_prompt(8, 4, "at the gym")
+    assert "bullshit" in system
+    assert "Do not censor" in system
+
+
+def test_makoto_is_not() -> None:
+    """One global profanity setting would break more characters than it fixed."""
+    system, _ = build_prompt(3, 4, "at school")
+    assert "You do not swear" in system
+
+
+def test_a_confidant_without_a_style_still_builds() -> None:
+    system, _ = build_prompt(11, 4, "reading fortunes")
+    assert "How you talk:" in system
+
+
+def test_continuity_rule_is_stated() -> None:
+    system, _ = build_prompt(8, 4, "at the gym")
+    assert "one conversation" in system
+
+
+def test_voice_outranks_correctness() -> None:
+    system, _ = build_prompt(8, 4, "at the gym")
+    assert "Sound like yourself before you sound correct" in system
+
+
+# --- observed failures ---------------------------------------------------------
+#
+# Both of these were produced by a scene that otherwise went perfectly: 21 of 21
+# records replaced, in voice, with real continuity.
+
+
+def test_names_from_the_original_must_be_kept() -> None:
+    """
+    Replacing "We came with Ann that one time," the model said Makoto, and elsewhere
+    invented Sae, who is not in the scene. Swapping one Phantom Thief for another reads
+    as a continuity error rather than as a different line.
+    """
+    system, _ = build_prompt(8, 4, "at the gym")
+    assert "Keep every name the original line used" in system
+
+
+def test_restating_the_previous_line_is_forbidden() -> None:
+    """
+    Observed consecutive: "Now I'm crushin' my reps like Makoto's got nothin' on me!"
+    then "Man, I'm crushin' my reps like Makoto's got nothin' on me, damn!"
+    """
+    system, _ = build_prompt(8, 4, "at the gym")
+    assert "Never restate your previous line" in system
