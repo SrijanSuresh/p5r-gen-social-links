@@ -2967,6 +2967,50 @@ public class Mod : IModV1
     }
 
     /// <summary>
+    /// True when a candidate line says what the previous one already said.
+    ///
+    /// The prompt forbids restating and the model does it anyway — observed consecutive:
+    /// "Now I'm crushin' my reps like Makoto's got nothin' on me!" then "Man, I'm
+    /// crushin' my reps like Makoto's got nothin' on me, damn!". A rule the model can
+    /// ignore is not a guarantee, so this is the part with teeth.
+    ///
+    /// Word overlap rather than string distance, because the failure is semantic
+    /// repetition dressed in different punctuation. Two thirds shared is the threshold: a
+    /// genuine follow-up reuses the subject and little else, while a restatement reuses
+    /// nearly everything. Short lines are exempt — "Hell yeah, dude!" twice in a scene is
+    /// how the character talks, not a defect.
+    /// </summary>
+    private bool RepeatsPreviousLine(RecordPlan record, string candidate)
+    {
+        if (record.Index == 0 || candidate.Length < 20) return false;
+
+        string? previous = _plan[record.Index - 1].Generated;
+        if (previous is null || previous.Length < 20) return false;
+
+        var earlier = new System.Collections.Generic.HashSet<string>(
+            previous.ToLowerInvariant().Split(' ', StringSplitOptions.RemoveEmptyEntries));
+        if (earlier.Count == 0) return false;
+
+        string[] words = candidate.ToLowerInvariant()
+                                  .Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        string[] prior = previous.ToLowerInvariant()
+                                 .Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (words.Length == 0) return false;
+
+        // Signal one: most of the words were already used.
+        int shared = 0;
+        foreach (string w in words) if (earlier.Contains(w)) shared++;
+        if (shared * 3 >= words.Length * 2) return true;
+
+        // Signal two: it opens the same way. Overlap alone missed "Gonna be seein' me
+        // sweat stains all over 'em" followed by "Gonna be seein' those stains all over
+        // my damn gym shorts too" — only half the words match, and the repetition is
+        // obvious on screen because the first three are identical.
+        return words.Length >= 3 && prior.Length >= 3
+            && prior[0] == words[0] && prior[1] == words[1] && prior[2] == words[2];
+    }
+
+    /// <summary>
     /// Ask the server for one record's replacement line, off the poll thread.
     ///
     /// The record is passed rather than looked up on completion: by the time the answer
@@ -2998,6 +3042,13 @@ public class Mod : IModV1
                     // answer while holding a queue slot the whole scene, so it gets a
                     // couple of chances and then keeps its scripted line.
                     GiveUpOrRetry(record, "no line fit the record");
+                    return;
+                }
+
+                if (RepeatsPreviousLine(record, text))
+                {
+                    _modLog!.Info($"[PREGEN] #{record.Index} rejected as a restatement: \"{text}\"");
+                    GiveUpOrRetry(record, "restated the previous line");
                     return;
                 }
 
