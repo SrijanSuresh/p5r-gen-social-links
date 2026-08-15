@@ -2922,18 +2922,43 @@ public class Mod : IModV1
         ctx.Append(" The line you are replacing is: \"").Append(record.Original).Append('"');
         ctx.Append(" Say something with the same purpose, in your own words.");
 
-        // Immediately preceding lines, so a reply reads as a reply. Generated text is
-        // preferred where it exists, because that is what the player actually saw.
-        int from = Math.Max(0, record.Index - 2);
-        if (from < record.Index)
-        {
-            ctx.Append(" Just before this, you said:");
-            for (int i = from; i < record.Index; i++)
-                ctx.Append(" \"").Append(_plan[i].Generated ?? _plan[i].Original).Append('"');
-        }
+        // What the player has actually heard, most recent last. Four lines rather than
+        // two: with two, consecutive generations came back as "Yeah, it was a sweet gym"
+        // followed by "You think you can just crash our gym session for free, huh?" —
+        // each fine alone, and plainly not the same conversation.
+        //
+        // Generated text where it exists, the script where it does not. A record the
+        // queue missed still played on screen, so leaving it out would describe a
+        // conversation with a hole in it.
+        // Drop the oldest lines until it fits, rather than truncating the finished string.
+        // The server rejects anything over 1024 characters, and a tail cut would remove
+        // "Continue from the last one." while keeping the least relevant history —
+        // exactly the wrong end to lose.
+        const int Budget = 1000;
+        int from = Math.Max(0, record.Index - 4);
 
-        string text = ctx.ToString();
-        return text.Length > 1000 ? text[..1000] : text;   // Pydantic caps context at 1024
+        while (true)
+        {
+            var history = new System.Text.StringBuilder();
+            if (from < record.Index)
+            {
+                history.Append(" The conversation so far, oldest first:");
+                for (int i = from; i < record.Index; i++)
+                {
+                    string said = _plan[i].Generated ?? _plan[i].Original;
+                    if (said.Length > 0) history.Append(" \"").Append(said).Append('"');
+                }
+                history.Append(" Continue from the last one.");
+            }
+
+            if (ctx.Length + history.Length <= Budget || from >= record.Index)
+            {
+                string full = ctx.Append(history).ToString();
+                return full.Length > Budget ? full[..Budget] : full;
+            }
+
+            from++;   // give up the oldest line and try again
+        }
     }
 
     /// <summary>
