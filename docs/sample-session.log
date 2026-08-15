@@ -1,0 +1,56 @@
+Excerpt from a live session on 2026-08-14. Two confidants, one game launch.
+Trimmed to the pipeline events; [WATCH] sampling lines removed for length.
+
+=== Ryuji, Protein Lovers gym ===
+22:04:47.119  [P5RGenSocialLinks] Hang-out: Confidant=8 Rank=4 Scene=51 (0x41E159A6C0)
+22:04:59.106  [ARM] 0x421216D000 len=192512 slots=103 — from a live read, no scan
+22:04:59.116  [PLAN] 25 records; capacity 15-1959 chars
+22:04:59.128  [PREGEN] #0 requested (cap=34)
+22:05:05.678  [PREGEN] #0 ready (31/34): "Welcome to Tae-ken Sports Club!"
+22:05:05.680  [TWIN] mirrored 1/1 rows at delta 0x85231C0
+22:05:05.683  [PREGEN] #0 written, 0 ahead of the player
+22:05:06.099  [PREGEN] #1 requested (cap=31)
+22:05:07.168  [PREGEN] #1 ready (25/31): "Ann's been here too, bro."
+22:05:07.169  [TWIN] mirrored 1/1 rows at delta 0x85231C0
+22:05:07.170  [PREGEN] #1 written, 1 ahead of the player
+22:05:07.598  [PREGEN] #2 requested (cap=81)
+22:05:09.448  [PREGEN] #2 ready (59/81): "And now she's even gettin' us free gym memberships somehow."
+22:05:09.450  [TWIN] mirrored 2/2 rows at delta 0x85231C0
+22:05:09.454  [PREGEN] #2 written, 2 ahead of the player
+22:05:09.598  [PREGEN] #3 requested (cap=92)
+22:05:11.297  [PREGEN] #3 ready (57/92): "She's gotta be gettin' some serious perks from Ann, dude!"
+22:05:11.297  [TWIN] mirrored 3/3 rows at delta 0x85231C0
+22:05:11.298  [PREGEN] #3 written, 3 ahead of the player
+22:05:11.598  [PREGEN] #4 requested (cap=59)
+22:05:13.598  [PREGEN] #4 requested (cap=59)
+22:05:15.030  [PREGEN] #4 ready (55/59): "She's gettin' 'em all hooked on this gym stuff somehow!"
+22:05:15.097  [PREGEN] #7 requested (cap=59)
+22:05:17.097  [PREGEN] #7 requested (cap=59)
+22:05:18.295  [PREGEN] #7 ready (55/59): "Now we can just show up whenever we wanna sweat it out."
+22:05:18.296  [TWIN] mirrored 2/2 rows at delta 0x85231C0
+
+=== Takemi, clinic (rank 3) ===
+22:09:09.599  [P5RGenSocialLinks] Hang-out: Confidant=14 Rank=3 Scene=40 (0x4211B2ABC0)
+22:09:12.603  [ARM] 0x421E241000 rejected — 366 text runs, outside 6-120. Not a scene script.
+22:09:12.605  [ARM] 0x421E90A000 rejected — 356 text runs, outside 6-120. Not a scene script.
+22:09:15.599  [ARM] 0x421E241000 rejected — 366 text runs, outside 6-120. Not a scene script.
+22:09:17.097  [ARM] 0x421E90A000 rejected — 356 text runs, outside 6-120. Not a scene script.
+22:09:20.100  [ARM] 0x422FF46000 len=36864 slots=109 — from a live read, no scan
+22:09:20.106  [PLAN] 64 records; capacity 10-100 chars
+22:09:27.946  [PREGEN] #0 ready (58/68): "I'm trying out some new experimental treatments here, kid."
+22:09:29.922  [PREGEN] #2 ready (80/94): "Her condition's worsening, so I need some actual data to proceed with treatment."
+22:09:29.924  [PREGEN] #2 written, 1 ahead of the player
+22:09:31.523  [PREGEN] #3 ready (63/66): "Need to run more tests and monitor her vital signs closely now."
+22:09:31.524  [PREGEN] #3 written, 2 ahead of the player
+22:09:35.717  [PREGEN] #5 ready (78/80): "...malnutrition or something more severe, probably, given her symptoms so far."
+22:09:35.718  [PREGEN] #5 written, 3 ahead of the player
+22:09:37.400  [PREGEN] #6 ready (62/75): "It could be something more complex, like a metabolic disorder."
+22:09:37.402  [PREGEN] #6 written, 4 ahead of the player
+22:09:38.747  [PREGEN] #7 ready (43/44): "which would explain her erratic blood work."
+22:09:38.749  [PREGEN] #7 written, 4 ahead of the player
+22:09:40.260  [PREGEN] #8 ready (30/42): "which is why I need more data."
+22:09:40.262  [PREGEN] #8 written, 4 ahead of the player
+22:09:42.126  [PREGEN] #9 ready (63/98): "Eventually, I'll have enough data to narrow down her condition."
+22:09:42.128  [PREGEN] #9 written, 5 ahead of the player
+22:09:44.024  [PREGEN] #11 ready (65/100): "Not quite famous enough to have a decent research budget, anyway."
+22:09:44.027  [PREGEN] #11 written, 7 ahead of the player
