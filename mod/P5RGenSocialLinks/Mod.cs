@@ -49,6 +49,12 @@ public class Mod : IModV1
     private readonly byte[]              _recordBuf = new byte[128];
     private readonly byte[]              _mirrorBuf = new byte[128];
 
+    // Guards the pool write path. Flushing now happens from two places — the poll tick
+    // and the thread-pool continuation that finishes a generation — and both walk the
+    // plan and write into game memory. Arming takes it too, because replacing _heapPools
+    // under a flush would have it writing through a base it is halfway done with.
+    private readonly object              _writeLock = new();
+
     // Signed distance from a record in an armed pool to the same record in the copy the
     // speech bubble reads, discovered by watching both be read within a millisecond of
     // each other with identical text.
@@ -2828,7 +2834,8 @@ public class Mod : IModV1
     /// </summary>
     private void FlushReadyRecords()
     {
-        foreach (RecordPlan record in _plan)
+        lock (_writeLock)
+        foreach (RecordPlan record in _plan.ToArray())
         {
             if (record.State != RecordState.Ready || record.Generated is null) continue;
             if (!record.IsWritable) continue;
@@ -2967,6 +2974,12 @@ public class Mod : IModV1
                 record.Generated = text;
                 record.State     = RecordState.Ready;
                 _modLog!.Info($"[PREGEN] #{record.Index} ready ({text.Length}/{record.Capacity}): \"{text}\"");
+
+                // Write it now rather than on the next poll tick. Waiting added up to a
+                // full 500ms between a line existing and it reaching memory, on top of
+                // ~1.5s of inference — and that delay lands exactly where it hurts, at the
+                // front of a scene where the queue has not banked any buffer yet.
+                FlushReadyRecords();
             }
             catch (Server.InferenceInFlightException)
             {
@@ -3262,6 +3275,8 @@ public class Mod : IModV1
         // The second copy is still written, by MirrorToTwin, which finds it at a learned
         // offset and verifies byte-for-byte before touching anything. That is the
         // mechanism that actually knows two addresses hold the same line.
+        lock (_writeLock)
+        {
         _outsideReads = 0;
         _twinDelta    = 0;   // learned for the pool being replaced; meaningless for this one
         _heapPools.Clear();
@@ -3278,6 +3293,7 @@ public class Mod : IModV1
                       "— from a live read, no scan");
 
         BuildRecordPlan();
+        }
     }
 
     /// <summary>
