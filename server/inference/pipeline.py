@@ -29,6 +29,22 @@ class ChatCompletionBackend(Protocol):
     ) -> dict[str, Any]: ...
 
 
+def _token_budget(max_chars: int, ceiling: int) -> int:
+    """
+    Tokens worth generating for a line of ``max_chars`` characters.
+
+    Decode dominates the round trip. At 20 of 32 layers on the GPU, generating a fixed 32
+    tokens costs roughly two seconds regardless of how short the destination is — and a
+    thirty-character bubble needs about ten. The rest was generated and then thrown away
+    by the character clip.
+
+    English runs near four characters per token, so the budget is chars/3 with a few
+    tokens of headroom: enough that the model reaches a sentence end on its own rather
+    than being cut off at the limit, which is the failure that produces fragments.
+    """
+    return max(8, min(ceiling, max_chars // 3 + 6))
+
+
 class InferencePipeline:
     """Wraps a chat-completion backend into a single generate() call."""
 
@@ -62,7 +78,7 @@ class InferencePipeline:
                 {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": user_prompt},
             ],
-            max_tokens=self._cfg.max_tokens,
+            max_tokens=_token_budget(budget, self._cfg.max_tokens),
             temperature=self._cfg.temperature,
             top_p=self._cfg.top_p,
             repeat_penalty=self._cfg.repeat_penalty,
