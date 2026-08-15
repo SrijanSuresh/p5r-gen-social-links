@@ -33,6 +33,19 @@ class Confidant:
     # the Phantom Thieves is never wrong, while one who speaks up at the wrong time is.
     knows_identity: bool = False
 
+    # How this character actually talks: rhythm, filler, address terms, verbal tics.
+    #
+    # personality_blurb says who someone is; this says how they sound, and the model needs
+    # both. Given only "loud, loyal, hot-headed best friend", it produced "Guess I'm cool
+    # with paying for the session if that's what keeps this place running." — accurate to
+    # the description and completely wrong for the character.
+    speech_style: str = ""
+
+    # Whether this character swears in the localisation. Ryuji does, constantly; Makoto
+    # does not. Applying one profanity setting to everyone would break more characters
+    # than it fixed, so it lives per confidant.
+    swears: bool = False
+
 
 CONFIDANTS: dict[int, Confidant] = {
     # ── Confirmed IDs (verified from live game memory or user-provided ID table) ──
@@ -43,7 +56,16 @@ CONFIDANTS: dict[int, Confidant] = {
     5:  Confidant(5,  "Yusuke Kitagawa",       "Emperor",     "Eccentric artist; speaks in lofty, aesthetic metaphors.", True, True),
     6:  Confidant(6,  "Sojiro Sakura",         "Hierophant",  "Gruff but caring guardian; old-school pragmatist.", False, True),
     7:  Confidant(7,  "Ann Takamaki",          "Lovers",      "Empathetic, fashionable; grapples with identity and self-worth.", True, True),
-    8:  Confidant(8,  "Ryuji Sakamoto",        "Chariot",     "Loud, loyal, hot-headed best friend; talks in street slang.", True, True),
+    8:  Confidant(8,  "Ryuji Sakamoto",        "Chariot",     "Loud, loyal, hot-headed best friend; talks in street slang.", True, True,
+                   speech_style=(
+                       "Drops the g from -ing (talkin', goin', effin'). Calls Joker 'bro', "
+                       "'dude' or 'man'. Opens with 'Yo', 'Hell yeah', 'For real?', "
+                       "'Dude!', 'Aw, c'mon'. Uses 'ain't', 'gonna', 'gotta', 'lemme', "
+                       "''cause', 'sh---y'. Blunt and loud, short bursts rather than "
+                       "clauses, enthusiasm over precision. Never formal, never polite, "
+                       "never uses a word like 'therefore' or 'regarding'."
+                   ),
+                   swears=True),
     9:  Confidant(9,  "Goro Akechi",           "Justice",     "Charming detective; carefully controlled public persona.", True, True),
     10: Confidant(10, "Futaba Sakura",         "Hermit",      "Hikikomori tech genius; uses gamer/internet slang.", True, True),
     11: Confidant(11, "Chihaya Mifune",        "Fortune",     "Earnest fortune teller struggling against a manipulative organization."),

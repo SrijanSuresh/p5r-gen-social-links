@@ -137,3 +137,43 @@ def test_context_reaches_the_user_prompt_verbatim() -> None:
     original = 'The line you are replacing is: "A towel?"'
     _, user = build_prompt(8, 4, original)
     assert original in user
+
+
+# --- voice ---------------------------------------------------------------------
+#
+# personality_blurb alone produced "Guess I'm cool with paying for the session if that's
+# what keeps this place running." from Ryuji: true to the description, and nothing like
+# the character. How someone sounds is separate information from who they are.
+
+
+def test_ryuji_gets_his_speech_style() -> None:
+    system, _ = build_prompt(8, 4, "at the gym")
+    assert "bro" in system
+    assert "ain't" in system
+
+
+def test_ryuji_is_allowed_to_swear() -> None:
+    system, _ = build_prompt(8, 4, "at the gym")
+    assert "bullshit" in system
+    assert "Do not censor" in system
+
+
+def test_makoto_is_not() -> None:
+    """One global profanity setting would break more characters than it fixed."""
+    system, _ = build_prompt(3, 4, "at school")
+    assert "You do not swear" in system
+
+
+def test_a_confidant_without_a_style_still_builds() -> None:
+    system, _ = build_prompt(11, 4, "reading fortunes")
+    assert "How you talk:" in system
+
+
+def test_continuity_rule_is_stated() -> None:
+    system, _ = build_prompt(8, 4, "at the gym")
+    assert "one conversation" in system
+
+
+def test_voice_outranks_correctness() -> None:
+    system, _ = build_prompt(8, 4, "at the gym")
+    assert "Sound like yourself before you sound correct" in system

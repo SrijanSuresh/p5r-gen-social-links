@@ -41,10 +41,26 @@ def _world_grounding(confidant: "Confidant") -> str:
     return UNAWARE_GROUNDING
 
 
+PROFANITY_ALLOWED = (
+    "You swear the way you do in the game, and more freely than a polite person would: "
+    "damn, goddamn, hell, crap, ass, bullshit, piss, bitch, shit, and a harder word when "
+    "something genuinely lands. It is casual venting, never aimed at Joker. Do not censor "
+    "yourself with asterisks or hyphens."
+)
+
+PROFANITY_FORBIDDEN = (
+    "You do not swear. Frustration comes out as sharpness or exasperation, not profanity."
+)
+
+
 SYSTEM_TEMPLATE = """\
 You are {name} from Persona 5 Royal. Your arcana is {arcana}.
 
 Character notes: {personality}
+
+How you talk: {speech_style}
+
+Language: {profanity}
 
 World: {world_grounding}
 
@@ -61,6 +77,11 @@ Rules:
 - Do NOT repeat the player's words verbatim; respond naturally.
 - If you are told which line you are replacing, keep its purpose and move the
   conversation the same distance forward. Do not restate a line you already said.
+- If you are shown what you just said, continue from it. This is one conversation,
+  not a set of separate remarks: pick up the same subject, answer your own last
+  point, or react to it. A line that could have opened the scene is wrong here.
+- Sound like yourself before you sound correct. A stiff, well-formed sentence is a
+  worse answer than a rough one in character.
 """
 
 
@@ -85,6 +106,8 @@ def build_prompt(
         arcana=confidant.arcana,
         personality=confidant.personality_blurb,
         world_grounding=_world_grounding(confidant),
+        speech_style=confidant.speech_style or "Plainly, in your own voice.",
+        profanity=PROFANITY_ALLOWED if confidant.swears else PROFANITY_FORBIDDEN,
         rank=rank,
         tier_note=_tier_note(rank),
         max_chars=max_chars,
