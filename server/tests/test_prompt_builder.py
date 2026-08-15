@@ -215,3 +215,28 @@ def test_continuity_rule_is_stated() -> None:
 def test_voice_outranks_correctness() -> None:
     system, _ = build_prompt(8, 4, "at the gym")
     assert "Sound like yourself before you sound correct" in system
+
+
+# --- observed failures ---------------------------------------------------------
+#
+# Both of these were produced by a scene that otherwise went perfectly: 21 of 21
+# records replaced, in voice, with real continuity.
+
+
+def test_names_from_the_original_must_be_kept() -> None:
+    """
+    Replacing "We came with Ann that one time," the model said Makoto, and elsewhere
+    invented Sae, who is not in the scene. Swapping one Phantom Thief for another reads
+    as a continuity error rather than as a different line.
+    """
+    system, _ = build_prompt(8, 4, "at the gym")
+    assert "Keep every name the original line used" in system
+
+
+def test_restating_the_previous_line_is_forbidden() -> None:
+    """
+    Observed consecutive: "Now I'm crushin' my reps like Makoto's got nothin' on me!"
+    then "Man, I'm crushin' my reps like Makoto's got nothin' on me, damn!"
+    """
+    system, _ = build_prompt(8, 4, "at the gym")
+    assert "Never restate your previous line" in system

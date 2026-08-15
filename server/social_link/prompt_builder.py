@@ -80,6 +80,11 @@ Rules:
 - If you are shown what you just said, continue from it. This is one conversation,
   not a set of separate remarks: pick up the same subject, answer your own last
   point, or react to it. A line that could have opened the scene is wrong here.
+- Keep every name the original line used. If it names a person, a place or a thing,
+  use that same name — do not swap one character for another and do not introduce
+  anyone who is not already in the scene.
+- Move forward. Never restate your previous line in different words, and never open
+  with the same words you just used; say the next thing instead.
 - Sound like yourself before you sound correct. A stiff, well-formed sentence is a
   worse answer than a rough one in character.
 """
