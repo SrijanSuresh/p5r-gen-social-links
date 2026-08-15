@@ -3065,6 +3065,23 @@ public class Mod : IModV1
     }
 
     /// <summary>
+    /// Start the queue immediately after arming, without waiting for the next poll tick.
+    ///
+    /// The front of a scene is where coverage is always lost — #3 through #6 in the last
+    /// three sessions — because the player is reading at full speed while the queue has
+    /// banked nothing. Half a second of idling before the first request is spent at the
+    /// exact moment it can least be afforded.
+    /// </summary>
+    private void KickPregen()
+    {
+        if (_cfg.PregenLookahead <= 0 || _plan.Count == 0) return;
+        if (!_reader!.TryResolve(out nuint session)) return;
+
+        SocialLinkSnapshot? snap = SocialLinkReader.TryReadFromPtr(session);
+        if (snap is not null) PumpPregen(snap);
+    }
+
+    /// <summary>
     /// Build the scene plan from region 0: one entry per record, with its capacity and
     /// the scripted line it currently holds.
     ///
@@ -3294,6 +3311,10 @@ public class Mod : IModV1
 
         BuildRecordPlan();
         }
+
+        // Outside the lock: the request goes to the thread pool and its continuation takes
+        // the same lock to flush.
+        KickPregen();
     }
 
     /// <summary>
