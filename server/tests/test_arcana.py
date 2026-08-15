@@ -100,3 +100,33 @@ def test_no_id_gap_in_base_roster() -> None:
     """IDs 1–22 must all be present — no gaps in the confirmed range."""
     for expected_id in range(1, 23):
         assert expected_id in CONFIDANTS, f"Missing confirmed confidant ID {expected_id}"
+
+
+# --- speech styles -------------------------------------------------------------
+
+
+def test_takemi_sounds_nothing_like_ryuji() -> None:
+    """
+    The machinery is character-agnostic; the voice was not. Without a style, every
+    confidant fell back to the generic register that made Ryuji say "Guess I'm cool with
+    paying for the session if that's what keeps this place running."
+    """
+    from social_link.arcana import get_confidant
+
+    assert get_confidant(14).speech_style != get_confidant(8).speech_style
+    assert get_confidant(14).speech_style != ""
+
+
+def test_only_characters_who_swear_in_the_localisation_do() -> None:
+    from social_link.arcana import get_confidant
+
+    assert get_confidant(8).swears        # Ryuji, constantly
+    assert not get_confidant(14).swears   # Takemi is dry, not profane
+    assert not get_confidant(3).swears    # Makoto never
+
+
+def test_a_confidant_without_a_style_still_resolves() -> None:
+    """Sixteen of twenty-four have no style yet; they must degrade, not break."""
+    from social_link.arcana import get_confidant
+
+    assert get_confidant(17).speech_style == ""
