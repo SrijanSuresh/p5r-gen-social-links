@@ -2942,13 +2942,18 @@ public class Mod : IModV1
             var history = new System.Text.StringBuilder();
             if (from < record.Index)
             {
-                history.Append(" The conversation so far, oldest first:");
+                // Attribution matters more than it looks. These are the speaker's own
+                // earlier lines, and calling them "the conversation so far" made the model
+                // read them as the other person's: replacing Ryuji explaining the pricing,
+                // it answered him instead — "Fair enough, bro, that's a small price."
+                history.Append(" You have just said, oldest first:");
                 for (int i = from; i < record.Index; i++)
                 {
                     string said = _plan[i].Generated ?? _plan[i].Original;
                     if (said.Length > 0) history.Append(" \"").Append(said).Append('"');
                 }
-                history.Append(" Continue from the last one.");
+                history.Append(" Carry on from your own last line — you are still talking, " +
+                               "not replying to someone.");
             }
 
             if (ctx.Length + history.Length <= Budget || from >= record.Index)
