@@ -3013,9 +3013,11 @@ public class Mod : IModV1
             }
             catch (Server.InferenceInFlightException)
             {
-                // The server was busy with another record. Not an error — put it back and
-                // the next tick picks it up, which is what makes the queue self-pacing.
+                // Put it back for the next tick. Logged rather than swallowed: this was
+                // silent, and a scene where 57 of 78 requests were dropped looked from
+                // the mod's side like generation simply not happening.
                 record.State = RecordState.Pending;
+                _modLog!.Warn($"[PREGEN] #{record.Index} dropped — server busy.");
             }
             catch (OperationCanceledException)
             {
@@ -3069,6 +3071,17 @@ public class Mod : IModV1
 
         int lookahead = _cfg.PregenLookahead;
         if (lookahead <= 0 || _plan.Count == 0) return;
+
+        // One request at a time, because the server runs one at a time. It answers 429 to
+        // anything overlapping, and the poll tick is 500ms against 2-3s of inference — so
+        // four requests in five were born to be dropped. The server counted 78 requests,
+        // 57 drops and 14 completions across one scene, and the mod never saw a single
+        // failure because a 429 was handled silently.
+        //
+        // Issuing one and waiting is not slower. The rejected four were never going to
+        // produce anything; they only churned state and hid the real throughput.
+        foreach (RecordPlan inFlight in _plan)
+            if (inFlight.State == RecordState.InFlight) return;
 
         int from = _poolNextRecord.Count > 0 ? Math.Max(0, _poolNextRecord[0]) : 0;
         int to   = Math.Min(_plan.Count, from + lookahead);
