@@ -3391,6 +3391,12 @@ public class Mod : IModV1
         // The second copy is still written, by MirrorToTwin, which finds it at a learned
         // offset and verifies byte-for-byte before touching anything. That is the
         // mechanism that actually knows two addresses hold the same line.
+        // Report the outgoing plan before replacing it. A scene with sub-scenes re-arms
+        // as it moves between them, and coverage measured only at session end described
+        // the last plan alone — 1 of 11, while 67 records had been written across the
+        // session. A number that ignores most of its subject is worse than none.
+        LogSceneCoverage();
+
         lock (_writeLock)
         {
         _outsideReads = 0;
