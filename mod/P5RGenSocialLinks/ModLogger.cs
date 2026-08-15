@@ -55,6 +55,12 @@ internal sealed class ModLogger
         // specific run.
         try
         {
+            // Keep the previous run. Truncating per launch was right for "what did this
+            // session do", and wrong the moment a session worth diagnosing is followed by
+            // a relaunch before anyone looks — which is exactly what happens when the
+            // answer to "did it work?" is "no", and the reflex is to try again.
+            if (File.Exists(LogPath)) File.Copy(LogPath, LogPath + ".1", overwrite: true);
+
             File.WriteAllText(LogPath, $"=== P5RGenSocialLinks {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===\n");
             _path   = LogPath;
             _writer = new StreamWriter(LogPath, append: true) { AutoFlush = true };
