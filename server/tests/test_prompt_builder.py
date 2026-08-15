@@ -85,15 +85,32 @@ def test_all_confidants_build_prompt_without_error() -> None:
 # ones — "You're finally here, I've been" reached the screen with the rest cut off.
 
 
-def test_budget_appears_in_the_user_prompt() -> None:
+def test_the_stated_target_sits_below_the_real_capacity() -> None:
+    """
+    The model overshoots whatever number it is given, and an overshoot is discarded
+    whole rather than trimmed — the clip only keeps text ending on a sentence boundary.
+    Aiming below capacity leaves room for the overshoot to land inside it.
+    """
     _, user = build_prompt(8, 4, "at the gym", max_chars=30)
-    assert "30 characters" in user
+    assert "30 characters" not in user
+    assert "25 characters" in user      # 85% of 30
+
+
+def test_the_target_never_collapses_on_a_tiny_record() -> None:
+    _, user = build_prompt(8, 4, "at the gym", max_chars=12)
+    assert "12 characters" in user
+
+
+def test_the_prompt_asks_for_a_finished_sentence() -> None:
+    """An unfinished line is thrown away, so finishing matters more than length."""
+    _, user = build_prompt(8, 4, "at the gym", max_chars=40)
+    assert "Finish the sentence" in user
 
 
 def test_budget_is_also_given_in_words() -> None:
     """Models count words far more reliably than characters."""
     _, user = build_prompt(8, 4, "at the gym", max_chars=50)
-    assert "10 words" in user
+    assert "8 words" in user      # 85% of 50 is 42, at ~5 chars a word
 
 
 def test_word_budget_never_drops_below_three() -> None:

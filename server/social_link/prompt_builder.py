@@ -124,10 +124,19 @@ def build_prompt(
     #
     # Roughly five characters per word including the space. Words are what the model can
     # actually count; characters it can only estimate.
-    max_words = max(3, max_chars // 5)
+    # Aim below the real capacity, because the model overshoots whatever number it is
+    # given and a line that overshoots is discarded whole.
+    #
+    # The clip only keeps text ending on a sentence boundary — a fragment reads worse than
+    # the script it replaces — so an overshoot is not trimmed, it is thrown away, and the
+    # record is retried at ~1.5s a go. Records of 30 characters were being asked twice and
+    # still failing. Asking for 85% leaves room for the overshoot to land inside.
+    target = max(12, max_chars * 85 // 100)
+    max_words = max(3, target // 5)
     user = (
         f"[Scene context: {context}]\n"
-        f"[Hard limit: {max_chars} characters, about {max_words} words.]\n"
+        f"[Aim for about {target} characters, roughly {max_words} words. "
+        f"Finish the sentence — a complete short line beats a longer unfinished one.]\n"
         f"{confidant.name}:"
     )
     return system, user
