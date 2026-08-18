@@ -6132,3 +6132,117 @@ first line of text, and the tail where the names live are all cheap to log, and 
 them they say what the dialogue table actually contains and where the headers actually are.
 
 Guessing the layout has been tried. Reading it has not.
+
+---
+
+## Chapter 79: Every Address Points to Itself
+
+One hex dump settled a layout that two hypotheses had failed to guess.
+
+```
+[BMDHEX] head +0000  07 00 00 00 20 22 00 00 4D 53 47 31 00 00 00 00  |.... "..MSG1....|
+[BMDHEX] head +0010  AC 21 00 00 74 00 00 00 30 00 00 00 01 00 02 00  |.!..t...0.......|
+[BMDHEX] head +0020  00 00 00 00 8C 01 00 00 00 00 00 00 1C 02 00 00  |................|
+```
+
+`FileSize` at `+0x04` is `0x2220`, and the file is 8736 bytes. `DialogCount` at `+0x18` is
+`0x30` — 48. `IsRelocated` at `+0x1C` is 1. All as documented.
+
+Then the dialogue table at `+0x20`: `Kind = 0`, `Address = 0x18C`. And the first message
+header is at `0x1B0`, which `0x18C` is not, under any base I had tried.
+
+### The rule
+
+`0x1B0 − 0x18C = 0x24`, and `0x24` is where the address field itself sits — entry 0 begins
+at `0x20`, its `Kind` occupies four bytes, its `Address` occupies the next four.
+
+**A stored address is relative to the position of the field that stores it.**
+
+```
+dialog[0].Address  field @ 0x024, value 0x018C  ->  0x01B0   MSG_000_0_0
+speakerTable.Array field @ 0x1A0, value 0x1FE0  ->  0x2180   the name array
+speakerNames[0]    field @ 0x180, value 0x000C  ->  0x218C   "Takemi"
+speakerNames[1]    field @ 0x184, value 0x000F  ->  0x2193   "Girl's Father"
+speakerNames[2]    field @ 0x188, value 0x0019  ->  0x21A1   "Sick Girl"
+```
+
+Five for five, then fourteen more in a second file. That is what `IsRelocated = 1` means
+here: the fields named by the relocation table have been rewritten in place as self-relative
+deltas.
+
+`RelocationTable` at `+0x10` is the exception and proves the rule — it is a plain file
+offset, because it is the one field that cannot be listed in the table it points at. Both
+files confirm it: `0x21AC + 0x74 = 0x2220`, and `0xDDC + 0x27 = 0xE03`, each landing
+exactly on the end of its file.
+
+### The message header was right the whole time
+
+```
++01B0  4D 53 47 5F 30 30 30 5F 30 5F 30 00 ...   Name[24] = "MSG_000_0_0"
++01C8  01 00                                      PageCount = 1
++01CA  00 00                                      SpeakerId = 0  -> "Takemi"
++01CC  08 00 00 00                                PageStart[0], field-relative -> 0x1D4
++01D0  00 00 00 74                                TextBufferSize = 116
++01D4  F2 05 FF FF F1 41 ...                      text
+```
+
+Name, page count, speaker id, page table, text at `0x20 + 4·PageCount` — exactly Ch. 75.
+The parser was never the problem. Ch. 78 concluded the layout was wrong when only the
+addressing was, and the difference matters: `BmdMessage.TryParse` needed no change at all.
+
+The confirmation is a system message from the other file, which has no speaker:
+
+```
++00B8  03 00      PageCount = 3
++00BA  FF FF      SpeakerId = 0xFFFF
+```
+
+Three pages, nobody talking. That is a rank-up notification, and the sentinel is doing
+precisely what the format says it does.
+
+### Why the search found nothing
+
+`TryFindHeader` walks back from a text run. It assumed the run begins where the text buffer
+begins. It does not:
+
+```
++01D4  F2 05 FF FF F1 41 F6 86 01 01 6D 01 01 01 01 01 ...   text buffer starts here
++01FC  2E 2E 2E 53 6F 2C 20 77 68 79 20 63 6F 6D 65 20      "...So, why come "
+```
+
+Forty bytes of control codes sit between the two, and the pool scanner — which looks for
+printable ASCII — reports `0x1FC`. Every candidate header position was therefore shifted by
+a distance that varies per message, so nothing was ever tested at the right offset.
+
+Incidentally, that gap is where the notorious `+0x28` came from: `0x1FC − 0x1D4` is `0x28`.
+The number was real. It was the length of a control-code prefix, and I read it as the size
+of a header.
+
+### Stop searching
+
+There is no need to search backwards at all. `DialogCount` says how many messages there
+are, and the dialogue table says where each one is. The entire scene enumerates in a loop:
+
+```
+for i in 0 .. DialogCount-1:
+    field = 0x20 + 8*i + 4
+    message = field + int32(file, field)
+```
+
+Exact, ordered, and it yields the name, the speaker id and the text offset of every message
+in the file — including the ones the player never reaches, which is what pre-generation
+needs and what the observation channel of Ch. 78 could never provide.
+
+This is Ch. 73 again, one level down. That chapter deleted a heap scan because the game
+would hand over the pointer if asked. This deletes a header search because the file has a
+table of contents and I was walking backwards past it.
+
+### One free consequence
+
+The dialogue data ends where the speaker name array begins, at `0x2180`. Everything past
+that is names and the relocation table — not dialogue, and never safe to overwrite.
+
+`"Girl's Father"` is a thirteen-character run of printable ASCII sitting inside an armed
+region. The pool scanner has been finding it, and the only reason it was never rewritten is
+that thirteen characters fall below the generation floor. That was luck, not design, and
+knowing where the dialogue ends turns it into design.
