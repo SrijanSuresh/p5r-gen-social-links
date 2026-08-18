@@ -48,3 +48,23 @@ jobs:
 
       - name: Build (Release)
         run: dotnet build -c Release --no-restore
+
+  dotnet-tests:
+    name: Mod tests (.NET)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mod/P5RGenSocialLinks.Tests
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      # The test project links the parser sources rather than referencing the mod, so it
+      # carries no Reloaded or Win32 dependency and runs on the Linux runner unchanged.
+      - name: Run tests
+        run: dotnet test -v minimal

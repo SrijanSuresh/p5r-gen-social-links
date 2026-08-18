@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>P5RGenSocialLinks.Tests</RootNamespace>
+  </PropertyGroup>
+
+  <!-- Source files are linked in rather than reached through a ProjectReference.
+
+       The mod assembly pulls in Reloaded and touches Win32 through P/Invoke, so
+       referencing it would drag a Windows-only runtime dependency into a test suite whose
+       whole subject is byte layout. The parsers under test have no dependencies at all —
+       they take a byte[] and return a struct — so compiling them into the test assembly
+       keeps the suite portable and lets it see `internal` types without InternalsVisibleTo. -->
+  <ItemGroup>
+    <Compile Include="../P5RGenSocialLinks/Memory/BmdMessage.cs"
+             Link="Memory/BmdMessage.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+</Project>
