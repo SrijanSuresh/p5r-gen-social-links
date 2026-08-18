@@ -261,10 +261,37 @@ can fast-forward, while typed input is the case where they have just spent 5–1
 at a keyboard — you cannot mash past your own typing. What remains unsolved is the input
 channel itself (Reloaded console, a server-hosted page, or an in-game field with IME work).
 
-**Also queued:** speaker attribution. Every record in a pool is currently rewritten in the
-confidant's voice, so a scene with other characters — Takemi's rank-up involves a patient
-and her father — puts her words in their mouths. The BMD labels may carry the speaker;
-they are not parsed yet.
+### ✅ Speaker attribution
+A rank-up scene is not one person talking. Takemi's involves a patient and her father, and
+every one of their lines used to be rewritten in Takemi's voice, because the only thing the
+mod knew about a record was that it was a record.
+
+The mod now parses the scene's MSG1 archive: the dialogue table locates every message, each
+message header carries a speaker id, and the speaker table resolves it to a name. Records
+belonging to anyone else are left alone, and — more useful — handed to the model as the
+other half of the conversation, so a generated line replies to the question that was
+actually asked.
+
+Measured on Takemi's clinic scene:
+
+```
+[SPEAKER] MSG1 at 0x424D59ACB0: 48 messages, 3 speakers, dialogue ends at file+0x2180
+[SPEAKER]   [0] Takemi
+[SPEAKER]   [1] Girl's Father
+[SPEAKER]   [2] Sick Girl
+[SPEAKER] Tae Takemi: 37 own, 20 other, 7 unattributed
+[SCENE] replaced 29/31 records (93%), 27 left to other speakers
+```
+
+Getting there cost two wrong guesses about the format, both recorded in `learning.md`
+Ch. 75–80. The rule that finally worked: **every stored address in a BMD is relative to the
+position of the field that stores it.** Nothing in the documentation says so; one hex dump
+did.
+
+**Next up:** who a line is spoken *to*. Attribution says who is talking, but the prompt still
+assumes the listener is always Joker — so Takemi tells a child's father about "your parents",
+and answers "can I go to school tomorrow?" with a line aimed at the protagonist. The scene
+has an addressee as well as a speaker, and only one of them is modelled.
 
 ---
 

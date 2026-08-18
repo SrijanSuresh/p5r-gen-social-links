@@ -5749,3 +5749,589 @@ None of them failed loudly. They produced confident, well-logged, wrong behaviou
 is the argument for logging the *reasoning* and not only the outcome. `record 0/207`
 against `record 0/180` is the entire second bug, visible in one line, and only because
 the log prints the denominator.
+
+---
+
+## Chapter 75: The Header You Have Been Skipping Over
+
+Every record the interpreter hands us starts with twenty-four bytes we have spent the
+whole project stepping around.
+
+`ReadRecordPreview` opens with a loop whose entire purpose is to get past them:
+
+```csharp
+for (int start = 0; start < Window; start++)
+{
+    if (!IsPrintable(_recordBuf[start])) continue;
+    ...
+    if (end - start < 8) { start = end; continue; }
+```
+
+Skip the unprintable bytes, skip anything shorter than eight characters, take the first
+run that reads like English. It works. It also throws away the answer to the question we
+sat down to solve today.
+
+### The bug, stated precisely
+
+A Takemi rank-up scene is not Takemi talking for twelve records. It is Takemi, a patient,
+the patient's father, and a narrator, interleaved. The mod rewrites all of them in
+Takemi's voice, because the only thing it knows about a record is that it is a record.
+
+The failure is not subtle in play. The father says something dry and clinical about his
+daughter's treatment; a nurse asks a question and answers herself in a doctor's cadence.
+The lines are individually decent — the model is doing its job — and collectively wrong,
+because they are attributed to whoever happens to be on screen.
+
+There is no heuristic fix here. You cannot infer the speaker from the text, because the
+text is the thing being replaced. Whatever tells us who is talking has to be read before
+the first write, from the game's own data.
+
+### What is actually at record+0
+
+Atlus ships dialogue in `.BMD` files (`MSG1` format, shared across Persona 3/4/5 and
+documented by the AtlusScriptToolkit project). A dialogue message inside one is a struct,
+not a string:
+
+```
+offset  size  field
+0x00      24  Name          e.g. "MSG_001_5_0", NUL-padded ASCII
+0x18       2  PageCount     int16 — speech bubbles in this message
+0x1A       2  SpeakerId     uint16 — index into the file's speaker table, 0xFFFF = none
+0x1C   4*n    PageStartAddresses   int32 each, n = PageCount
+ ...       4  TextBufferSize
+ ...       ?  TextBuffer    the bytes we have been rewriting
+```
+
+Read that layout against the one measurement we already have. Ch. 69 recorded the first
+character of a live record at `+0x28`:
+
+```
+0x1C + 4*PageCount + 4 = text
+       PageCount = 1  ->  0x24
+       PageCount = 2  ->  0x28   <-- the one we measured
+       PageCount = 3  ->  0x2C
+```
+
+A two-page message. The layout predicts the number we already had, which is the only kind
+of confirmation worth anything before a scene has been run.
+
+It also explains the cursor. `RDX` at the hook site is not "characters printed so far
+from the top of the text" — it is a byte offset from the *record* base, and the first
+value it can hold is the page start address, which is `0x28` for a two-page message. We
+have been reading the page table's contents out of a register without recognising them.
+
+And `MSG_001_5_0`, the symbol we have been seeing in hex dumps and treating as pool
+scenery, is not scenery. It is field one of the struct we are standing on.
+
+### Why the name matters as much as the speaker id
+
+`SpeakerId` is an index, and an index needs its table. That table lives in the `MSG1`
+file header, which is somewhere behind us in the region — findable, but a second problem.
+
+The name is free. It is right there at offset zero, it is ASCII, and it carries structure:
+`MSG_001_5_0` is a message id, and `SEL_003` (which the interpreter also serves) is a
+selection prompt — a menu, not a line of dialogue. Rewriting a menu option is a different
+and worse bug than rewriting the wrong speaker, and one string comparison rules it out.
+
+So the first cut is: read the header, log the name and the speaker id for every record we
+watch, and change nothing else. Two scenes of evidence, then decisions.
+
+This is the discipline Ch. 74 arrived at the hard way. Every bug in this project has been
+a rule that was true when it was written — "one session, one pool", "the armed regions are
+copies", "reads run monotonically". Each one was reasonable, each one was tested against
+exactly one scene, and each one was wrong the first time a different scene ran. The layout
+above is a claim from documentation plus one confirming offset. That is a hypothesis, and
+it gets logged before it gets trusted.
+
+### The part that is not a bug fix
+
+Attribution is also the missing half of the context.
+
+Right now a generated Takemi line is given the scripted line it replaces and Takemi's own
+previous lines. It is never told that the line before hers was the father asking a
+question, because the mod has no concept of "the father". Once records carry a speaker,
+the ones we do *not* rewrite stop being obstacles and become the conversation: the model
+can answer the question that was actually asked.
+
+The scene stops being a list of slots to overwrite and becomes a script with parts.
+
+---
+
+## Chapter 76: An Index Needs Its Table
+
+`SpeakerId` is a number. Ch. 75 got it out of the record header, and on its own it is
+worth almost nothing: knowing that record 4 and record 9 share speaker 2 tells you they
+are the same person, not who that person is.
+
+The mod needs the name, because the decision it has to make is "is this the confidant we
+are generating for?" — and the only handle it has on the confidant is a name, read out of
+a completely different structure (the CMM session struct, `ConfidantId` → `arcana.py`).
+
+### Where the table lives
+
+The `MSG1` file that contains the records also contains the table:
+
+```
+0x00       1  FileType
+0x01       1  Format
+0x02       2  UserId
+0x04       4  FileSize
+0x08       4  Magic                "MSG1"
+0x0C       4  ExtSize
+0x10       4  RelocationTable
+0x14       4  RelocationTableSize
+0x18       4  DialogCount
+0x1C       2  IsRelocated
+0x1E       2  Version
+0x20     8*n  DialogEntry[n]       { int Kind; int Address; }
+ ...      16  SpeakerTable         { int ArrayAddress; int Count; int ExtAddress; int _ }
+```
+
+`ArrayAddress` points at an array of `Count` addresses, each pointing at a NUL-terminated
+name. Two hops from an index to a string.
+
+### The problem with every address in that layout
+
+None of them are file offsets. They are relative to a base, and the base is a convention
+of the format rather than something stored in it. The one the toolchain uses is file start
+plus `0x10`; whether P5R's runtime copy keeps that after relocation is not something this
+mod can look up.
+
+The tempting move is to pick one and move on. Do not. A wrong base here does not crash and
+does not return empty — it walks into the middle of the dialogue data and reads whatever
+NUL-terminated run it lands on. The failure mode of guessing is *plausible names for the
+wrong speakers*, which is indistinguishable from success until someone plays the scene and
+notices the nurse talking like a doctor. That is precisely the class of bug Ch. 74 is about.
+
+### Let the data decide
+
+There is a check available that costs nothing. The dialogue table is a list of addresses to
+message records, and Ch. 75 already knows how to tell whether bytes are a message record.
+
+So: try each candidate base, resolve the first few dialogue entries, and require that they
+land on something `BmdMessage.TryParse` accepts — twenty-four bytes of printable ASCII with
+exact NUL padding, followed by a plausible page count. A wrong base fails that immediately,
+because the interior of a text buffer does not look like a header.
+
+The base is not assumed, it is *recovered*, and the recovery is verified against a
+structure we can independently parse. This is the same shape as the self-consistency test
+in `TryFindHeader` — accept the interpretation that predicts data you can already check —
+and it is going to keep being the answer, because reverse engineering never gives you a
+spec, only agreement between structures.
+
+### The magic is the anchor
+
+One more circularity to break: the parse needs the file start, and all we have is a record
+address somewhere inside the file.
+
+`MSG1` is four bytes at file+8, so the file start is a backwards search away. Nearest match
+wins, and that is not a tie-break — several BMDs are resident at once, and a record belongs
+to the file immediately behind it. Searching to the front of the region and taking the
+first hit would attribute a Takemi scene to whatever was loaded before it.
+
+### What is still guesswork, stated plainly
+
+Two things:
+
+- Whether the runtime copy is relocated at all. If P5R rewrites the addresses into real
+  pointers on load, neither candidate base resolves and the whole struct fails — which is
+  fine, because it fails *closed*: no table, no names, no attribution, and the mod keeps
+  behaving exactly as it did yesterday.
+- Whether P5R's speaker names are plain ASCII. They carry inline formatting codes, which
+  are stripped rather than rendered, so the worst case is a name with a character missing
+  rather than line noise in a prompt.
+
+Both are answered by one line of log from one real scene, which is where this stops being
+a chapter and starts being evidence.
+
+---
+
+## Chapter 77: Two Names for the Same Person
+
+The speaker table gives a label. The session struct gives a confidant id, which
+`ConfidantNames` turns into a display name. Attribution is the question of whether those
+two strings are the same person, and they are almost never the same string.
+
+The game labels a bubble `Takemi`. The mod calls her `Tae Takemi`. It labels one `Dr.
+Takemi` when the patient is speaking to her, `Ryuji` where the mod says `Ryuji Sakamoto`,
+and `???` before an introduction.
+
+### Why not just substring
+
+`speaker.Contains(name) || name.Contains(speaker)` handles the easy cases and quietly
+breaks on the interesting one. `Sakura` is inside `Futaba Sakura` and inside `Sojiro
+Sakura`. In a Futaba scene, every line Sojiro speaks would be attributed to Futaba and
+rewritten in her voice — which is exactly the bug this whole chapter exists to remove,
+reintroduced by the fix for it.
+
+`Niijima` is the same problem for Makoto and Sae, and those two share scenes constantly.
+
+### Tokens, minus the parts that are not names
+
+So compare word by word. Lowercase, drop anything that is not a letter (which handles
+`Dr.` losing its full stop, and `???` reducing to nothing at all), and drop the words that
+are titles rather than names — `dr`, `mr`, `ms`, `sensei`, `san`, `kun`, `chan`, `senpai`.
+Tokens shorter than three letters go too; nothing distinguishing survives at two.
+
+A shared token is then a candidate match. `Takemi` ∩ `{tae, takemi}` is non-empty. So is
+`Sakura` ∩ `{futaba, sakura}` — which is where the interesting part starts.
+
+### Let the table say which tokens are worth trusting
+
+A token that appears in more than one confidant's name cannot identify anybody. And the
+mod already holds every confidant's name, so it does not have to be told which tokens
+those are — it can work them out:
+
+```
+sakura   -> Futaba Sakura, Sojiro Sakura     ambiguous
+niijima  -> Makoto Niijima, Sae Niijima      ambiguous
+takemi   -> Tae Takemi                       distinctive
+futaba   -> Futaba Sakura                    distinctive
+```
+
+Match on distinctive tokens only. `Sakura` alone now matches nobody, which is the correct
+answer — the label genuinely does not say which one — while `Futaba` and `Sojiro` both
+still resolve. The rule maintains itself: adding a confidant whose surname collides with
+an existing one silently moves that surname into the ambiguous set, rather than silently
+creating a mis-attribution.
+
+This is the second time in two chapters that the answer has been *derive it from data you
+already hold* rather than *write down what you believe*. That is not a coincidence. Every
+hand-written table in this project has been wrong at least once — `ConfidantNames` was
+wrong about Takemi for months because two entries were missing above her.
+
+### What a non-match means
+
+Not "skip". Not yet.
+
+A record that is not the confidant's is still part of the conversation, and up to now the
+mod has had no way to say so. The scripted line is left alone *and* handed to the model as
+context, attributed to whoever the table named. The line the confidant says next is then a
+reply to a question that was actually asked, instead of a plausible sentence dropped into a
+gap.
+
+The scene stops being a list of slots and becomes a script with parts — which was the
+closing sentence of Ch. 75, and is the point of the whole exercise.
+
+### Failing closed
+
+Every step here can fail: no archive, no speaker table, an unknown label, an ambiguous one.
+All of them resolve to the same answer — *not attributable* — and the gate treats "not
+attributable" as "do not rewrite".
+
+That is the conservative direction, and it costs coverage. A scene whose archive does not
+parse rewrites nothing at all, where yesterday it rewrote everything. So the gate ships
+behind `speaker_filter_enabled`, off by default, and the first run produces the log that
+says whether the attribution is trustworthy. Turning it on is a decision made with evidence
+in hand, not a hope compiled in.
+
+---
+
+## Chapter 78: The Pointer Was Never the Record
+
+Ch. 75 opened with "every record the interpreter hands us starts with twenty-four bytes we
+have spent the whole project stepping around." A scene later, the count is nought for
+sixty-five:
+
+```
+[SPEAKER] 0/65 records attributed; none
+[SPEAKER]   #0 ? spk=65535
+```
+
+Not a partial failure, not a wrong speaker id. `BmdMessage.TryParse` never once returned
+true against live memory.
+
+### The line that settles it
+
+```
+[WATCH] in-pool record=0x4211C245E3 cursor=0x7 "Girl's Father"
+```
+
+`Girl's Father` is a speaker name, and a speaker name is a bare NUL-terminated string —
+it has no page count, no page table, no header of any kind. The interpreter loaded its
+address into RAX and started fetching characters, exactly as it does for a line of
+dialogue.
+
+So `mov rax,[rbx+0x20]` is not a message record. It is *the string currently being drawn*.
+The struct that owns it is somewhere else, and everything Ch. 75 built on top of that
+address was built on a misreading.
+
+The `[GAP]` dumps say the same thing from the other side:
+
+```
+[GAP] 27B between #3 and #4: 0A F2 23 00 00 F1 21 F2 05 FF FF F1 41 F7 61 09 01 01 ...
+```
+
+Twenty-seven bytes between one bubble and the next, and not one of them is ASCII. A
+twenty-four byte name would be unmissable there. There is no header between the texts.
+
+### Where the wrong number came from
+
+Ch. 75's confirmation was that the layout predicted the text at `+0x28`, and `0x1C + 4·2 +
+4` is `0x28` for a two-page message. That felt like the layout agreeing with a measurement.
+
+It was not a measurement. `+0x28` came from `AdvancePoolCursor`, which matches a record
+address to a text run *within a window*:
+
+```csharp
+const int HeaderWindow = 0x80;
+...
+if (textOff - offset > HeaderWindow) break;
+```
+
+`0x28` was one observation of a distance that the code permits to be anything up to `0x80`.
+A tolerance got written down as a fact, and then a documented file format was accepted
+because it reproduced the fact.
+
+This is not the Ch. 74 failure — a rule that was true and stopped being true. It is worse
+and simpler: a number that was never load-bearing, promoted to evidence because it agreed
+with what I already wanted to believe. The right question about `+0x28` was "how was that
+obtained?", and I did not ask it.
+
+### What is still standing
+
+Three things, all worth keeping:
+
+- **The file is real and findable.** `MSG1 at 0x4211C22450 (8736B)` — the magic search
+  works, the declared size is plausible, and the first line's text lands at `file+0x1D4`.
+  Everything about locating the archive held; only the interpretation of its interior did
+  not.
+- **Speaker names live near the end of it.** `0x4211C245E3` is `file+0x2193` of `0x2220` —
+  the last hundred and forty bytes. That is where a name array belongs, and the game
+  reading strings out of it is direct evidence the array is there.
+- **The rejection filter did its job.** `TryParse` was strict about NUL padding precisely
+  so it would refuse rubbish, and when the layout turned out to be wrong it refused
+  everything rather than inventing sixty-five plausible names. A loose parser would have
+  attributed this scene confidently and wrongly, and the log would have looked like
+  success.
+
+### The thing the game handed over unasked
+
+It draws the speaker's name. Through the same interpreter, from a fixed address, re-read
+every time the bubble changes:
+
+```
+15:44:58.253  record=0x4211C22938 "So it seems her body's developed"
+15:44:58.254  record=0x4211C245E3 "Girl's Father"
+```
+
+One millisecond apart. Who is speaking is observable without parsing anything at all —
+which is Ch. 65's lesson arriving a second time, from a different direction: *ask the
+consumer, not the format*.
+
+It is not a complete answer, because pre-generation runs eight records ahead of the player
+and this only reports the line being drawn now. But it is a free, exact ground truth for
+the current line, and that makes it something better than a fallback — it is a way to
+check whatever the format-parsing eventually claims.
+
+### What happens next is a hex dump, not another hypothesis
+
+Two hypotheses have now been offered for the interior of this file and one has been tested.
+The next step is not a third. The file's first `0x60` bytes, the `0x60` bytes ahead of the
+first line of text, and the tail where the names live are all cheap to log, and between
+them they say what the dialogue table actually contains and where the headers actually are.
+
+Guessing the layout has been tried. Reading it has not.
+
+---
+
+## Chapter 79: Every Address Points to Itself
+
+One hex dump settled a layout that two hypotheses had failed to guess.
+
+```
+[BMDHEX] head +0000  07 00 00 00 20 22 00 00 4D 53 47 31 00 00 00 00  |.... "..MSG1....|
+[BMDHEX] head +0010  AC 21 00 00 74 00 00 00 30 00 00 00 01 00 02 00  |.!..t...0.......|
+[BMDHEX] head +0020  00 00 00 00 8C 01 00 00 00 00 00 00 1C 02 00 00  |................|
+```
+
+`FileSize` at `+0x04` is `0x2220`, and the file is 8736 bytes. `DialogCount` at `+0x18` is
+`0x30` — 48. `IsRelocated` at `+0x1C` is 1. All as documented.
+
+Then the dialogue table at `+0x20`: `Kind = 0`, `Address = 0x18C`. And the first message
+header is at `0x1B0`, which `0x18C` is not, under any base I had tried.
+
+### The rule
+
+`0x1B0 − 0x18C = 0x24`, and `0x24` is where the address field itself sits — entry 0 begins
+at `0x20`, its `Kind` occupies four bytes, its `Address` occupies the next four.
+
+**A stored address is relative to the position of the field that stores it.**
+
+```
+dialog[0].Address  field @ 0x024, value 0x018C  ->  0x01B0   MSG_000_0_0
+speakerTable.Array field @ 0x1A0, value 0x1FE0  ->  0x2180   the name array
+speakerNames[0]    field @ 0x180, value 0x000C  ->  0x218C   "Takemi"
+speakerNames[1]    field @ 0x184, value 0x000F  ->  0x2193   "Girl's Father"
+speakerNames[2]    field @ 0x188, value 0x0019  ->  0x21A1   "Sick Girl"
+```
+
+Five for five, then fourteen more in a second file. That is what `IsRelocated = 1` means
+here: the fields named by the relocation table have been rewritten in place as self-relative
+deltas.
+
+`RelocationTable` at `+0x10` is the exception and proves the rule — it is a plain file
+offset, because it is the one field that cannot be listed in the table it points at. Both
+files confirm it: `0x21AC + 0x74 = 0x2220`, and `0xDDC + 0x27 = 0xE03`, each landing
+exactly on the end of its file.
+
+### The message header was right the whole time
+
+```
++01B0  4D 53 47 5F 30 30 30 5F 30 5F 30 00 ...   Name[24] = "MSG_000_0_0"
++01C8  01 00                                      PageCount = 1
++01CA  00 00                                      SpeakerId = 0  -> "Takemi"
++01CC  08 00 00 00                                PageStart[0], field-relative -> 0x1D4
++01D0  00 00 00 74                                TextBufferSize = 116
++01D4  F2 05 FF FF F1 41 ...                      text
+```
+
+Name, page count, speaker id, page table, text at `0x20 + 4·PageCount` — exactly Ch. 75.
+The parser was never the problem. Ch. 78 concluded the layout was wrong when only the
+addressing was, and the difference matters: `BmdMessage.TryParse` needed no change at all.
+
+The confirmation is a system message from the other file, which has no speaker:
+
+```
++00B8  03 00      PageCount = 3
++00BA  FF FF      SpeakerId = 0xFFFF
+```
+
+Three pages, nobody talking. That is a rank-up notification, and the sentinel is doing
+precisely what the format says it does.
+
+### Why the search found nothing
+
+`TryFindHeader` walks back from a text run. It assumed the run begins where the text buffer
+begins. It does not:
+
+```
++01D4  F2 05 FF FF F1 41 F6 86 01 01 6D 01 01 01 01 01 ...   text buffer starts here
++01FC  2E 2E 2E 53 6F 2C 20 77 68 79 20 63 6F 6D 65 20      "...So, why come "
+```
+
+Forty bytes of control codes sit between the two, and the pool scanner — which looks for
+printable ASCII — reports `0x1FC`. Every candidate header position was therefore shifted by
+a distance that varies per message, so nothing was ever tested at the right offset.
+
+Incidentally, that gap is where the notorious `+0x28` came from: `0x1FC − 0x1D4` is `0x28`.
+The number was real. It was the length of a control-code prefix, and I read it as the size
+of a header.
+
+### Stop searching
+
+There is no need to search backwards at all. `DialogCount` says how many messages there
+are, and the dialogue table says where each one is. The entire scene enumerates in a loop:
+
+```
+for i in 0 .. DialogCount-1:
+    field = 0x20 + 8*i + 4
+    message = field + int32(file, field)
+```
+
+Exact, ordered, and it yields the name, the speaker id and the text offset of every message
+in the file — including the ones the player never reaches, which is what pre-generation
+needs and what the observation channel of Ch. 78 could never provide.
+
+This is Ch. 73 again, one level down. That chapter deleted a heap scan because the game
+would hand over the pointer if asked. This deletes a header search because the file has a
+table of contents and I was walking backwards past it.
+
+### One free consequence
+
+The dialogue data ends where the speaker name array begins, at `0x2180`. Everything past
+that is names and the relocation table — not dialogue, and never safe to overwrite.
+
+`"Girl's Father"` is a thirteen-character run of printable ASCII sitting inside an armed
+region. The pool scanner has been finding it, and the only reason it was never rewritten is
+that thirteen characters fall below the generation floor. That was luck, not design, and
+knowing where the dialogue ends turns it into design.
+
+---
+
+## Chapter 80: Two Files, Two Answers
+
+The self-relative rule from Ch. 79 went in, and the next scene split cleanly down the
+middle.
+
+```
+[SPEAKER] MSG1 at 0x424C630190: 14 messages, 0 speakers, dialogue ends at file+0xDDC
+[SPEAKER] 35/35 records attributed; narrationx35
+[SPEAKER]   #0 CMM_EVENT_OPEN spk=65535
+[SPEAKER]   #4 CMM_EVENT_RANKUP_2 spk=65535
+```
+
+Fourteen messages, every one located, every name read, and the speaker sentinel correct for
+a file that has no speakers at all. The rule is right.
+
+```
+[SPEAKER] MSG1 at 0x41DC897020 (8736B) did not resolve
+```
+
+The clinic file, same 8736 bytes as the dump that produced the rule, still fails.
+
+### All or nothing was the wrong contract
+
+`TryParse` refuses the archive if any one of the 48 dialogue entries does not resolve. That
+was a deliberate choice in Ch. 76, made for a good reason — half a scene attributed under a
+wrong rule is worse than none, because it looks like it worked.
+
+The reason no longer applies. The rule is not in question any more; a second file confirmed
+it end to end. What is in question is whether every *entry* in a file is the same kind of
+thing, and one odd entry out of 48 should not cost the other 47.
+
+But the fix is not simply to skip the odd one. Skipping leaves a hole in the offset map, and
+containment matching would then hand that hole's text to the previous message — silently
+attributing one character's lines to another, which is the original bug wearing a different
+hat.
+
+So an entry that does not parse becomes a **hole that is still on the map**: recorded at its
+own offset, named nothing, speaker `NoSpeaker`. Text landing inside it resolves to
+"unattributed", which the filter already treats as "leave this line alone". The archive
+degrades to less coverage instead of to wrong coverage.
+
+### What the odd entry probably is
+
+The scene has a choice in it — `"Yes, I'm sure!"` appears in the watch log, and that is a
+menu option, not a line. The format has a second record kind for exactly this, and the
+dialogue entry's `Kind` field distinguishes them:
+
+```
+MessageDialog                    SelectionDialog
+  char[24] Name                    char[24] Name
+  int16    PageCount    @0x18      int16    Ext          @0x18
+  int16    SpeakerId    @0x1A      int16    OptionCount  @0x1A
+  int32[]  PageStarts             int32[]  OptionStarts
+```
+
+Same shape, but the count moves from `0x18` to `0x1A` and there is no speaker at all. Read
+as a message, a selection offers whatever sits in `Ext` as its page count — and
+`BmdMessage.TryParse` rejects an implausible one, which is exactly what it is built to do.
+
+That is a hypothesis, not a measurement, and this chapter has learned not to promote one to
+the other. It ships with the hole mechanism underneath it, so if it is wrong the file still
+parses and the selections come out unattributed. And the log now names the first entry that
+failed and dumps its bytes, so a second wrong guess costs one line of log rather than a
+session.
+
+Selections must never be rewritten regardless. Changing what the buttons say without
+changing what they do is a worse bug than a mis-attributed line.
+
+### The other thing this scene taught
+
+Zero records were replaced, and the mod's log gave no reason. The server console did:
+
+```
+POST /generate HTTP/1.1" 503 Service Unavailable
+```
+
+The inference backend was down for the entire run. On the mod's side that path retries three
+times at eight-second intervals and then throws, and the throw is caught by a handler that
+logs nothing on the first attempt. So a dead backend looked, from the log, like a queue that
+simply never produced anything — and the only visible trace was a thirty-second gap between
+two `[PREGEN] requested` lines, which you have to already suspect the answer to notice.
+
+This is the same defect as the 429 storm of Ch. 72, in the same place, found the same way:
+by reading the *server's* log because the mod's log was silent. The rule that keeps being
+relearned is that a failure which is handled is not a failure which is understood, and the
+handler is exactly where the log line belongs.

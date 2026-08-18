@@ -101,6 +101,33 @@ internal sealed class GenConfig
     public bool MsgHookEnabled { get; init; } = true;
 
     /// <summary>
+    /// Only rewrite records whose BMD header attributes them to the active confidant.
+    ///
+    /// A rank-up scene is not one person talking. Takemi's involves a patient and her
+    /// father, and without this every one of their lines is rewritten in her voice.
+    ///
+    /// On since the archive layout was read out of a hex dump rather than guessed, and
+    /// checked against nineteen addresses across two live files (Ch. 79).
+    ///
+    /// Safe to leave on even if a future scene does not parse: a scene with nothing at all
+    /// attributed to the confidant is refused rather than filtered, so a broken chain costs
+    /// the attribution and not the mod. Set false to rule the filter out while diagnosing
+    /// something else.
+    /// </summary>
+    [JsonPropertyName("speaker_filter_enabled")]
+    public bool SpeakerFilterEnabled { get; init; } = true;
+
+    /// <summary>
+    /// Dump the scene archive's header, the bytes ahead of its first line, and its tail.
+    ///
+    /// A dozen log lines once per armed scene. On while the BMD interior is still being
+    /// worked out — two hypotheses have been offered for it and one has already been
+    /// tested to destruction, so the layout gets read rather than guessed (Ch. 78).
+    /// </summary>
+    [JsonPropertyName("bmd_dump_enabled")]
+    public bool BmdDumpEnabled { get; init; } = true;
+
+    /// <summary>
     /// When true, PointerChainResolver logs each chain step with address and dereferenced value.
     /// Useful for diagnosing broken pointer chains after a game patch; leave false in production.
     /// </summary>

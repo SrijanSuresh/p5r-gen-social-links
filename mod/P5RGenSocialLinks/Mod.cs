@@ -48,6 +48,8 @@ public class Mod : IModV1
     // never disturb a pool scan mid-walk, even though both run on the poll thread today.
     private readonly byte[]              _recordBuf = new byte[128];
     private readonly byte[]              _mirrorBuf = new byte[128];
+    private readonly byte[]              _headerBuf = new byte[BmdMessage.HeaderBytes];
+    private bool                         _speakerAudited;
 
     // Guards the pool write path. Flushing now happens from two places — the poll tick
     // and the thread-pool continuation that finishes a generation — and both walk the
@@ -2795,6 +2797,11 @@ public class Mod : IModV1
             // scene line reported as "elsewhere" means the ranking missed the live buffer.
             string where = AdvancePoolCursor(record) ? "in-pool  " : "elsewhere";
 
+            // The struct in front of the text, read but not yet acted on. Ch. 75 derives
+            // the layout from the MSG1 format and one live measurement; two scenes of
+            // this log decide whether it survives contact with a real pool.
+            string header = TryReadHeader(record, out BmdMessage msg) ? msg.ToString() : "unparsed";
+
             // Arm from the read itself. Gated on an active hang-out because the
             // interpreter serves every string in the game — menus, item names, the
             // newspaper — and arming on the first record seen anywhere would point the
@@ -2811,7 +2818,8 @@ public class Mod : IModV1
             LearnTwinDelta(record, text);
 
             if (logged++ < MaxLogged)
-                _modLog!.Info($"[WATCH] {where} record=0x{record:X} cursor=0x{cursor:X} \"{text}\"");
+                _modLog!.Info($"[WATCH] {where} record=0x{record:X} cursor=0x{cursor:X} " +
+                              $"[{header}] \"{text}\"");
             else
                 suppressed++;
         }
@@ -2877,13 +2885,18 @@ public class Mod : IModV1
     {
         if (_plan.Count == 0) return;
 
-        int written = 0, pending = 0, tooSmall = 0;
+        int written = 0, pending = 0, tooSmall = 0, foreign = 0;
         var gaps = new System.Text.StringBuilder();
         foreach (RecordPlan record in _plan)
         {
             bool replaced = record.WasWritten;
             if (replaced) { written++; continue; }
             if (record.Original.Length < 8) continue;   // never a candidate
+
+            // Another character's line is not a miss. Counting it as one would report a
+            // Takemi scene shared with a patient and her father as half-failed, when
+            // leaving those lines alone is the whole point of the filter.
+            if (record.State == RecordState.Foreign) { foreign++; continue; }
 
             // Records we deliberately never queue are not failures, and counting them as
             // misses understated the result: the first report read 17/22 when five of the
@@ -2897,6 +2910,7 @@ public class Mod : IModV1
         int candidates = written + pending;
         int percent    = candidates == 0 ? 0 : written * 100 / candidates;
         _modLog!.Info($"[SCENE] replaced {written}/{candidates} records ({percent}%)" +
+                      (foreign  > 0 ? $", {foreign} left to other speakers" : "") +
                       (tooSmall > 0 ? $", {tooSmall} too short to try" : "") +
                       (gaps.Length > 0 ? $" — missed {gaps}" : ""));
     }
@@ -2937,23 +2951,20 @@ public class Mod : IModV1
         const int Budget = 1000;
         int from = Math.Max(0, record.Index - 4);
 
+        // Whether this scene resolved speaker names at all. Without them every earlier
+        // line has to be presented as the confidant's own, which is what the unattributed
+        // path below does; with them, the history can name who said what.
+        bool attributed = false;
+        foreach (RecordPlan planned in _plan)
+            if (planned.Speaker.Length > 0) { attributed = true; break; }
+
         while (true)
         {
             var history = new System.Text.StringBuilder();
             if (from < record.Index)
             {
-                // Attribution matters more than it looks. These are the speaker's own
-                // earlier lines, and calling them "the conversation so far" made the model
-                // read them as the other person's: replacing Ryuji explaining the pricing,
-                // it answered him instead — "Fair enough, bro, that's a small price."
-                history.Append(" You have just said, oldest first:");
-                for (int i = from; i < record.Index; i++)
-                {
-                    string said = _plan[i].Generated ?? _plan[i].Original;
-                    if (said.Length > 0) history.Append(" \"").Append(said).Append('"');
-                }
-                history.Append(" Carry on from your own last line — you are still talking, " +
-                               "not replying to someone.");
+                if (attributed) AppendCast(history, snap, record, from);
+                else            AppendMonologue(history, record, from);
             }
 
             if (ctx.Length + history.Length <= Budget || from >= record.Index)
@@ -2965,6 +2976,72 @@ public class Mod : IModV1
             from++;   // give up the oldest line and try again
         }
     }
+
+    /// <summary>
+    /// Earlier lines with nobody's name on them, presented as the confidant's own.
+    ///
+    /// This is the shape the context had before speaker attribution existed, and it is
+    /// still the right one when a scene's archive does not resolve: every line has to be
+    /// attributed to somebody, and the confidant is the only name available.
+    ///
+    /// The wording is load-bearing. Calling this block "the conversation so far" made the
+    /// model read the lines as the other person's and answer them — replacing Ryuji
+    /// explaining the gym's pricing, it came back with "Fair enough, bro, that's a small
+    /// price," which is a reply to himself.
+    /// </summary>
+    private void AppendMonologue(
+        System.Text.StringBuilder history, RecordPlan record, int from)
+    {
+        history.Append(" You have just said, oldest first:");
+        for (int i = from; i < record.Index; i++)
+        {
+            string said = _plan[i].Generated ?? _plan[i].Original;
+            if (said.Length > 0) history.Append(" \"").Append(said).Append('"');
+        }
+        history.Append(" Carry on from your own last line — you are still talking, " +
+                       "not replying to someone.");
+    }
+
+    /// <summary>
+    /// Earlier lines with their speakers named — the scene as a script rather than a
+    /// monologue.
+    ///
+    /// This is the half of attribution that improves lines rather than protecting them.
+    /// The records the filter declines to rewrite are not obstacles; they are the other
+    /// half of the conversation, and until now the mod had no way to say so. A Takemi
+    /// line that follows her patient's father asking a question can now answer the
+    /// question, instead of being a plausible sentence dropped into the gap.
+    ///
+    /// The closing instruction changes with the last speaker, because "carry on from your
+    /// own last line" is exactly wrong when the last line was somebody else's.
+    /// </summary>
+    private void AppendCast(
+        System.Text.StringBuilder history, SocialLinkSnapshot snap, RecordPlan record, int from)
+    {
+        history.Append(" The conversation so far, oldest first:");
+        for (int i = from; i < record.Index; i++)
+        {
+            string said = _plan[i].Generated ?? _plan[i].Original;
+            if (said.Length == 0) continue;
+
+            history.Append(' ')
+                   .Append(IsConfidantLine(snap, _plan[i]) ? "You" : SpeakerLabel(_plan[i]))
+                   .Append(": \"").Append(said).Append('"');
+        }
+
+        RecordPlan previous = _plan[record.Index - 1];
+        history.Append(IsConfidantLine(snap, previous)
+            ? " Carry on from your own last line — you are still talking, not replying to someone."
+            : $" Reply to what {SpeakerLabel(previous)} just said.");
+    }
+
+    private bool IsConfidantLine(SocialLinkSnapshot snap, RecordPlan record) =>
+        ConfidantNames.IsSpokenBy(snap.ConfidantId, record.Speaker);
+
+    /// A name for a line the prompt has to attribute to somebody. Unlabelled bubbles are
+    /// common — narration, and anyone the scene has not introduced yet.
+    private static string SpeakerLabel(RecordPlan record) =>
+        record.Speaker.Length > 0 ? record.Speaker : "Someone else";
 
     /// <summary>
     /// True when a candidate line says what the previous one already said.
@@ -3076,6 +3153,11 @@ public class Mod : IModV1
             }
             catch (Exception ex) when (ex is not OutOfMemoryException)
             {
+                // Logged here, not only when the retries run out. A backend that was down
+                // for an entire scene produced no line and no explanation: the queue looked
+                // idle, and the only trace was a thirty-second gap between two requests.
+                // Same defect as the 429 storm, same handler (Ch. 80).
+                _modLog!.Warn($"[PREGEN] #{record.Index} failed: {ex.Message}");
                 GiveUpOrRetry(record, ex.Message);
             }
         });
@@ -3123,6 +3205,8 @@ public class Mod : IModV1
         int lookahead = _cfg.PregenLookahead;
         if (lookahead <= 0 || _plan.Count == 0) return;
 
+        ApplySpeakerFilter(snap);
+
         // One request at a time, because the server runs one at a time. It answers 429 to
         // anything overlapping, and the poll tick is 500ms against 2-3s of inference — so
         // four requests in five were born to be dropped. The server counted 78 requests,
@@ -3164,6 +3248,67 @@ public class Mod : IModV1
     }
 
     /// <summary>
+    /// Take the records this scene attributes to somebody else out of the queue.
+    ///
+    /// Runs on every pump but does work once: only Pending records can move to Foreign,
+    /// so the second pass finds nothing left to do.
+    ///
+    /// The audit line is printed whether or not the filter is on, because deciding to turn
+    /// it on needs the same numbers the filter acts on. A scene that reports "9 own, 7
+    /// other, 0 unattributed" is one this is ready for; "0 own, 0 other, 16 unattributed"
+    /// means the archive did not resolve and turning the switch on would silence the mod
+    /// completely.
+    /// </summary>
+    private void ApplySpeakerFilter(SocialLinkSnapshot snap)
+    {
+        // Once per plan. Both halves are decided by data fixed at arm time, so repeating
+        // them on a 500 ms tick would re-tokenize every name in the scene twice a second
+        // to reach the same answer — the kind of per-tick cost that has been felt as
+        // stutter before.
+        if (_speakerAudited || _plan.Count == 0) return;
+        _speakerAudited = true;
+
+        int mine = 0, others = 0, unattributed = 0;
+        foreach (RecordPlan record in _plan)
+        {
+            if (record.Speaker.Length == 0) unattributed++;
+            else if (ConfidantNames.IsSpokenBy(snap.ConfidantId, record.Speaker)) mine++;
+            else others++;
+        }
+
+        _modLog!.Info($"[SPEAKER] {ConfidantNames.Resolve(snap.ConfidantId)}: " +
+                      $"{mine} own, {others} other, {unattributed} unattributed" +
+                      (_cfg.SpeakerFilterEnabled ? "" : " (filter off — nothing skipped)"));
+
+        if (!_cfg.SpeakerFilterEnabled) return;
+
+        // Refuse to filter a scene the confidant appears to say nothing in.
+        //
+        // That is not a scene — it is a broken chain somewhere between the header and the
+        // name table, and acting on it would replace "every line in the wrong voice" with
+        // "no lines at all". Ch. 77 calls for failing closed on a single record; failing
+        // closed on all of them is a different decision and it should not be silent.
+        if (mine == 0)
+        {
+            _modLog!.Info("[SPEAKER] filter idle — no record attributed to the confidant");
+            return;
+        }
+
+        int skipped = 0;
+        foreach (RecordPlan record in _plan)
+        {
+            if (record.State != RecordState.Pending) continue;
+            if (ConfidantNames.IsSpokenBy(snap.ConfidantId, record.Speaker)) continue;
+
+            record.State = RecordState.Foreign;
+            skipped++;
+        }
+
+        if (skipped > 0)
+            _modLog!.Info($"[SPEAKER] left {skipped} records to their own speakers");
+    }
+
+    /// <summary>
     /// Start the queue immediately after arming, without waiting for the next poll tick.
     ///
     /// The front of a scene is where coverage is always lost — #3 through #6 in the last
@@ -3192,10 +3337,19 @@ public class Mod : IModV1
     private void BuildRecordPlan()
     {
         _plan.Clear();
+        _speakerAudited = false;
         if (_heapPools.Count == 0 || _poolRecords.Count == 0) return;
 
         (nuint poolBase, _, (int Off, int Len)[] slots) = _heapPools[0];
         var records = _poolRecords[0];
+
+        // Before the loop, because every record is attributed through it. Declared up
+        // front rather than inline: the short circuit on an empty pool would otherwise
+        // leave the outputs unassigned.
+        BmdArchive archive  = default;
+        nuint      fileAddr = 0;
+        bool haveArchive = records.Count > 0 &&
+            TryResolveArchive(poolBase, slots[records[0].Start].Off, out archive, out fileAddr);
 
         for (int i = 0; i < records.Count; i++)
         {
@@ -3215,20 +3369,210 @@ public class Mod : IModV1
                 line.Append(AsciiPreview(poolBase + (nuint)off, len));
             }
 
+            // Who says it. The archive's dialogue table already lists every message and
+            // where its text starts, so this is containment rather than a search: the run
+            // the scanner found belongs to the last message beginning at or before it
+            // (Ch. 79).
+            string name      = string.Empty;
+            string speaker   = string.Empty;
+            int    speakerId = BmdMessage.NoSpeaker;
+
+            if (haveArchive)
+            {
+                int fileOffset = (int)(poolBase + (nuint)slots[start].Off - fileAddr);
+                if (archive.TryFindByTextOffset(fileOffset, out BmdArchive.Entry entry))
+                {
+                    name      = entry.Name;
+                    speakerId = entry.SpeakerId;
+                    archive.TryGetSpeakerName(speakerId, out speaker);
+                }
+            }
+
             _plan.Add(new RecordPlan
             {
-                Index    = i,
-                Capacity = capacity + (count - 1),
-                Original = line.ToString().Trim(),
+                Index     = i,
+                Capacity  = capacity + (count - 1),
+                Original  = line.ToString().Trim(),
+                Name      = name,
+                SpeakerId = speakerId,
+                Speaker   = speaker,
             });
         }
 
         LogSlotSeparators(poolBase, slots);
+        LogSpeakerCensus();
 
         _modLog!.Info($"[PLAN] {_plan.Count} records; " +
                       $"capacity {MinCapacity()}-{MaxCapacity()} chars");
         for (int i = 0; i < Math.Min(4, _plan.Count); i++)
             _modLog!.Info($"[PLAN]   {_plan[i]}");
+    }
+
+    /// <summary>
+    /// Locate and parse the MSG1 archive the armed pool's records belong to.
+    ///
+    /// The backwards walk is deliberately not bounded by the pool region. VirtualQuery
+    /// hands back the region containing an address, not the allocation, and two arms gave
+    /// up after "no MSG1 header within 116B of the first record" because the file started
+    /// before the region did. The span halves on a failed read instead, so the search runs
+    /// as far back as memory allows and no further.
+    ///
+    /// Every step may fail, and failing costs nothing: no archive means no names, which
+    /// leaves the plan exactly as it was before any of this existed.
+    /// </summary>
+    private bool TryResolveArchive(
+        nuint poolBase, int firstTextOff, out BmdArchive archive, out nuint fileAddr)
+    {
+        const int LookBack = 0x10000;
+
+        archive  = default;
+        fileAddr = 0;
+
+        nuint   textAddr = poolBase + (nuint)firstTextOff;
+        byte[]? window   = null;
+        int     span     = LookBack;
+
+        while (span >= BmdMessage.HeaderBytes)
+        {
+            if ((ulong)textAddr > (ulong)span)
+            {
+                var buf = new byte[span];
+                if (MemoryGuard.TryRead(textAddr - (nuint)span, buf, span)) { window = buf; break; }
+            }
+            span /= 2;
+        }
+        if (window is null) return false;
+
+        if (!BmdArchive.TryFindMagicBefore(window, span - 1, out int magicIndex))
+        {
+            _modLog!.Info($"[SPEAKER] no MSG1 header within {span}B of the first record");
+            return false;
+        }
+        if (!BmdArchive.TryReadFileSize(window, magicIndex, out int fileSize))
+        {
+            _modLog!.Info("[SPEAKER] MSG1 header found but its declared size is implausible");
+            return false;
+        }
+
+        nuint addr = textAddr - (nuint)span + (nuint)magicIndex - 8;
+        var   file = new byte[fileSize];
+        if (!MemoryGuard.TryRead(addr, file, fileSize))
+        {
+            _modLog!.Info($"[SPEAKER] MSG1 at 0x{addr:X} declared {fileSize}B, unreadable");
+            return false;
+        }
+
+        LogArchiveDump(addr, file, (int)(textAddr - addr));
+
+        if (!BmdArchive.TryParse(file, out archive))
+        {
+            _modLog!.Info($"[SPEAKER] MSG1 at 0x{addr:X} ({fileSize}B) did not resolve");
+            return false;
+        }
+
+        fileAddr = addr;
+        _modLog!.Info($"[SPEAKER] MSG1 at 0x{addr:X}: {archive.DialogCount} messages, " +
+                      $"{archive.SpeakerCount} speakers, dialogue ends at file+0x" +
+                      $"{archive.DialogueEnd:X}" +
+                      (archive.HoleCount > 0 ? $", {archive.HoleCount} unreadable" : "") +
+                      (BmdArchive.IsRelocated(file) ? "" : ", NOT relocated"));
+
+        // An entry that still does not parse is a hypothesis that has not survived, and the
+        // bytes are the only thing that will say which one. Printing them costs three lines
+        // and saves a play session.
+        if (archive.HoleCount > 0 && archive.FirstHoleOffset >= 0)
+        {
+            _modLog!.Info($"[SPEAKER] first unreadable entry #{archive.FirstHole} " +
+                          $"at file+0x{archive.FirstHoleOffset:X}");
+            LogHexBlock("hole", file, archive.FirstHoleOffset, 0x30);
+        }
+
+        for (int i = 0; i < Math.Min(16, archive.SpeakerCount); i++)
+            if (archive.TryGetSpeakerName(i, out string name))
+                _modLog!.Info($"[SPEAKER]   [{i}] {name}");
+
+        return true;
+    }
+
+    /// <summary>
+    /// Dump the three parts of the archive that decide what its interior looks like.
+    ///
+    /// Two hypotheses were offered for this layout before one hex dump settled it (Ch. 79).
+    /// The dump stays: it costs a dozen log lines once per armed scene, and it is what any
+    /// future disagreement between the parser and the game will be settled with.
+    /// </summary>
+    private void LogArchiveDump(nuint fileAddr, byte[] file, int firstTextOffset)
+    {
+        if (!_cfg.BmdDumpEnabled) return;
+
+        _modLog!.Info($"[BMDHEX] file at 0x{fileAddr:X}, {file.Length}B, " +
+                      $"first text at file+0x{firstTextOffset:X}");
+
+        LogHexBlock("head", file, 0, 0x60);
+
+        int dialogCount = file[0x18] | (file[0x19] << 8) | (file[0x1A] << 16) | (file[0x1B] << 24);
+        _modLog!.Info($"[BMDHEX] dialogCount@0x18 = {dialogCount} " +
+                      $"-> speaker table at file+0x{0x20 + 8 * dialogCount:X}");
+        if (dialogCount > 0 && 0x20 + 8 * dialogCount + 0x30 < file.Length)
+            LogHexBlock("spk ", file, 0x20 + 8 * dialogCount, 0x30);
+
+        int before = Math.Max(0, firstTextOffset - 0x40);
+        LogHexBlock("pre ", file, before, Math.Min(0x50, file.Length - before));
+
+        int tail = Math.Max(0, file.Length - 0x140);
+        LogHexBlock("tail", file, tail, file.Length - tail);
+    }
+
+    /// <summary>Sixteen bytes per line, hex then ASCII, offsets relative to the file.</summary>
+    private void LogHexBlock(string tag, byte[] file, int start, int length)
+    {
+        for (int off = start; off < start + length && off < file.Length; off += 16)
+        {
+            var hex   = new System.Text.StringBuilder(48);
+            var ascii = new System.Text.StringBuilder(16);
+
+            for (int i = 0; i < 16; i++)
+            {
+                if (off + i >= file.Length) { hex.Append("   "); continue; }
+                byte b = file[off + i];
+                hex.Append(b.ToString("X2")).Append(' ');
+                ascii.Append(b >= 0x20 && b <= 0x7E ? (char)b : '.');
+            }
+            _modLog!.Info($"[BMDHEX] {tag} +{off:X4}  {hex} |{ascii}|");
+        }
+    }
+
+    /// <summary>
+    /// Report which speakers the scene contains, and how much of it we could attribute.
+    ///
+    /// The census is the evidence, not the feature. If the layout in Ch. 75 is right this
+    /// prints a handful of ids in script order with names beside them; if it is wrong it
+    /// prints a scatter of one-offs, or nothing at all, and no behaviour has changed yet
+    /// either way. Nothing keys off SpeakerId until a real scene has produced this line.
+    /// </summary>
+    private void LogSpeakerCensus()
+    {
+        var counts  = new System.Collections.Generic.Dictionary<int, int>();
+        int unknown = 0;
+
+        foreach (RecordPlan record in _plan)
+        {
+            if (record.Name.Length == 0) { unknown++; continue; }
+            counts.TryGetValue(record.SpeakerId, out int n);
+            counts[record.SpeakerId] = n + 1;
+        }
+
+        var parts = new System.Collections.Generic.List<string>();
+        foreach (var pair in counts)
+            parts.Add($"{(pair.Key == BmdMessage.NoSpeaker ? "narration" : $"spk{pair.Key}")}" +
+                      $"x{pair.Value}");
+
+        _modLog!.Info($"[SPEAKER] {_plan.Count - unknown}/{_plan.Count} records attributed; " +
+                      $"{(parts.Count > 0 ? string.Join(", ", parts) : "none")}");
+
+        for (int i = 0; i < Math.Min(6, _plan.Count); i++)
+            _modLog!.Info($"[SPEAKER]   #{i} {(_plan[i].Name.Length > 0 ? _plan[i].Name : "?")} " +
+                          $"spk={_plan[i].SpeakerId}");
     }
 
     /// <summary>
@@ -3565,7 +3909,13 @@ public class Mod : IModV1
                 // it, and rewriting it is the bug they described as the text switching.
                 // Backlog re-reads freeze too, which is correct — a line in the log has
                 // certainly been shown.
-                if (i < _plan.Count && _plan[i].State != RecordState.Rendered)
+                //
+                // Foreign is left alone. It is already terminal, and flipping it to
+                // Rendered would erase the reason the record was skipped — coverage would
+                // then count another character's line as one the queue failed to reach.
+                if (i < _plan.Count &&
+                    _plan[i].State != RecordState.Rendered &&
+                    _plan[i].State != RecordState.Foreign)
                 {
                     _plan[i].State = RecordState.Rendered;
                     _modLog!.Info($"[PLAN] #{i} rendered — frozen");
@@ -3574,6 +3924,20 @@ public class Mod : IModV1
             }
         }
         return inPool;
+    }
+
+    /// <summary>
+    /// Parse the BMD header at a record base, through ReadProcessMemory.
+    ///
+    /// Same reasoning as ReadRecordPreview: the pointer came out of a register inside the
+    /// game's own loop and the message may have been freed before this tick looks at it,
+    /// so the read has to be one that can fail rather than one that can fault.
+    /// </summary>
+    private bool TryReadHeader(nuint record, out BmdMessage message)
+    {
+        message = default;
+        return MemoryGuard.TryRead(record, _headerBuf, BmdMessage.HeaderBytes)
+            && BmdMessage.TryParse(_headerBuf, out message);
     }
 
     /// <summary>

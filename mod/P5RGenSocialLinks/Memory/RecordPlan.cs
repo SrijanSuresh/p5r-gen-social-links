@@ -27,6 +27,20 @@ internal enum RecordState
     /// The interpreter has read it. Frozen — overwriting now is the bug the player
     /// described as "the text keeps switching".
     Rendered,
+
+    /// <summary>
+    /// The header attributes this line to somebody other than the confidant.
+    ///
+    /// Terminal, and decided at plan time rather than reached through the life cycle. A
+    /// Takemi rank-up contains a patient and her father, and every one of their lines used
+    /// to be rewritten in Takemi's voice because the only thing the mod knew about a
+    /// record was that it was a record (Ch. 77).
+    ///
+    /// Distinct from Rendered because the two mean opposite things about the same record:
+    /// Rendered is "too late", Foreign is "not ours". Collapsing them would report a scene
+    /// full of other people's dialogue as a scene the queue failed to keep up with.
+    /// </summary>
+    Foreign,
 }
 
 /// <summary>
@@ -51,6 +65,25 @@ internal sealed class RecordPlan
     /// destroys it and it is the best context the model can be given about this specific
     /// moment (Ch. 64).
     internal string Original { get; init; } = string.Empty;
+
+    /// <summary>
+    /// The BMD symbol for this message, e.g. "MSG_001_5_0", or empty when the header
+    /// could not be located. Diagnostic rather than load-bearing: it is what makes a
+    /// mis-grouped record obvious in the log, because names run in script order.
+    /// </summary>
+    internal string Name { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Index into the scene's speaker table, or <see cref="BmdMessage.NoSpeaker"/> for
+    /// narration and for records whose header was not found.
+    ///
+    /// Unknown and narration deliberately share a value. Both mean "not attributable to
+    /// the confidant", and the safe response to either is the same: leave the line alone.
+    /// </summary>
+    internal int SpeakerId { get; set; } = BmdMessage.NoSpeaker;
+
+    /// <summary>Resolved display name for <see cref="SpeakerId"/>, when the table is known.</summary>
+    internal string Speaker { get; set; } = string.Empty;
 
     internal RecordState State { get; set; } = RecordState.Pending;
 
@@ -81,8 +114,15 @@ internal sealed class RecordPlan
     /// True while the record may still be overwritten. Written is included on purpose:
     /// a pre-generated line is a floor that a reactive generation is allowed to raise,
     /// right up until the interpreter reads it.
-    internal bool IsWritable => State != RecordState.Rendered;
+    internal bool IsWritable =>
+        State != RecordState.Rendered && State != RecordState.Foreign;
 
-    public override string ToString() =>
-        $"#{Index} {State} cap={Capacity} \"{Original[..System.Math.Min(Original.Length, 32)]}\"";
+    public override string ToString()
+    {
+        string who = Speaker.Length > 0 ? Speaker
+                   : SpeakerId != BmdMessage.NoSpeaker ? $"spk{SpeakerId}"
+                   : "-";
+        return $"#{Index} {State} cap={Capacity} {who} " +
+               $"\"{Original[..System.Math.Min(Original.Length, 32)]}\"";
+    }
 }

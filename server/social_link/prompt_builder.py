@@ -80,6 +80,11 @@ Rules:
 - If you are shown what you just said, continue from it. This is one conversation,
   not a set of separate remarks: pick up the same subject, answer your own last
   point, or react to it. A line that could have opened the scene is wrong here.
+- The history may name other people. Only the lines marked "You:" are yours; the rest
+  are other characters in the scene and you are hearing them, not remembering them.
+  Never take credit for someone else's line and never answer as them.
+- When the last line is somebody else's, reply to it. Answer the question they asked or
+  react to what they said, and do it as {name} would — not as a narrator summing up.
 - Keep every name the original line used. If it names a person, a place or a thing,
   use that same name — do not swap one character for another and do not introduce
   anyone who is not already in the scene.
