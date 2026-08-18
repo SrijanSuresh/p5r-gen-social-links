@@ -5749,3 +5749,108 @@ None of them failed loudly. They produced confident, well-logged, wrong behaviou
 is the argument for logging the *reasoning* and not only the outcome. `record 0/207`
 against `record 0/180` is the entire second bug, visible in one line, and only because
 the log prints the denominator.
+
+---
+
+## Chapter 75: The Header You Have Been Skipping Over
+
+Every record the interpreter hands us starts with twenty-four bytes we have spent the
+whole project stepping around.
+
+`ReadRecordPreview` opens with a loop whose entire purpose is to get past them:
+
+```csharp
+for (int start = 0; start < Window; start++)
+{
+    if (!IsPrintable(_recordBuf[start])) continue;
+    ...
+    if (end - start < 8) { start = end; continue; }
+```
+
+Skip the unprintable bytes, skip anything shorter than eight characters, take the first
+run that reads like English. It works. It also throws away the answer to the question we
+sat down to solve today.
+
+### The bug, stated precisely
+
+A Takemi rank-up scene is not Takemi talking for twelve records. It is Takemi, a patient,
+the patient's father, and a narrator, interleaved. The mod rewrites all of them in
+Takemi's voice, because the only thing it knows about a record is that it is a record.
+
+The failure is not subtle in play. The father says something dry and clinical about his
+daughter's treatment; a nurse asks a question and answers herself in a doctor's cadence.
+The lines are individually decent — the model is doing its job — and collectively wrong,
+because they are attributed to whoever happens to be on screen.
+
+There is no heuristic fix here. You cannot infer the speaker from the text, because the
+text is the thing being replaced. Whatever tells us who is talking has to be read before
+the first write, from the game's own data.
+
+### What is actually at record+0
+
+Atlus ships dialogue in `.BMD` files (`MSG1` format, shared across Persona 3/4/5 and
+documented by the AtlusScriptToolkit project). A dialogue message inside one is a struct,
+not a string:
+
+```
+offset  size  field
+0x00      24  Name          e.g. "MSG_001_5_0", NUL-padded ASCII
+0x18       2  PageCount     int16 — speech bubbles in this message
+0x1A       2  SpeakerId     uint16 — index into the file's speaker table, 0xFFFF = none
+0x1C   4*n    PageStartAddresses   int32 each, n = PageCount
+ ...       4  TextBufferSize
+ ...       ?  TextBuffer    the bytes we have been rewriting
+```
+
+Read that layout against the one measurement we already have. Ch. 69 recorded the first
+character of a live record at `+0x28`:
+
+```
+0x1C + 4*PageCount + 4 = text
+       PageCount = 1  ->  0x24
+       PageCount = 2  ->  0x28   <-- the one we measured
+       PageCount = 3  ->  0x2C
+```
+
+A two-page message. The layout predicts the number we already had, which is the only kind
+of confirmation worth anything before a scene has been run.
+
+It also explains the cursor. `RDX` at the hook site is not "characters printed so far
+from the top of the text" — it is a byte offset from the *record* base, and the first
+value it can hold is the page start address, which is `0x28` for a two-page message. We
+have been reading the page table's contents out of a register without recognising them.
+
+And `MSG_001_5_0`, the symbol we have been seeing in hex dumps and treating as pool
+scenery, is not scenery. It is field one of the struct we are standing on.
+
+### Why the name matters as much as the speaker id
+
+`SpeakerId` is an index, and an index needs its table. That table lives in the `MSG1`
+file header, which is somewhere behind us in the region — findable, but a second problem.
+
+The name is free. It is right there at offset zero, it is ASCII, and it carries structure:
+`MSG_001_5_0` is a message id, and `SEL_003` (which the interpreter also serves) is a
+selection prompt — a menu, not a line of dialogue. Rewriting a menu option is a different
+and worse bug than rewriting the wrong speaker, and one string comparison rules it out.
+
+So the first cut is: read the header, log the name and the speaker id for every record we
+watch, and change nothing else. Two scenes of evidence, then decisions.
+
+This is the discipline Ch. 74 arrived at the hard way. Every bug in this project has been
+a rule that was true when it was written — "one session, one pool", "the armed regions are
+copies", "reads run monotonically". Each one was reasonable, each one was tested against
+exactly one scene, and each one was wrong the first time a different scene ran. The layout
+above is a claim from documentation plus one confirming offset. That is a hypothesis, and
+it gets logged before it gets trusted.
+
+### The part that is not a bug fix
+
+Attribution is also the missing half of the context.
+
+Right now a generated Takemi line is given the scripted line it replaces and Takemi's own
+previous lines. It is never told that the line before hers was the father asking a
+question, because the mod has no concept of "the father". Once records carry a speaker,
+the ones we do *not* rewrite stop being obstacles and become the conversation: the model
+can answer the question that was actually asked.
+
+The scene stops being a list of slots to overwrite and becomes a script with parts.
