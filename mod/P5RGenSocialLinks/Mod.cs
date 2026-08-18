@@ -3846,7 +3846,13 @@ public class Mod : IModV1
                 // it, and rewriting it is the bug they described as the text switching.
                 // Backlog re-reads freeze too, which is correct — a line in the log has
                 // certainly been shown.
-                if (i < _plan.Count && _plan[i].State != RecordState.Rendered)
+                //
+                // Foreign is left alone. It is already terminal, and flipping it to
+                // Rendered would erase the reason the record was skipped — coverage would
+                // then count another character's line as one the queue failed to reach.
+                if (i < _plan.Count &&
+                    _plan[i].State != RecordState.Rendered &&
+                    _plan[i].State != RecordState.Foreign)
                 {
                     _plan[i].State = RecordState.Rendered;
                     _modLog!.Info($"[PLAN] #{i} rendered — frozen");
