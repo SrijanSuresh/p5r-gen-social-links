@@ -3153,6 +3153,11 @@ public class Mod : IModV1
             }
             catch (Exception ex) when (ex is not OutOfMemoryException)
             {
+                // Logged here, not only when the retries run out. A backend that was down
+                // for an entire scene produced no line and no explanation: the queue looked
+                // idle, and the only trace was a thirty-second gap between two requests.
+                // Same defect as the 429 storm, same handler (Ch. 80).
+                _modLog!.Warn($"[PREGEN] #{record.Index} failed: {ex.Message}");
                 GiveUpOrRetry(record, ex.Message);
             }
         });
@@ -3469,7 +3474,18 @@ public class Mod : IModV1
         _modLog!.Info($"[SPEAKER] MSG1 at 0x{addr:X}: {archive.DialogCount} messages, " +
                       $"{archive.SpeakerCount} speakers, dialogue ends at file+0x" +
                       $"{archive.DialogueEnd:X}" +
+                      (archive.HoleCount > 0 ? $", {archive.HoleCount} unreadable" : "") +
                       (BmdArchive.IsRelocated(file) ? "" : ", NOT relocated"));
+
+        // An entry that still does not parse is a hypothesis that has not survived, and the
+        // bytes are the only thing that will say which one. Printing them costs three lines
+        // and saves a play session.
+        if (archive.HoleCount > 0 && archive.FirstHoleOffset >= 0)
+        {
+            _modLog!.Info($"[SPEAKER] first unreadable entry #{archive.FirstHole} " +
+                          $"at file+0x{archive.FirstHoleOffset:X}");
+            LogHexBlock("hole", file, archive.FirstHoleOffset, 0x30);
+        }
 
         for (int i = 0; i < Math.Min(16, archive.SpeakerCount); i++)
             if (archive.TryGetSpeakerName(i, out string name))

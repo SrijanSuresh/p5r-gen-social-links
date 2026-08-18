@@ -40,6 +40,20 @@ internal sealed class InferenceInFlightException : Exception
     internal InferenceInFlightException() : base("Server returned 429: inference in-flight.") { }
 }
 
+/// <summary>
+/// The server answered 503 after every retry: the inference backend is not up.
+///
+/// Distinct from a generic HTTP failure because the remedy is different and outside the
+/// mod — llama-server is down, or the model never finished loading. A scene ran its whole
+/// length against a dead backend and the mod's log said nothing at all (Ch. 80).
+/// </summary>
+internal sealed class BackendUnavailableException : Exception
+{
+    internal BackendUnavailableException(int retries, TimeSpan delay)
+        : base($"inference backend unavailable (503 after {retries} retries over " +
+               $"{retries * delay.TotalSeconds:F0}s) — is llama-server up?") { }
+}
+
 internal sealed class LLMClient : IDisposable
 {
     private readonly HttpClient _http;
@@ -80,6 +94,13 @@ internal sealed class LLMClient : IDisposable
                 await Task.Delay(Retry503Delay, ct);
                 continue;
             }
+
+            // Name the status rather than letting EnsureSuccessStatusCode phrase it. A 503
+            // means the inference backend is not answering, which is a different problem
+            // from anything the mod can fix, and the caller's log line is where someone
+            // will look first.
+            if (response.StatusCode == HttpStatusCode.ServiceUnavailable)
+                throw new BackendUnavailableException(MaxRetries503, Retry503Delay);
 
             response.EnsureSuccessStatusCode();
             string body = await response.Content.ReadAsStringAsync(ct);
