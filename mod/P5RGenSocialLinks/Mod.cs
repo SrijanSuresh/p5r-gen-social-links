@@ -48,6 +48,7 @@ public class Mod : IModV1
     // never disturb a pool scan mid-walk, even though both run on the poll thread today.
     private readonly byte[]              _recordBuf = new byte[128];
     private readonly byte[]              _mirrorBuf = new byte[128];
+    private readonly byte[]              _headerBuf = new byte[BmdMessage.HeaderBytes];
 
     // Guards the pool write path. Flushing now happens from two places — the poll tick
     // and the thread-pool continuation that finishes a generation — and both walk the
@@ -2795,6 +2796,11 @@ public class Mod : IModV1
             // scene line reported as "elsewhere" means the ranking missed the live buffer.
             string where = AdvancePoolCursor(record) ? "in-pool  " : "elsewhere";
 
+            // The struct in front of the text, read but not yet acted on. Ch. 75 derives
+            // the layout from the MSG1 format and one live measurement; two scenes of
+            // this log decide whether it survives contact with a real pool.
+            string header = TryReadHeader(record, out BmdMessage msg) ? msg.ToString() : "unparsed";
+
             // Arm from the read itself. Gated on an active hang-out because the
             // interpreter serves every string in the game — menus, item names, the
             // newspaper — and arming on the first record seen anywhere would point the
@@ -2811,7 +2817,8 @@ public class Mod : IModV1
             LearnTwinDelta(record, text);
 
             if (logged++ < MaxLogged)
-                _modLog!.Info($"[WATCH] {where} record=0x{record:X} cursor=0x{cursor:X} \"{text}\"");
+                _modLog!.Info($"[WATCH] {where} record=0x{record:X} cursor=0x{cursor:X} " +
+                              $"[{header}] \"{text}\"");
             else
                 suppressed++;
         }
@@ -3574,6 +3581,20 @@ public class Mod : IModV1
             }
         }
         return inPool;
+    }
+
+    /// <summary>
+    /// Parse the BMD header at a record base, through ReadProcessMemory.
+    ///
+    /// Same reasoning as ReadRecordPreview: the pointer came out of a register inside the
+    /// game's own loop and the message may have been freed before this tick looks at it,
+    /// so the read has to be one that can fail rather than one that can fault.
+    /// </summary>
+    private bool TryReadHeader(nuint record, out BmdMessage message)
+    {
+        message = default;
+        return MemoryGuard.TryRead(record, _headerBuf, BmdMessage.HeaderBytes)
+            && BmdMessage.TryParse(_headerBuf, out message);
     }
 
     /// <summary>
