@@ -3257,7 +3257,12 @@ public class Mod : IModV1
     /// </summary>
     private void ApplySpeakerFilter(SocialLinkSnapshot snap)
     {
-        if (_plan.Count == 0) return;
+        // Once per plan. Both halves are decided by data fixed at arm time, so repeating
+        // them on a 500 ms tick would re-tokenize every name in the scene twice a second
+        // to reach the same answer — the kind of per-tick cost that has been felt as
+        // stutter before.
+        if (_speakerAudited || _plan.Count == 0) return;
+        _speakerAudited = true;
 
         int mine = 0, others = 0, unattributed = 0;
         foreach (RecordPlan record in _plan)
@@ -3267,13 +3272,9 @@ public class Mod : IModV1
             else others++;
         }
 
-        if (!_speakerAudited)
-        {
-            _speakerAudited = true;
-            _modLog!.Info($"[SPEAKER] {ConfidantNames.Resolve(snap.ConfidantId)}: " +
-                          $"{mine} own, {others} other, {unattributed} unattributed" +
-                          (_cfg.SpeakerFilterEnabled ? "" : " (filter off — nothing skipped)"));
-        }
+        _modLog!.Info($"[SPEAKER] {ConfidantNames.Resolve(snap.ConfidantId)}: " +
+                      $"{mine} own, {others} other, {unattributed} unattributed" +
+                      (_cfg.SpeakerFilterEnabled ? "" : " (filter off — nothing skipped)"));
 
         if (!_cfg.SpeakerFilterEnabled) return;
 
