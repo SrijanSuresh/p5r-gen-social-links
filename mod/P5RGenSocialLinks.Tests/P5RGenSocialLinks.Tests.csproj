@@ -17,6 +17,8 @@
   <ItemGroup>
     <Compile Include="../P5RGenSocialLinks/Memory/BmdMessage.cs"
              Link="Memory/BmdMessage.cs" />
+    <Compile Include="../P5RGenSocialLinks/Memory/BmdArchive.cs"
+             Link="Memory/BmdArchive.cs" />
   </ItemGroup>
 
   <ItemGroup>
