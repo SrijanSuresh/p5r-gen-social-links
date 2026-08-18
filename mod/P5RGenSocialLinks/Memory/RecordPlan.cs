@@ -27,6 +27,20 @@ internal enum RecordState
     /// The interpreter has read it. Frozen — overwriting now is the bug the player
     /// described as "the text keeps switching".
     Rendered,
+
+    /// <summary>
+    /// The header attributes this line to somebody other than the confidant.
+    ///
+    /// Terminal, and decided at plan time rather than reached through the life cycle. A
+    /// Takemi rank-up contains a patient and her father, and every one of their lines used
+    /// to be rewritten in Takemi's voice because the only thing the mod knew about a
+    /// record was that it was a record (Ch. 77).
+    ///
+    /// Distinct from Rendered because the two mean opposite things about the same record:
+    /// Rendered is "too late", Foreign is "not ours". Collapsing them would report a scene
+    /// full of other people's dialogue as a scene the queue failed to keep up with.
+    /// </summary>
+    Foreign,
 }
 
 /// <summary>
@@ -100,7 +114,8 @@ internal sealed class RecordPlan
     /// True while the record may still be overwritten. Written is included on purpose:
     /// a pre-generated line is a floor that a reactive generation is allowed to raise,
     /// right up until the interpreter reads it.
-    internal bool IsWritable => State != RecordState.Rendered;
+    internal bool IsWritable =>
+        State != RecordState.Rendered && State != RecordState.Foreign;
 
     public override string ToString()
     {
