@@ -75,13 +75,13 @@
   // A rank-up scene is not one person talking — Takemi's involves a patient and her
   // father — and without this their lines get rewritten in her voice too.
   //
-  // Off by default: it can only remove work, and it does so based on a chain that has to
-  // hold end to end (message header parses, MSG1 file found, address base resolves,
-  // speaker label matches the confidant). Any link failing leaves records unattributed,
-  // and unattributed means skipped. Watch the [SPEAKER] lines in the log first — they
-  // print real character names when the chain works, and report what this filter would
-  // have done while it is off.
-  "speaker_filter_enabled": false,
+  // On since the archive layout was read out of a hex dump rather than guessed, and
+  // checked against nineteen addresses across two live files.
+  //
+  // Safe to leave on even if a scene does not parse: one with nothing attributed to the
+  // confidant is refused rather than filtered, so a broken chain costs the attribution
+  // and not the mod. The [SPEAKER] lines report what it did either way.
+  "speaker_filter_enabled": true,
 
   // Dump the scene archive's header, the bytes ahead of its first line, and its tail.
   // A dozen log lines once per armed scene, on while the BMD interior is being worked out.
