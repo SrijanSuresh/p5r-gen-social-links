@@ -6246,3 +6246,92 @@ that is names and the relocation table — not dialogue, and never safe to overw
 region. The pool scanner has been finding it, and the only reason it was never rewritten is
 that thirteen characters fall below the generation floor. That was luck, not design, and
 knowing where the dialogue ends turns it into design.
+
+---
+
+## Chapter 80: Two Files, Two Answers
+
+The self-relative rule from Ch. 79 went in, and the next scene split cleanly down the
+middle.
+
+```
+[SPEAKER] MSG1 at 0x424C630190: 14 messages, 0 speakers, dialogue ends at file+0xDDC
+[SPEAKER] 35/35 records attributed; narrationx35
+[SPEAKER]   #0 CMM_EVENT_OPEN spk=65535
+[SPEAKER]   #4 CMM_EVENT_RANKUP_2 spk=65535
+```
+
+Fourteen messages, every one located, every name read, and the speaker sentinel correct for
+a file that has no speakers at all. The rule is right.
+
+```
+[SPEAKER] MSG1 at 0x41DC897020 (8736B) did not resolve
+```
+
+The clinic file, same 8736 bytes as the dump that produced the rule, still fails.
+
+### All or nothing was the wrong contract
+
+`TryParse` refuses the archive if any one of the 48 dialogue entries does not resolve. That
+was a deliberate choice in Ch. 76, made for a good reason — half a scene attributed under a
+wrong rule is worse than none, because it looks like it worked.
+
+The reason no longer applies. The rule is not in question any more; a second file confirmed
+it end to end. What is in question is whether every *entry* in a file is the same kind of
+thing, and one odd entry out of 48 should not cost the other 47.
+
+But the fix is not simply to skip the odd one. Skipping leaves a hole in the offset map, and
+containment matching would then hand that hole's text to the previous message — silently
+attributing one character's lines to another, which is the original bug wearing a different
+hat.
+
+So an entry that does not parse becomes a **hole that is still on the map**: recorded at its
+own offset, named nothing, speaker `NoSpeaker`. Text landing inside it resolves to
+"unattributed", which the filter already treats as "leave this line alone". The archive
+degrades to less coverage instead of to wrong coverage.
+
+### What the odd entry probably is
+
+The scene has a choice in it — `"Yes, I'm sure!"` appears in the watch log, and that is a
+menu option, not a line. The format has a second record kind for exactly this, and the
+dialogue entry's `Kind` field distinguishes them:
+
+```
+MessageDialog                    SelectionDialog
+  char[24] Name                    char[24] Name
+  int16    PageCount    @0x18      int16    Ext          @0x18
+  int16    SpeakerId    @0x1A      int16    OptionCount  @0x1A
+  int32[]  PageStarts             int32[]  OptionStarts
+```
+
+Same shape, but the count moves from `0x18` to `0x1A` and there is no speaker at all. Read
+as a message, a selection offers whatever sits in `Ext` as its page count — and
+`BmdMessage.TryParse` rejects an implausible one, which is exactly what it is built to do.
+
+That is a hypothesis, not a measurement, and this chapter has learned not to promote one to
+the other. It ships with the hole mechanism underneath it, so if it is wrong the file still
+parses and the selections come out unattributed. And the log now names the first entry that
+failed and dumps its bytes, so a second wrong guess costs one line of log rather than a
+session.
+
+Selections must never be rewritten regardless. Changing what the buttons say without
+changing what they do is a worse bug than a mis-attributed line.
+
+### The other thing this scene taught
+
+Zero records were replaced, and the mod's log gave no reason. The server console did:
+
+```
+POST /generate HTTP/1.1" 503 Service Unavailable
+```
+
+The inference backend was down for the entire run. On the mod's side that path retries three
+times at eight-second intervals and then throws, and the throw is caught by a handler that
+logs nothing on the first attempt. So a dead backend looked, from the log, like a queue that
+simply never produced anything — and the only visible trace was a thirty-second gap between
+two `[PREGEN] requested` lines, which you have to already suspect the answer to notice.
+
+This is the same defect as the 429 storm of Ch. 72, in the same place, found the same way:
+by reading the *server's* log because the mod's log was silent. The rule that keeps being
+relearned is that a failure which is handled is not a failure which is understood, and the
+handler is exactly where the log line belongs.
