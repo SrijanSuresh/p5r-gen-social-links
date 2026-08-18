@@ -50,4 +50,25 @@ internal static class ConfidantNames
 
     internal static string Resolve(int confidantId) =>
         _names.TryGetValue(confidantId, out string? name) ? name : $"Confidant #{confidantId}";
+
+    /// <summary>
+    /// Name tokens shared by two or more confidants, and so useless for identifying one.
+    ///
+    /// Derived from the table above rather than listed, so a confidant added with a
+    /// colliding surname moves that surname out of use instead of quietly making the
+    /// existing holder answer to it (Ch. 77).
+    /// </summary>
+    private static readonly System.Collections.Generic.HashSet<string> _ambiguous =
+        SpeakerMatch.AmbiguousTokens(_names.Values);
+
+    /// <summary>
+    /// True when a speaker label out of a scene's BMD names this confidant.
+    ///
+    /// An unknown id has no name to compare against, and an unlabelled or ambiguous
+    /// speaker matches nobody. All three are false, and false means "not the confidant",
+    /// which is the direction that leaves the scripted line intact.
+    /// </summary>
+    internal static bool IsSpokenBy(int confidantId, string? speakerLabel) =>
+        _names.TryGetValue(confidantId, out string? name)
+        && SpeakerMatch.Matches(speakerLabel, name, _ambiguous);
 }

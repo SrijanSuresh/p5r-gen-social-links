@@ -19,6 +19,10 @@
              Link="Memory/BmdMessage.cs" />
     <Compile Include="../P5RGenSocialLinks/Memory/BmdArchive.cs"
              Link="Memory/BmdArchive.cs" />
+    <Compile Include="../P5RGenSocialLinks/Memory/SpeakerMatch.cs"
+             Link="Memory/SpeakerMatch.cs" />
+    <Compile Include="../P5RGenSocialLinks/Memory/ConfidantNames.cs"
+             Link="Memory/ConfidantNames.cs" />
   </ItemGroup>
 
   <ItemGroup>
