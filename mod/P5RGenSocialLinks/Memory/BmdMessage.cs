@@ -133,66 +133,6 @@ internal readonly struct BmdMessage
         return true;
     }
 
-    /// <summary>
-    /// Largest number of bytes a header plus its page table can occupy, for the backwards
-    /// search below. Sixteen pages is far past anything a speech bubble uses; the cap is
-    /// there to bound the search, not to describe the format.
-    /// </summary>
-    internal const int MaxSearchPages = 16;
-    internal const int MaxHeaderSpan   = PageTableOffset + 4 * MaxSearchPages + 4;
-
-    /// <summary>
-    /// Find the header belonging to a text run, by searching backwards from it.
-    ///
-    /// The pool scanner locates records by their text — runs of printable bytes — and has
-    /// no idea where the struct around them begins. It cannot: the distance from header to
-    /// text is a function of the page count, which is stored in the header.
-    ///
-    /// That circularity is also the check. For each candidate page count the header would
-    /// sit at a known distance back, so a candidate is accepted only when the header found
-    /// there *predicts its own position*: parse at <c>textIndex - (0x20 + 4n)</c> and
-    /// require the parsed PageCount to be exactly n. A run of bytes that happens to look
-    /// like a name and a plausible count will almost never also agree about where it is.
-    ///
-    /// <paramref name="window"/> holds pool bytes; <paramref name="textIndex"/> is the
-    /// index of the run's first character within it.
-    /// </summary>
-    internal static bool TryFindHeader(
-        byte[] window, int textIndex, out BmdMessage message, out int headerIndex)
-    {
-        message     = default;
-        headerIndex = -1;
-        if (window is null) return false;
-        if (textIndex < 0 || textIndex > window.Length) return false;
-
-        // Nearest first. Records are packed, so a false positive is likelier the further
-        // back the search goes — the bytes there belong to the previous message's text.
-        for (int pages = 1; pages <= MaxSearchPages; pages++)
-        {
-            int candidate = textIndex - (PageTableOffset + 4 * pages + 4);
-            if (candidate < 0) break;
-
-            if (!TryParseAt(window, candidate, out BmdMessage parsed)) continue;
-            if (parsed.PageCount != pages) continue;   // it must predict its own position
-
-            message     = parsed;
-            headerIndex = candidate;
-            return true;
-        }
-        return false;
-    }
-
-    /// <summary>Parse a header at an arbitrary index inside a larger buffer.</summary>
-    private static bool TryParseAt(byte[] window, int index, out BmdMessage message)
-    {
-        message = default;
-        if (index < 0 || index + HeaderBytes > window.Length) return false;
-
-        var slice = new byte[HeaderBytes];
-        Array.Copy(window, index, slice, 0, HeaderBytes);
-        return TryParse(slice, out message);
-    }
-
     public override string ToString() =>
         $"{Name} pages={PageCount} speaker={(HasSpeaker ? SpeakerId.ToString() : "none")}";
 }
