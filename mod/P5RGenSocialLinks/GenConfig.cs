@@ -101,6 +101,22 @@ internal sealed class GenConfig
     public bool MsgHookEnabled { get; init; } = true;
 
     /// <summary>
+    /// Only rewrite records whose BMD header attributes them to the active confidant.
+    ///
+    /// A rank-up scene is not one person talking. Takemi's involves a patient and her
+    /// father, and without this every one of their lines is rewritten in her voice.
+    ///
+    /// Off by default because it can only ever remove work, and it removes it based on a
+    /// chain that has to hold end to end: the message header parses, the MSG1 file is
+    /// found, the address base resolves, and the speaker label matches the confidant's
+    /// name. Any link failing leaves records unattributed, and unattributed means skipped.
+    /// Turn it on once a scene's [SPEAKER] log shows real character names — the same log
+    /// prints what the filter would have done while it is off.
+    /// </summary>
+    [JsonPropertyName("speaker_filter_enabled")]
+    public bool SpeakerFilterEnabled { get; init; } = false;
+
+    /// <summary>
     /// When true, PointerChainResolver logs each chain step with address and dereferenced value.
     /// Useful for diagnosing broken pointer chains after a game patch; leave false in production.
     /// </summary>
