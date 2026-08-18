@@ -86,3 +86,41 @@ def test_every_confidant_gets_exactly_one_grounding() -> None:
             if g in system
         ]
         assert len(present) == 1, f"{confidant_id} got {len(present)} grounding blocks"
+
+
+# --- multi-speaker scenes -----------------------------------------------------
+#
+# A rank-up is not a monologue. Takemi's involves a patient and her father, and the mod
+# now names them in the history it sends. Before that the model was told every earlier
+# line was the confidant's own, so it took credit for the father's lines and then
+# answered itself.
+
+
+def test_only_lines_marked_as_yours_are_the_speakers() -> None:
+    system, _ = build_prompt(TAKEMI, 4, "clinic")
+    assert '"You:"' in system
+
+
+def test_told_not_to_answer_as_another_character() -> None:
+    system, _ = build_prompt(TAKEMI, 4, "clinic")
+    assert "never answer as them" in system.lower()
+
+
+def test_told_to_reply_when_the_last_line_was_someone_elses() -> None:
+    system, _ = build_prompt(TAKEMI, 4, "clinic")
+    assert "when the last line is somebody else's, reply to it" in system.lower()
+
+
+def test_the_reply_rule_names_the_character() -> None:
+    """The rule interpolates {name}; a stray brace would ship the literal placeholder."""
+    system, _ = build_prompt(TAKEMI, 4, "clinic")
+    assert "as Tae Takemi would" in system
+    assert "{name}" not in system
+
+
+def test_multi_speaker_rules_reach_every_confidant() -> None:
+    from social_link.arcana import CONFIDANTS
+
+    for confidant_id in CONFIDANTS:
+        system, _ = build_prompt(confidant_id, 3, "scene")
+        assert "you are hearing them, not remembering them" in system
