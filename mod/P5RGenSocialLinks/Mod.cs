@@ -3237,6 +3237,8 @@ public class Mod : IModV1
             });
         }
 
+        ResolveSpeakerNames(poolBase, slots[records[0].Start].Off);
+
         LogSlotSeparators(poolBase, slots);
         LogSpeakerCensus();
 
@@ -3265,6 +3267,83 @@ public class Mod : IModV1
         if (!MemoryGuard.TryRead(poolBase + (nuint)windowStart, _headerWindow, span)) return false;
 
         return BmdMessage.TryFindHeader(_headerWindow, span, out header, out _);
+    }
+
+    /// <summary>
+    /// Turn the speaker ids on the plan into names, by finding and parsing the MSG1 file
+    /// the records belong to.
+    ///
+    /// Two reads, not one. The first walks backwards from the first record looking for the
+    /// magic, because the file header is the only thing that can say where the file starts
+    /// and how long it is. The second copies the whole file, because the speaker names sit
+    /// past the end of every message and a window that reaches the records does not reach
+    /// them.
+    ///
+    /// Every step is allowed to fail, and failing costs nothing: no archive means no names,
+    /// which leaves SpeakerId as a bare index and the mod behaving exactly as it did before
+    /// this existed (Ch. 76).
+    /// </summary>
+    private void ResolveSpeakerNames(nuint poolBase, int firstTextOff)
+    {
+        // How far back the file header may be. It has to clear the dialogue table, which
+        // is eight bytes per message, plus whatever the scene's earlier records occupy.
+        const int LookBack = 0x10000;
+
+        int span = Math.Min(firstTextOff, LookBack);
+        if (span < BmdMessage.HeaderBytes) return;
+
+        var window = new byte[span];
+        if (!MemoryGuard.TryRead(poolBase + (nuint)(firstTextOff - span), window, span)) return;
+
+        if (!BmdArchive.TryFindMagicBefore(window, span - 1, out int magicIndex))
+        {
+            _modLog!.Info($"[SPEAKER] no MSG1 header within {span}B of the first record");
+            return;
+        }
+        if (!BmdArchive.TryReadFileSize(window, magicIndex, out int fileSize))
+        {
+            _modLog!.Info("[SPEAKER] MSG1 header found but its declared size is implausible");
+            return;
+        }
+
+        nuint fileAddr = poolBase + (nuint)(firstTextOff - span + magicIndex - 8);
+        var   file     = new byte[fileSize];
+        if (!MemoryGuard.TryRead(fileAddr, file, fileSize))
+        {
+            _modLog!.Info($"[SPEAKER] MSG1 at 0x{fileAddr:X} declared {fileSize}B, unreadable");
+            return;
+        }
+
+        if (!BmdArchive.TryParse(file, 8, out BmdArchive archive))
+        {
+            // Neither address base made the dialogue table land on message headers. The
+            // likeliest cause is that P5R relocates the addresses into real pointers on
+            // load, in which case this approach cannot work and the log should say so
+            // rather than silently doing nothing.
+            _modLog!.Info($"[SPEAKER] MSG1 at 0x{fileAddr:X} ({fileSize}B) did not resolve");
+            return;
+        }
+
+        int named = 0;
+        foreach (RecordPlan record in _plan)
+        {
+            if (record.SpeakerId == BmdMessage.NoSpeaker) continue;
+            if (archive.TryGetSpeakerName(file, record.SpeakerId, out string name))
+            {
+                record.Speaker = name;
+                named++;
+            }
+        }
+
+        _modLog!.Info($"[SPEAKER] MSG1 at 0x{fileAddr:X}: {archive.DialogCount} messages, " +
+                      $"{archive.SpeakerCount} speakers, base=+0x" +
+                      $"{archive.AddressBase - archive.FileStart:X}; named {named}/{_plan.Count}");
+
+        // The table itself, which is the evidence that the layout is right. A correct
+        // parse prints character names; a wrong one prints fragments of dialogue.
+        for (int i = 0; i < Math.Min(16, archive.SpeakerCount); i++)
+            if (archive.TryGetSpeakerName(file, i, out string name))
+                _modLog!.Info($"[SPEAKER]   [{i}] {name}");
     }
 
     /// <summary>
