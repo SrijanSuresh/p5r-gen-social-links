@@ -3503,13 +3503,22 @@ public class Mod : IModV1
 
         LogHexBlock("head", file, 0, 0x60);
 
+        // Where the speaker table sits if the dialogue count at file+0x18 means what the
+        // format says it does. Printed unvalidated on purpose — a garbage count is itself
+        // the answer, and hiding it behind a sanity check would hide the answer with it.
+        int dialogCount = file[0x18] | (file[0x19] << 8) | (file[0x1A] << 16) | (file[0x1B] << 24);
+        _modLog!.Info($"[BMDHEX] dialogCount@0x18 = {dialogCount} " +
+                      $"-> speaker table would be at file+0x{0x20 + 8 * dialogCount:X}");
+        if (dialogCount > 0 && 0x20 + 8 * dialogCount + 0x30 < file.Length)
+            LogHexBlock("spk ", file, 0x20 + 8 * dialogCount, 0x30);
+
         // What sits in front of the first line. If a message header exists, it is here.
         int before = Math.Max(0, firstTextOffset - 0x40);
         LogHexBlock("pre ", file, before, Math.Min(0x50, file.Length - before));
 
         // The tail. "Girl's Father" was read live from file+0x2193 of 0x2220, so the name
-        // array and the strings it points at are both in this window.
-        int tail = Math.Max(0, file.Length - 0xC0);
+        // strings and whatever indexes them are both in this window.
+        int tail = Math.Max(0, file.Length - 0x140);
         LogHexBlock("tail", file, tail, file.Length - tail);
     }
 
