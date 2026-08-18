@@ -3371,7 +3371,7 @@ public class Mod : IModV1
             });
         }
 
-        ResolveSpeakerNames(poolBase, slots[records[0].Start].Off);
+        if (records.Count > 0) ResolveSpeakerNames(poolBase, slots[records[0].Start].Off);
 
         LogSlotSeparators(poolBase, slots);
         LogSpeakerCensus();
