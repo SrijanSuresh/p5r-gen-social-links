@@ -276,23 +276,84 @@ public class BmdArchiveTests
     // --- rejection ------------------------------------------------------------------
 
     [Fact]
-    public void Rejects_a_dialogue_table_that_points_at_nothing()
+    public void One_entry_that_does_not_parse_becomes_a_hole()
     {
+        // A menu record among 48 lines should not cost the other 47. The file still parses;
+        // the odd entry is recorded as a hole (Ch. 80).
         (byte[] file, _) = Archive(Scene, Speakers);
-        file[0x24] ^= 0x5A;
+        file[0x20 + 8 * 1 + 4] ^= 0x08;
+
+        Assert.True(BmdArchive.TryParse(file, out BmdArchive archive));
+        Assert.Equal(1, archive.HoleCount);
+        Assert.Equal(1, archive.FirstHole);
+        Assert.False(archive.Entries[1].Known);
+
+        // The rest survive intact.
+        Assert.Equal("MSG_000_0_0", archive.Entries[0].Name);
+        Assert.Equal("MSG_002_0_0", archive.Entries[2].Name);
+    }
+
+    [Fact]
+    public void A_hole_never_inherits_the_previous_message_speaker()
+    {
+        // The reason a hole stays on the map instead of being skipped. Message 1 belongs to
+        // the girl's father; if its entry is unreadable, its text must attribute to nobody
+        // rather than to Takemi, who owns the message before it.
+        (byte[] file, int[] ascii) = Archive(Scene, Speakers);
+        file[0x20 + 8 * 1 + 4] ^= 0x08;
+
+        Assert.True(BmdArchive.TryParse(file, out BmdArchive archive));
+        Assert.False(archive.TryFindByTextOffset(ascii[1], out _));
+
+        // And the message before it still resolves normally.
+        Assert.True(archive.TryFindByTextOffset(ascii[0], out BmdArchive.Entry first));
+        Assert.Equal("MSG_000_0_0", first.Name);
+    }
+
+    [Fact]
+    public void Rejects_a_file_where_most_entries_do_not_resolve()
+    {
+        // The line between degrading and pretending. A few odd records is a file with
+        // menus in it; a majority is the wrong rule.
+        (byte[] file, _) = Archive(Scene, Speakers);
+        for (int i = 1; i < Scene.Length; i++) file[0x20 + 8 * i + 4] ^= 0x08;
 
         Assert.False(BmdArchive.TryParse(file, out _));
     }
 
     [Fact]
-    public void Rejects_a_file_whose_later_entries_do_not_resolve()
+    public void Rejects_an_address_that_lands_outside_the_file()
     {
-        // All or nothing. Half a scene attributed under a wrong rule is worse than none,
-        // because it looks like it worked.
+        // Not a hole — an address that does not even point into the file means the
+        // addressing rule itself is wrong, and half a map is worse than none.
         (byte[] file, _) = Archive(Scene, Speakers);
-        file[0x20 + 8 * 2 + 4] ^= 0x33;
+        file[0x24 + 3] = 0x7F;
 
         Assert.False(BmdArchive.TryParse(file, out _));
+    }
+
+    [Fact]
+    public void A_selection_record_is_parsed_and_flagged()
+    {
+        // Selections put the count where a message keeps its speaker. Read as a message the
+        // header is rejected; read with its Kind it resolves, and it must never be rewritten
+        // — changing what the buttons say without changing what they do is a worse bug than
+        // a mis-attributed line.
+        (byte[] file, _) = Archive(Scene, Speakers);
+
+        // Turn entry 2 into a selection: Kind = 1, and move its count field.
+        int header = 0x20 + 8 * 2 + 4;
+        file[header - 4] = 1;
+        int record = header + (file[header] | (file[header + 1] << 8) |
+                               (file[header + 2] << 16) | (file[header + 3] << 24));
+        file[record + BmdMessage.SpeakerIdOffset]     = file[record + BmdMessage.PageCountOffset];
+        file[record + BmdMessage.SpeakerIdOffset + 1] = 0;
+        file[record + BmdMessage.PageCountOffset]     = 0;
+
+        Assert.True(BmdArchive.TryParse(file, out BmdArchive archive));
+        Assert.Equal(0, archive.HoleCount);
+        Assert.True(archive.Entries[2].IsSelection);
+        Assert.Equal(BmdMessage.NoSpeaker, archive.Entries[2].SpeakerId);
     }
 
     [Fact]

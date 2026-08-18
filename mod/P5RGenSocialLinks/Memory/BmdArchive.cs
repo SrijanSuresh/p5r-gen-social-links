@@ -63,15 +63,25 @@ internal readonly struct BmdArchive
     /// <summary>Longest speaker name accepted, in bytes, before the string is truncated.</summary>
     private const int MaxNameBytes = 64;
 
-    /// <summary>One message, located and decoded.</summary>
+    /// <summary>
+    /// One dialogue-table entry, decoded if it could be and held as a hole if it could not.
+    ///
+    /// A hole keeps its offset and reports no name and no speaker. That matters: skipping
+    /// an entry outright would leave a gap in the offset map, and containment matching
+    /// would then hand its text to the previous message - one character's lines attributed
+    /// to another, which is the bug this whole feature exists to remove (Ch. 80).
+    /// </summary>
     internal readonly struct Entry
     {
-        internal int    Index      { get; }
-        internal int    Offset     { get; }   // file offset of the record header
-        internal int    TextOffset { get; }   // file offset of its text buffer
-        internal int    SpeakerId  { get; }
-        internal string Name       { get; }
+        internal int    Index       { get; }
+        internal int    Offset      { get; }   // file offset of the record header
+        internal int    TextOffset  { get; }   // file offset of its text buffer
+        internal int    SpeakerId   { get; }
+        internal string Name        { get; }
         internal bool   IsSelection { get; }
+
+        /// <summary>False when the header did not parse; the entry is a hole on the map.</summary>
+        internal bool Known => Name.Length > 0;
 
         internal Entry(int index, int offset, int textOffset, int speakerId,
                        string name, bool isSelection)
@@ -83,14 +93,28 @@ internal readonly struct BmdArchive
             Name        = name;
             IsSelection = isSelection;
         }
+
+        /// <summary>An entry whose header could not be read. Text inside it attributes to nobody.</summary>
+        internal static Entry Hole(int index, int offset) =>
+            new(index, offset, offset, BmdMessage.NoSpeaker, string.Empty, false);
     }
 
     private readonly byte[]  _file;
     private readonly Entry[] _entries;
     private readonly int     _speakerArray;
 
-    internal int    SpeakerCount  { get; }
-    internal int    DialogCount   => _entries.Length;
+    internal int SpeakerCount { get; }
+    internal int DialogCount  => _entries.Length;
+
+    /// <summary>Entries whose header did not parse. Their text attributes to nobody.</summary>
+    internal int HoleCount { get; }
+
+    /// <summary>Index of the first unparsed entry, or -1. Diagnostic.</summary>
+    internal int FirstHole { get; }
+
+    /// <summary>File offset of the first unparsed entry's header, or -1. Diagnostic.</summary>
+    internal int FirstHoleOffset =>
+        FirstHole >= 0 && FirstHole < _entries.Length ? _entries[FirstHole].Offset : -1;
 
     /// <summary>
     /// File offset where dialogue data stops and the speaker names begin.
@@ -105,13 +129,15 @@ internal readonly struct BmdArchive
     internal IReadOnlyList<Entry> Entries => _entries;
 
     private BmdArchive(byte[] file, Entry[] entries, int speakerArray, int speakerCount,
-                       int dialogueEnd)
+                       int dialogueEnd, int holeCount, int firstHole)
     {
         _file         = file;
         _entries      = entries;
         _speakerArray = speakerArray;
         SpeakerCount  = speakerCount;
         DialogueEnd   = dialogueEnd;
+        HoleCount     = holeCount;
+        FirstHole     = firstHole;
     }
 
     internal bool HasSpeakerTable => SpeakerCount > 0 && _speakerArray > 0;
@@ -196,25 +222,42 @@ internal readonly struct BmdArchive
                 speakerArray = 0;
         }
 
-        var entries = new Entry[dialogCount];
+        var entries   = new Entry[dialogCount];
+        int known     = 0;
+        int firstHole = -1;
+
         for (int i = 0; i < dialogCount; i++)
         {
             int field  = DialogTableOffset + DialogEntryBytes * i + 4;
             int kind   = ReadInt32(file, field - 4);
             int offset = field + ReadInt32(file, field);
 
+            // An address that does not even land inside the file is not a hole, it is the
+            // wrong rule: the whole archive is refused rather than half-mapped.
             if (offset < 0 || offset + BmdMessage.HeaderBytes > file.Length) return false;
 
             var header = new byte[BmdMessage.HeaderBytes];
             Array.Copy(file, offset, header, 0, BmdMessage.HeaderBytes);
-            if (!BmdMessage.TryParse(header, out BmdMessage message)) return false;
 
-            int textOffset = offset + message.TextOffset;
-            if (textOffset > file.Length) return false;
-
-            entries[i] = new Entry(i, offset, textOffset, message.SpeakerId,
-                                   message.Name, kind != 0 || message.IsSelection);
+            bool isSelection = kind != 0;
+            if (BmdMessage.TryParse(header, isSelection, out BmdMessage message) &&
+                offset + message.TextOffset <= file.Length)
+            {
+                entries[i] = new Entry(i, offset, offset + message.TextOffset,
+                                       message.SpeakerId, message.Name,
+                                       isSelection || message.IsSelection);
+                known++;
+            }
+            else
+            {
+                entries[i] = Entry.Hole(i, offset);
+                if (firstHole < 0) firstHole = i;
+            }
         }
+
+        // A file where most entries do not parse is not a file with a few odd records in
+        // it. The threshold is the line between degrading and pretending.
+        if (known * 2 < dialogCount) return false;
 
         // Dialogue stops at whichever comes first: the name array or the relocation table.
         // Both are file offsets past the last text buffer, and either one bounds the region
@@ -224,7 +267,8 @@ internal readonly struct BmdArchive
         if (speakerArray > 0)                       dialogEnd = Math.Min(dialogEnd, speakerArray);
         if (reloc > 0 && reloc <= file.Length)      dialogEnd = Math.Min(dialogEnd, reloc);
 
-        archive = new BmdArchive(file, entries, speakerArray, speakerCount, dialogEnd);
+        archive = new BmdArchive(file, entries, speakerArray, speakerCount, dialogEnd,
+                                 dialogCount - known, firstHole);
         return true;
     }
 
@@ -256,7 +300,11 @@ internal readonly struct BmdArchive
             entry = candidate;
             found = true;
         }
-        return found;
+
+        // Landing in a hole is a successful lookup with no answer. Reporting failure is
+        // what keeps the caller from walking on to some earlier message and using its
+        // speaker instead.
+        return found && entry.Known;
     }
 
     /// <summary>

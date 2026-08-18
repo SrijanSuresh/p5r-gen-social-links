@@ -87,19 +87,45 @@ internal readonly struct BmdMessage
     /// may hold whatever the allocator put there after the message was freed. A parser
     /// that always succeeds would hand the rest of the mod a name made of line noise.
     /// </summary>
-    internal static bool TryParse(byte[] buf, out BmdMessage message)
+    internal static bool TryParse(byte[] buf, out BmdMessage message) =>
+        TryParse(buf, isSelection: false, out message);
+
+    /// <summary>
+    /// Parse a header of either record kind.
+    ///
+    /// A selection is the list of replies the player picks from, and its header is the same
+    /// shape with two fields swapped: the count moves from 0x18 to 0x1A, 0x18 holds a
+    /// pattern instead, and there is no speaker at all.
+    ///
+    /// <code>
+    /// MessageDialog                    SelectionDialog
+    ///   char[24] Name                    char[24] Name
+    ///   int16    PageCount    @0x18      int16    Ext          @0x18
+    ///   int16    SpeakerId    @0x1A      int16    OptionCount  @0x1A
+    ///   int32[]  PageStarts             int32[]  OptionStarts
+    /// </code>
+    ///
+    /// Which one a record is comes from the dialogue table's Kind field, not from guessing:
+    /// read as a message, a selection offers whatever sits in Ext as its page count, and
+    /// this parser rejects an implausible one — which is what made a whole 48-message file
+    /// fail on account of one menu (Ch. 80).
+    /// </summary>
+    internal static bool TryParse(byte[] buf, bool isSelection, out BmdMessage message)
     {
         message = default;
         if (buf is null || buf.Length < HeaderBytes) return false;
 
         if (!TryReadName(buf, out string name)) return false;
 
-        int pageCount = buf[PageCountOffset] | (buf[PageCountOffset + 1] << 8);
-        int speakerId = buf[SpeakerIdOffset] | (buf[SpeakerIdOffset + 1] << 8);
+        int countOffset = isSelection ? SpeakerIdOffset : PageCountOffset;
+        int count       = buf[countOffset] | (buf[countOffset + 1] << 8);
+        int speakerId   = isSelection
+            ? NoSpeaker
+            : buf[SpeakerIdOffset] | (buf[SpeakerIdOffset + 1] << 8);
 
-        if (pageCount < 1 || pageCount > MaxPages) return false;
+        if (count < 1 || count > MaxPages) return false;
 
-        message = new BmdMessage(name, pageCount, speakerId);
+        message = new BmdMessage(name, count, speakerId);
         return true;
     }
 
