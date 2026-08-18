@@ -49,7 +49,6 @@ public class Mod : IModV1
     private readonly byte[]              _recordBuf = new byte[128];
     private readonly byte[]              _mirrorBuf = new byte[128];
     private readonly byte[]              _headerBuf = new byte[BmdMessage.HeaderBytes];
-    private readonly byte[]              _headerWindow = new byte[BmdMessage.MaxHeaderSpan];
     private bool                         _speakerAudited;
 
     // Guards the pool write path. Flushing now happens from two places — the poll tick
@@ -3339,6 +3338,14 @@ public class Mod : IModV1
         (nuint poolBase, _, (int Off, int Len)[] slots) = _heapPools[0];
         var records = _poolRecords[0];
 
+        // Before the loop, because every record is attributed through it. Declared up
+        // front rather than inline: the short circuit on an empty pool would otherwise
+        // leave the outputs unassigned.
+        BmdArchive archive  = default;
+        nuint      fileAddr = 0;
+        bool haveArchive = records.Count > 0 &&
+            TryResolveArchive(poolBase, slots[records[0].Start].Off, out archive, out fileAddr);
+
         for (int i = 0; i < records.Count; i++)
         {
             (int start, int count) = records[i];
@@ -3357,21 +3364,35 @@ public class Mod : IModV1
                 line.Append(AsciiPreview(poolBase + (nuint)off, len));
             }
 
-            // Who says it. The scanner found this record by its text; the header sits a
-            // page-table's width behind that, and TryFindHeader recovers it (Ch. 75).
-            bool found = TryReadPoolHeader(poolBase, slots[start].Off, out BmdMessage header);
+            // Who says it. The archive's dialogue table already lists every message and
+            // where its text starts, so this is containment rather than a search: the run
+            // the scanner found belongs to the last message beginning at or before it
+            // (Ch. 79).
+            string name      = string.Empty;
+            string speaker   = string.Empty;
+            int    speakerId = BmdMessage.NoSpeaker;
+
+            if (haveArchive)
+            {
+                int fileOffset = (int)(poolBase + (nuint)slots[start].Off - fileAddr);
+                if (archive.TryFindByTextOffset(fileOffset, out BmdArchive.Entry entry))
+                {
+                    name      = entry.Name;
+                    speakerId = entry.SpeakerId;
+                    archive.TryGetSpeakerName(speakerId, out speaker);
+                }
+            }
 
             _plan.Add(new RecordPlan
             {
                 Index     = i,
                 Capacity  = capacity + (count - 1),
                 Original  = line.ToString().Trim(),
-                Name      = found ? header.Name : string.Empty,
-                SpeakerId = found ? header.SpeakerId : BmdMessage.NoSpeaker,
+                Name      = name,
+                SpeakerId = speakerId,
+                Speaker   = speaker,
             });
         }
-
-        if (records.Count > 0) ResolveSpeakerNames(poolBase, slots[records[0].Start].Off);
 
         LogSlotSeparators(poolBase, slots);
         LogSpeakerCensus();
@@ -3383,42 +3404,24 @@ public class Mod : IModV1
     }
 
     /// <summary>
-    /// Read the BMD header belonging to the text run at <paramref name="textOff"/> inside
-    /// an armed pool.
-    ///
-    /// The window is the bytes immediately before the run, so the search reads only memory
-    /// the scanner has already walked, and through ReadProcessMemory so a region freed
-    /// between arming and planning fails instead of faulting.
-    /// </summary>
-    private bool TryReadPoolHeader(nuint poolBase, int textOff, out BmdMessage header)
-    {
-        header = default;
-
-        int span = Math.Min(textOff, BmdMessage.MaxHeaderSpan);
-        if (span < BmdMessage.HeaderBytes) return false;
-
-        int windowStart = textOff - span;
-        if (!MemoryGuard.TryRead(poolBase + (nuint)windowStart, _headerWindow, span)) return false;
-
-        return BmdMessage.TryFindHeader(_headerWindow, span, out header, out _);
-    }
-
-    /// <summary>
-    /// Locate the MSG1 archive the records belong to, resolve what can be resolved, and
-    /// dump enough of it to settle what the rest of the layout is.
+    /// Locate and parse the MSG1 archive the armed pool's records belong to.
     ///
     /// The backwards walk is deliberately not bounded by the pool region. VirtualQuery
-    /// hands back the region containing an address, not the allocation, and two arms this
-    /// session gave up after "no MSG1 header within 116B of the first record" — the file
-    /// started before the region did. The span shrinks on a failed read instead, so the
-    /// search runs as far back as memory allows and no further.
+    /// hands back the region containing an address, not the allocation, and two arms gave
+    /// up after "no MSG1 header within 116B of the first record" because the file started
+    /// before the region did. The span halves on a failed read instead, so the search runs
+    /// as far back as memory allows and no further.
     ///
-    /// Every step is allowed to fail, and failing costs nothing: no archive means no names,
-    /// which leaves the plan exactly as it was before this existed (Ch. 76).
+    /// Every step may fail, and failing costs nothing: no archive means no names, which
+    /// leaves the plan exactly as it was before any of this existed.
     /// </summary>
-    private void ResolveSpeakerNames(nuint poolBase, int firstTextOff)
+    private bool TryResolveArchive(
+        nuint poolBase, int firstTextOff, out BmdArchive archive, out nuint fileAddr)
     {
         const int LookBack = 0x10000;
+
+        archive  = default;
+        fileAddr = 0;
 
         nuint   textAddr = poolBase + (nuint)firstTextOff;
         byte[]? window   = null;
@@ -3433,66 +3436,54 @@ public class Mod : IModV1
             }
             span /= 2;
         }
-        if (window is null) return;
+        if (window is null) return false;
 
         if (!BmdArchive.TryFindMagicBefore(window, span - 1, out int magicIndex))
         {
             _modLog!.Info($"[SPEAKER] no MSG1 header within {span}B of the first record");
-            return;
+            return false;
         }
         if (!BmdArchive.TryReadFileSize(window, magicIndex, out int fileSize))
         {
             _modLog!.Info("[SPEAKER] MSG1 header found but its declared size is implausible");
-            return;
+            return false;
         }
 
-        nuint fileAddr = textAddr - (nuint)span + (nuint)magicIndex - 8;
-        var   file     = new byte[fileSize];
-        if (!MemoryGuard.TryRead(fileAddr, file, fileSize))
+        nuint addr = textAddr - (nuint)span + (nuint)magicIndex - 8;
+        var   file = new byte[fileSize];
+        if (!MemoryGuard.TryRead(addr, file, fileSize))
         {
-            _modLog!.Info($"[SPEAKER] MSG1 at 0x{fileAddr:X} declared {fileSize}B, unreadable");
-            return;
+            _modLog!.Info($"[SPEAKER] MSG1 at 0x{addr:X} declared {fileSize}B, unreadable");
+            return false;
         }
 
-        LogArchiveDump(fileAddr, file, (int)(textAddr - fileAddr));
+        LogArchiveDump(addr, file, (int)(textAddr - addr));
 
-        if (!BmdArchive.TryParse(file, 8, out BmdArchive archive))
+        if (!BmdArchive.TryParse(file, out archive))
         {
-            _modLog!.Info($"[SPEAKER] MSG1 at 0x{fileAddr:X} ({fileSize}B) did not resolve");
-            return;
+            _modLog!.Info($"[SPEAKER] MSG1 at 0x{addr:X} ({fileSize}B) did not resolve");
+            return false;
         }
 
-        int named = 0;
-        foreach (RecordPlan record in _plan)
-        {
-            if (record.SpeakerId == BmdMessage.NoSpeaker) continue;
-            if (archive.TryGetSpeakerName(file, record.SpeakerId, out string name))
-            {
-                record.Speaker = name;
-                named++;
-            }
-        }
-
-        _modLog!.Info($"[SPEAKER] MSG1 at 0x{fileAddr:X}: {archive.DialogCount} messages, " +
-                      $"{archive.SpeakerCount} speakers, base=+0x" +
-                      $"{archive.AddressBase - archive.FileStart:X}; named {named}/{_plan.Count}");
+        fileAddr = addr;
+        _modLog!.Info($"[SPEAKER] MSG1 at 0x{addr:X}: {archive.DialogCount} messages, " +
+                      $"{archive.SpeakerCount} speakers, dialogue ends at file+0x" +
+                      $"{archive.DialogueEnd:X}" +
+                      (BmdArchive.IsRelocated(file) ? "" : ", NOT relocated"));
 
         for (int i = 0; i < Math.Min(16, archive.SpeakerCount); i++)
-            if (archive.TryGetSpeakerName(file, i, out string name))
+            if (archive.TryGetSpeakerName(i, out string name))
                 _modLog!.Info($"[SPEAKER]   [{i}] {name}");
+
+        return true;
     }
 
     /// <summary>
     /// Dump the three parts of the archive that decide what its interior looks like.
     ///
-    /// Two hypotheses have been offered for this layout and one has been tested to
-    /// destruction (Ch. 78). This is not a third: the header, the bytes immediately ahead
-    /// of the first line of text, and the tail where the speaker names live are all cheap
-    /// to print, and between them they say what the dialogue table holds and where the
-    /// message headers actually are.
-    ///
-    /// It runs once per plan and costs a dozen log lines, which is the correct price for
-    /// not guessing again.
+    /// Two hypotheses were offered for this layout before one hex dump settled it (Ch. 79).
+    /// The dump stays: it costs a dozen log lines once per armed scene, and it is what any
+    /// future disagreement between the parser and the game will be settled with.
     /// </summary>
     private void LogArchiveDump(nuint fileAddr, byte[] file, int firstTextOffset)
     {
@@ -3503,21 +3494,15 @@ public class Mod : IModV1
 
         LogHexBlock("head", file, 0, 0x60);
 
-        // Where the speaker table sits if the dialogue count at file+0x18 means what the
-        // format says it does. Printed unvalidated on purpose — a garbage count is itself
-        // the answer, and hiding it behind a sanity check would hide the answer with it.
         int dialogCount = file[0x18] | (file[0x19] << 8) | (file[0x1A] << 16) | (file[0x1B] << 24);
         _modLog!.Info($"[BMDHEX] dialogCount@0x18 = {dialogCount} " +
-                      $"-> speaker table would be at file+0x{0x20 + 8 * dialogCount:X}");
+                      $"-> speaker table at file+0x{0x20 + 8 * dialogCount:X}");
         if (dialogCount > 0 && 0x20 + 8 * dialogCount + 0x30 < file.Length)
             LogHexBlock("spk ", file, 0x20 + 8 * dialogCount, 0x30);
 
-        // What sits in front of the first line. If a message header exists, it is here.
         int before = Math.Max(0, firstTextOffset - 0x40);
         LogHexBlock("pre ", file, before, Math.Min(0x50, file.Length - before));
 
-        // The tail. "Girl's Father" was read live from file+0x2193 of 0x2220, so the name
-        // strings and whatever indexes them are both in this window.
         int tail = Math.Max(0, file.Length - 0x140);
         LogHexBlock("tail", file, tail, file.Length - tail);
     }
