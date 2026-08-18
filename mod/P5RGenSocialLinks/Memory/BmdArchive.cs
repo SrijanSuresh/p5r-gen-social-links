@@ -40,6 +40,7 @@ internal readonly struct BmdArchive
     /// Distance from the file start to the "MSG1" magic.
     private const int MagicOffset = 0x08;
 
+    private const int FileSizeOffset    = 0x04;
     private const int DialogCountOffset = 0x18;
     private const int DialogTableOffset = 0x20;
     private const int DialogEntryBytes  = 8;
@@ -49,6 +50,10 @@ internal readonly struct BmdArchive
     /// both size a table walk, so an implausible value has to fail here.
     private const int MaxDialogs  = 4096;
     private const int MaxSpeakers = 1024;
+
+    /// Bounds on the declared file size, which decides how much is copied per read.
+    private const int MinFileBytes = 0x40;
+    private const int MaxFileBytes = 16 * 1024 * 1024;
 
     /// <summary>Longest speaker name accepted, in bytes, before the string is truncated.</summary>
     private const int MaxNameBytes = 64;
@@ -100,6 +105,31 @@ internal readonly struct BmdArchive
             }
         }
         return false;
+    }
+
+    /// <summary>
+    /// Read the file's declared size from the four bytes at file+0x04.
+    ///
+    /// The caller needs this before it can read the archive, because the speaker names sit
+    /// past the end of every message — a window sized to reach the records is nowhere near
+    /// long enough to reach the table that names them.
+    ///
+    /// Bounded because the value decides how much memory gets copied out of the game on a
+    /// poll tick. Sixteen megabytes is far past any scene script and far short of anything
+    /// that would be felt.
+    /// </summary>
+    internal static bool TryReadFileSize(byte[] window, int magicIndex, out int fileSize)
+    {
+        fileSize = 0;
+
+        int fileStart = magicIndex - MagicOffset;
+        if (window is null || fileStart < 0 || fileStart + MagicOffset > window.Length) return false;
+
+        int size = ReadInt32(window, fileStart + FileSizeOffset);
+        if (size < MinFileBytes || size > MaxFileBytes) return false;
+
+        fileSize = size;
+        return true;
     }
 
     /// <summary>

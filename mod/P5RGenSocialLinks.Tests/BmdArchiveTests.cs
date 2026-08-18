@@ -87,6 +87,8 @@ public class BmdArchiveTests
         for (int i = 0; i < speakers.Count; i++)
             WriteInt32(body, speakerArray + 4 * i, nameIndices[i] - addressBase);
 
+        WriteInt32(body, 0x04, body.Count);   // FileSize, declared after the body is complete
+
         var window = new byte[lead + body.Count];
         for (int i = 0; i < lead; i++) window[i] = 0xCC;
         body.CopyTo(window, lead);
@@ -248,6 +250,38 @@ public class BmdArchiveTests
         Assert.Equal(0, archive.SpeakerCount);
         Assert.False(archive.HasSpeakerTable);
         Assert.False(archive.TryGetSpeakerName(window, 0, out _));
+    }
+
+    [Fact]
+    public void Reads_the_declared_file_size()
+    {
+        // The caller needs this before it can read the archive: speaker names live past
+        // the end of every message, so a window sized to reach the records falls short of
+        // the table that names them.
+        (byte[] window, int magic) = Archive(Scene, Speakers, lead: 96);
+
+        Assert.True(BmdArchive.TryReadFileSize(window, magic, out int size));
+        Assert.Equal(window.Length - 96, size);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(0x20)]
+    [InlineData(int.MaxValue)]
+    [InlineData(-4096)]
+    public void Rejects_an_implausible_file_size(int declared)
+    {
+        // The value decides how much game memory gets copied on a poll tick, so a garbage
+        // one has to be refused rather than acted on.
+        (byte[] window, int magic) = Archive(Scene, Speakers, lead: 96);
+        int fileStart = magic - 0x08;
+
+        window[fileStart + 4] = (byte)(declared & 0xFF);
+        window[fileStart + 5] = (byte)((declared >> 8) & 0xFF);
+        window[fileStart + 6] = (byte)((declared >> 16) & 0xFF);
+        window[fileStart + 7] = (byte)((declared >> 24) & 0xFF);
+
+        Assert.False(BmdArchive.TryReadFileSize(window, magic, out _));
     }
 
     [Fact]
