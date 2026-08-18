@@ -5854,3 +5854,92 @@ the ones we do *not* rewrite stop being obstacles and become the conversation: t
 can answer the question that was actually asked.
 
 The scene stops being a list of slots to overwrite and becomes a script with parts.
+
+---
+
+## Chapter 76: An Index Needs Its Table
+
+`SpeakerId` is a number. Ch. 75 got it out of the record header, and on its own it is
+worth almost nothing: knowing that record 4 and record 9 share speaker 2 tells you they
+are the same person, not who that person is.
+
+The mod needs the name, because the decision it has to make is "is this the confidant we
+are generating for?" — and the only handle it has on the confidant is a name, read out of
+a completely different structure (the CMM session struct, `ConfidantId` → `arcana.py`).
+
+### Where the table lives
+
+The `MSG1` file that contains the records also contains the table:
+
+```
+0x00       1  FileType
+0x01       1  Format
+0x02       2  UserId
+0x04       4  FileSize
+0x08       4  Magic                "MSG1"
+0x0C       4  ExtSize
+0x10       4  RelocationTable
+0x14       4  RelocationTableSize
+0x18       4  DialogCount
+0x1C       2  IsRelocated
+0x1E       2  Version
+0x20     8*n  DialogEntry[n]       { int Kind; int Address; }
+ ...      16  SpeakerTable         { int ArrayAddress; int Count; int ExtAddress; int _ }
+```
+
+`ArrayAddress` points at an array of `Count` addresses, each pointing at a NUL-terminated
+name. Two hops from an index to a string.
+
+### The problem with every address in that layout
+
+None of them are file offsets. They are relative to a base, and the base is a convention
+of the format rather than something stored in it. The one the toolchain uses is file start
+plus `0x10`; whether P5R's runtime copy keeps that after relocation is not something this
+mod can look up.
+
+The tempting move is to pick one and move on. Do not. A wrong base here does not crash and
+does not return empty — it walks into the middle of the dialogue data and reads whatever
+NUL-terminated run it lands on. The failure mode of guessing is *plausible names for the
+wrong speakers*, which is indistinguishable from success until someone plays the scene and
+notices the nurse talking like a doctor. That is precisely the class of bug Ch. 74 is about.
+
+### Let the data decide
+
+There is a check available that costs nothing. The dialogue table is a list of addresses to
+message records, and Ch. 75 already knows how to tell whether bytes are a message record.
+
+So: try each candidate base, resolve the first few dialogue entries, and require that they
+land on something `BmdMessage.TryParse` accepts — twenty-four bytes of printable ASCII with
+exact NUL padding, followed by a plausible page count. A wrong base fails that immediately,
+because the interior of a text buffer does not look like a header.
+
+The base is not assumed, it is *recovered*, and the recovery is verified against a
+structure we can independently parse. This is the same shape as the self-consistency test
+in `TryFindHeader` — accept the interpretation that predicts data you can already check —
+and it is going to keep being the answer, because reverse engineering never gives you a
+spec, only agreement between structures.
+
+### The magic is the anchor
+
+One more circularity to break: the parse needs the file start, and all we have is a record
+address somewhere inside the file.
+
+`MSG1` is four bytes at file+8, so the file start is a backwards search away. Nearest match
+wins, and that is not a tie-break — several BMDs are resident at once, and a record belongs
+to the file immediately behind it. Searching to the front of the region and taking the
+first hit would attribute a Takemi scene to whatever was loaded before it.
+
+### What is still guesswork, stated plainly
+
+Two things:
+
+- Whether the runtime copy is relocated at all. If P5R rewrites the addresses into real
+  pointers on load, neither candidate base resolves and the whole struct fails — which is
+  fine, because it fails *closed*: no table, no names, no attribution, and the mod keeps
+  behaving exactly as it did yesterday.
+- Whether P5R's speaker names are plain ASCII. They carry inline formatting codes, which
+  are stripped rather than rendered, so the worst case is a name with a character missing
+  rather than line noise in a prompt.
+
+Both are answered by one line of log from one real scene, which is where this stops being
+a chapter and starts being evidence.
