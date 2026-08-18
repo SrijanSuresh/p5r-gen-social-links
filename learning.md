@@ -5943,3 +5943,84 @@ Two things:
 
 Both are answered by one line of log from one real scene, which is where this stops being
 a chapter and starts being evidence.
+
+---
+
+## Chapter 77: Two Names for the Same Person
+
+The speaker table gives a label. The session struct gives a confidant id, which
+`ConfidantNames` turns into a display name. Attribution is the question of whether those
+two strings are the same person, and they are almost never the same string.
+
+The game labels a bubble `Takemi`. The mod calls her `Tae Takemi`. It labels one `Dr.
+Takemi` when the patient is speaking to her, `Ryuji` where the mod says `Ryuji Sakamoto`,
+and `???` before an introduction.
+
+### Why not just substring
+
+`speaker.Contains(name) || name.Contains(speaker)` handles the easy cases and quietly
+breaks on the interesting one. `Sakura` is inside `Futaba Sakura` and inside `Sojiro
+Sakura`. In a Futaba scene, every line Sojiro speaks would be attributed to Futaba and
+rewritten in her voice — which is exactly the bug this whole chapter exists to remove,
+reintroduced by the fix for it.
+
+`Niijima` is the same problem for Makoto and Sae, and those two share scenes constantly.
+
+### Tokens, minus the parts that are not names
+
+So compare word by word. Lowercase, drop anything that is not a letter (which handles
+`Dr.` losing its full stop, and `???` reducing to nothing at all), and drop the words that
+are titles rather than names — `dr`, `mr`, `ms`, `sensei`, `san`, `kun`, `chan`, `senpai`.
+Tokens shorter than three letters go too; nothing distinguishing survives at two.
+
+A shared token is then a candidate match. `Takemi` ∩ `{tae, takemi}` is non-empty. So is
+`Sakura` ∩ `{futaba, sakura}` — which is where the interesting part starts.
+
+### Let the table say which tokens are worth trusting
+
+A token that appears in more than one confidant's name cannot identify anybody. And the
+mod already holds every confidant's name, so it does not have to be told which tokens
+those are — it can work them out:
+
+```
+sakura   -> Futaba Sakura, Sojiro Sakura     ambiguous
+niijima  -> Makoto Niijima, Sae Niijima      ambiguous
+takemi   -> Tae Takemi                       distinctive
+futaba   -> Futaba Sakura                    distinctive
+```
+
+Match on distinctive tokens only. `Sakura` alone now matches nobody, which is the correct
+answer — the label genuinely does not say which one — while `Futaba` and `Sojiro` both
+still resolve. The rule maintains itself: adding a confidant whose surname collides with
+an existing one silently moves that surname into the ambiguous set, rather than silently
+creating a mis-attribution.
+
+This is the second time in two chapters that the answer has been *derive it from data you
+already hold* rather than *write down what you believe*. That is not a coincidence. Every
+hand-written table in this project has been wrong at least once — `ConfidantNames` was
+wrong about Takemi for months because two entries were missing above her.
+
+### What a non-match means
+
+Not "skip". Not yet.
+
+A record that is not the confidant's is still part of the conversation, and up to now the
+mod has had no way to say so. The scripted line is left alone *and* handed to the model as
+context, attributed to whoever the table named. The line the confidant says next is then a
+reply to a question that was actually asked, instead of a plausible sentence dropped into a
+gap.
+
+The scene stops being a list of slots and becomes a script with parts — which was the
+closing sentence of Ch. 75, and is the point of the whole exercise.
+
+### Failing closed
+
+Every step here can fail: no archive, no speaker table, an unknown label, an ambiguous one.
+All of them resolve to the same answer — *not attributable* — and the gate treats "not
+attributable" as "do not rewrite".
+
+That is the conservative direction, and it costs coverage. A scene whose archive does not
+parse rewrites nothing at all, where yesterday it rewrote everything. So the gate ships
+behind `speaker_filter_enabled`, off by default, and the first run produces the log that
+says whether the attribution is trustworthy. Turning it on is a decision made with evidence
+in hand, not a hope compiled in.
