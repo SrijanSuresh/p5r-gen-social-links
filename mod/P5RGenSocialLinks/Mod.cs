@@ -3404,30 +3404,36 @@ public class Mod : IModV1
     }
 
     /// <summary>
-    /// Turn the speaker ids on the plan into names, by finding and parsing the MSG1 file
-    /// the records belong to.
+    /// Locate the MSG1 archive the records belong to, resolve what can be resolved, and
+    /// dump enough of it to settle what the rest of the layout is.
     ///
-    /// Two reads, not one. The first walks backwards from the first record looking for the
-    /// magic, because the file header is the only thing that can say where the file starts
-    /// and how long it is. The second copies the whole file, because the speaker names sit
-    /// past the end of every message and a window that reaches the records does not reach
-    /// them.
+    /// The backwards walk is deliberately not bounded by the pool region. VirtualQuery
+    /// hands back the region containing an address, not the allocation, and two arms this
+    /// session gave up after "no MSG1 header within 116B of the first record" — the file
+    /// started before the region did. The span shrinks on a failed read instead, so the
+    /// search runs as far back as memory allows and no further.
     ///
     /// Every step is allowed to fail, and failing costs nothing: no archive means no names,
-    /// which leaves SpeakerId as a bare index and the mod behaving exactly as it did before
-    /// this existed (Ch. 76).
+    /// which leaves the plan exactly as it was before this existed (Ch. 76).
     /// </summary>
     private void ResolveSpeakerNames(nuint poolBase, int firstTextOff)
     {
-        // How far back the file header may be. It has to clear the dialogue table, which
-        // is eight bytes per message, plus whatever the scene's earlier records occupy.
         const int LookBack = 0x10000;
 
-        int span = Math.Min(firstTextOff, LookBack);
-        if (span < BmdMessage.HeaderBytes) return;
+        nuint   textAddr = poolBase + (nuint)firstTextOff;
+        byte[]? window   = null;
+        int     span     = LookBack;
 
-        var window = new byte[span];
-        if (!MemoryGuard.TryRead(poolBase + (nuint)(firstTextOff - span), window, span)) return;
+        while (span >= BmdMessage.HeaderBytes)
+        {
+            if ((ulong)textAddr > (ulong)span)
+            {
+                var buf = new byte[span];
+                if (MemoryGuard.TryRead(textAddr - (nuint)span, buf, span)) { window = buf; break; }
+            }
+            span /= 2;
+        }
+        if (window is null) return;
 
         if (!BmdArchive.TryFindMagicBefore(window, span - 1, out int magicIndex))
         {
@@ -3440,7 +3446,7 @@ public class Mod : IModV1
             return;
         }
 
-        nuint fileAddr = poolBase + (nuint)(firstTextOff - span + magicIndex - 8);
+        nuint fileAddr = textAddr - (nuint)span + (nuint)magicIndex - 8;
         var   file     = new byte[fileSize];
         if (!MemoryGuard.TryRead(fileAddr, file, fileSize))
         {
@@ -3448,12 +3454,10 @@ public class Mod : IModV1
             return;
         }
 
+        LogArchiveDump(fileAddr, file, (int)(textAddr - fileAddr));
+
         if (!BmdArchive.TryParse(file, 8, out BmdArchive archive))
         {
-            // Neither address base made the dialogue table land on message headers. The
-            // likeliest cause is that P5R relocates the addresses into real pointers on
-            // load, in which case this approach cannot work and the log should say so
-            // rather than silently doing nothing.
             _modLog!.Info($"[SPEAKER] MSG1 at 0x{fileAddr:X} ({fileSize}B) did not resolve");
             return;
         }
@@ -3473,11 +3477,59 @@ public class Mod : IModV1
                       $"{archive.SpeakerCount} speakers, base=+0x" +
                       $"{archive.AddressBase - archive.FileStart:X}; named {named}/{_plan.Count}");
 
-        // The table itself, which is the evidence that the layout is right. A correct
-        // parse prints character names; a wrong one prints fragments of dialogue.
         for (int i = 0; i < Math.Min(16, archive.SpeakerCount); i++)
             if (archive.TryGetSpeakerName(file, i, out string name))
                 _modLog!.Info($"[SPEAKER]   [{i}] {name}");
+    }
+
+    /// <summary>
+    /// Dump the three parts of the archive that decide what its interior looks like.
+    ///
+    /// Two hypotheses have been offered for this layout and one has been tested to
+    /// destruction (Ch. 78). This is not a third: the header, the bytes immediately ahead
+    /// of the first line of text, and the tail where the speaker names live are all cheap
+    /// to print, and between them they say what the dialogue table holds and where the
+    /// message headers actually are.
+    ///
+    /// It runs once per plan and costs a dozen log lines, which is the correct price for
+    /// not guessing again.
+    /// </summary>
+    private void LogArchiveDump(nuint fileAddr, byte[] file, int firstTextOffset)
+    {
+        if (!_cfg.BmdDumpEnabled) return;
+
+        _modLog!.Info($"[BMDHEX] file at 0x{fileAddr:X}, {file.Length}B, " +
+                      $"first text at file+0x{firstTextOffset:X}");
+
+        LogHexBlock("head", file, 0, 0x60);
+
+        // What sits in front of the first line. If a message header exists, it is here.
+        int before = Math.Max(0, firstTextOffset - 0x40);
+        LogHexBlock("pre ", file, before, Math.Min(0x50, file.Length - before));
+
+        // The tail. "Girl's Father" was read live from file+0x2193 of 0x2220, so the name
+        // array and the strings it points at are both in this window.
+        int tail = Math.Max(0, file.Length - 0xC0);
+        LogHexBlock("tail", file, tail, file.Length - tail);
+    }
+
+    /// <summary>Sixteen bytes per line, hex then ASCII, offsets relative to the file.</summary>
+    private void LogHexBlock(string tag, byte[] file, int start, int length)
+    {
+        for (int off = start; off < start + length && off < file.Length; off += 16)
+        {
+            var hex   = new System.Text.StringBuilder(48);
+            var ascii = new System.Text.StringBuilder(16);
+
+            for (int i = 0; i < 16; i++)
+            {
+                if (off + i >= file.Length) { hex.Append("   "); continue; }
+                byte b = file[off + i];
+                hex.Append(b.ToString("X2")).Append(' ');
+                ascii.Append(b >= 0x20 && b <= 0x7E ? (char)b : '.');
+            }
+            _modLog!.Info($"[BMDHEX] {tag} +{off:X4}  {hex} |{ascii}|");
+        }
     }
 
     /// <summary>

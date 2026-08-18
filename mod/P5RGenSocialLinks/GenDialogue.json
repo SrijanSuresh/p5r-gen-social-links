@@ -83,6 +83,10 @@
   // have done while it is off.
   "speaker_filter_enabled": false,
 
+  // Dump the scene archive's header, the bytes ahead of its first line, and its tail.
+  // A dozen log lines once per armed scene, on while the BMD interior is being worked out.
+  "bmd_dump_enabled": true,
+
   // Log every pointer chain step with address + dereferenced value.
   // Enable when TryResolve() fails and you need to find the broken link.
   // Leave false in normal play — fires every 500ms poll tick.

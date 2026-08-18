@@ -117,6 +117,16 @@ internal sealed class GenConfig
     public bool SpeakerFilterEnabled { get; init; } = false;
 
     /// <summary>
+    /// Dump the scene archive's header, the bytes ahead of its first line, and its tail.
+    ///
+    /// A dozen log lines once per armed scene. On while the BMD interior is still being
+    /// worked out — two hypotheses have been offered for it and one has already been
+    /// tested to destruction, so the layout gets read rather than guessed (Ch. 78).
+    /// </summary>
+    [JsonPropertyName("bmd_dump_enabled")]
+    public bool BmdDumpEnabled { get; init; } = true;
+
+    /// <summary>
     /// When true, PointerChainResolver logs each chain step with address and dereferenced value.
     /// Useful for diagnosing broken pointer chains after a game patch; leave false in production.
     /// </summary>
