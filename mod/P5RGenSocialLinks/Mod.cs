@@ -50,6 +50,7 @@ public class Mod : IModV1
     private readonly byte[]              _mirrorBuf = new byte[128];
     private readonly byte[]              _headerBuf = new byte[BmdMessage.HeaderBytes];
     private readonly byte[]              _headerWindow = new byte[BmdMessage.MaxHeaderSpan];
+    private bool                         _speakerAudited;
 
     // Guards the pool write path. Flushing now happens from two places — the poll tick
     // and the thread-pool continuation that finishes a generation — and both walk the
@@ -2885,13 +2886,18 @@ public class Mod : IModV1
     {
         if (_plan.Count == 0) return;
 
-        int written = 0, pending = 0, tooSmall = 0;
+        int written = 0, pending = 0, tooSmall = 0, foreign = 0;
         var gaps = new System.Text.StringBuilder();
         foreach (RecordPlan record in _plan)
         {
             bool replaced = record.WasWritten;
             if (replaced) { written++; continue; }
             if (record.Original.Length < 8) continue;   // never a candidate
+
+            // Another character's line is not a miss. Counting it as one would report a
+            // Takemi scene shared with a patient and her father as half-failed, when
+            // leaving those lines alone is the whole point of the filter.
+            if (record.State == RecordState.Foreign) { foreign++; continue; }
 
             // Records we deliberately never queue are not failures, and counting them as
             // misses understated the result: the first report read 17/22 when five of the
@@ -2905,6 +2911,7 @@ public class Mod : IModV1
         int candidates = written + pending;
         int percent    = candidates == 0 ? 0 : written * 100 / candidates;
         _modLog!.Info($"[SCENE] replaced {written}/{candidates} records ({percent}%)" +
+                      (foreign  > 0 ? $", {foreign} left to other speakers" : "") +
                       (tooSmall > 0 ? $", {tooSmall} too short to try" : "") +
                       (gaps.Length > 0 ? $" — missed {gaps}" : ""));
     }
@@ -3131,6 +3138,8 @@ public class Mod : IModV1
         int lookahead = _cfg.PregenLookahead;
         if (lookahead <= 0 || _plan.Count == 0) return;
 
+        ApplySpeakerFilter(snap);
+
         // One request at a time, because the server runs one at a time. It answers 429 to
         // anything overlapping, and the poll tick is 500ms against 2-3s of inference — so
         // four requests in five were born to be dropped. The server counted 78 requests,
@@ -3172,6 +3181,66 @@ public class Mod : IModV1
     }
 
     /// <summary>
+    /// Take the records this scene attributes to somebody else out of the queue.
+    ///
+    /// Runs on every pump but does work once: only Pending records can move to Foreign,
+    /// so the second pass finds nothing left to do.
+    ///
+    /// The audit line is printed whether or not the filter is on, because deciding to turn
+    /// it on needs the same numbers the filter acts on. A scene that reports "9 own, 7
+    /// other, 0 unattributed" is one this is ready for; "0 own, 0 other, 16 unattributed"
+    /// means the archive did not resolve and turning the switch on would silence the mod
+    /// completely.
+    /// </summary>
+    private void ApplySpeakerFilter(SocialLinkSnapshot snap)
+    {
+        if (_plan.Count == 0) return;
+
+        int mine = 0, others = 0, unattributed = 0;
+        foreach (RecordPlan record in _plan)
+        {
+            if (record.Speaker.Length == 0) unattributed++;
+            else if (ConfidantNames.IsSpokenBy(snap.ConfidantId, record.Speaker)) mine++;
+            else others++;
+        }
+
+        if (!_speakerAudited)
+        {
+            _speakerAudited = true;
+            _modLog!.Info($"[SPEAKER] {ConfidantNames.Resolve(snap.ConfidantId)}: " +
+                          $"{mine} own, {others} other, {unattributed} unattributed" +
+                          (_cfg.SpeakerFilterEnabled ? "" : " (filter off — nothing skipped)"));
+        }
+
+        if (!_cfg.SpeakerFilterEnabled) return;
+
+        // Refuse to filter a scene the confidant appears to say nothing in.
+        //
+        // That is not a scene — it is a broken chain somewhere between the header and the
+        // name table, and acting on it would replace "every line in the wrong voice" with
+        // "no lines at all". Ch. 77 calls for failing closed on a single record; failing
+        // closed on all of them is a different decision and it should not be silent.
+        if (mine == 0)
+        {
+            _modLog!.Info("[SPEAKER] filter idle — no record attributed to the confidant");
+            return;
+        }
+
+        int skipped = 0;
+        foreach (RecordPlan record in _plan)
+        {
+            if (record.State != RecordState.Pending) continue;
+            if (ConfidantNames.IsSpokenBy(snap.ConfidantId, record.Speaker)) continue;
+
+            record.State = RecordState.Foreign;
+            skipped++;
+        }
+
+        if (skipped > 0)
+            _modLog!.Info($"[SPEAKER] left {skipped} records to their own speakers");
+    }
+
+    /// <summary>
     /// Start the queue immediately after arming, without waiting for the next poll tick.
     ///
     /// The front of a scene is where coverage is always lost — #3 through #6 in the last
@@ -3200,6 +3269,7 @@ public class Mod : IModV1
     private void BuildRecordPlan()
     {
         _plan.Clear();
+        _speakerAudited = false;
         if (_heapPools.Count == 0 || _poolRecords.Count == 0) return;
 
         (nuint poolBase, _, (int Off, int Len)[] slots) = _heapPools[0];
