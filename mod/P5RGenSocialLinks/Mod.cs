@@ -2952,23 +2952,20 @@ public class Mod : IModV1
         const int Budget = 1000;
         int from = Math.Max(0, record.Index - 4);
 
+        // Whether this scene resolved speaker names at all. Without them every earlier
+        // line has to be presented as the confidant's own, which is what the unattributed
+        // path below does; with them, the history can name who said what.
+        bool attributed = false;
+        foreach (RecordPlan planned in _plan)
+            if (planned.Speaker.Length > 0) { attributed = true; break; }
+
         while (true)
         {
             var history = new System.Text.StringBuilder();
             if (from < record.Index)
             {
-                // Attribution matters more than it looks. These are the speaker's own
-                // earlier lines, and calling them "the conversation so far" made the model
-                // read them as the other person's: replacing Ryuji explaining the pricing,
-                // it answered him instead — "Fair enough, bro, that's a small price."
-                history.Append(" You have just said, oldest first:");
-                for (int i = from; i < record.Index; i++)
-                {
-                    string said = _plan[i].Generated ?? _plan[i].Original;
-                    if (said.Length > 0) history.Append(" \"").Append(said).Append('"');
-                }
-                history.Append(" Carry on from your own last line — you are still talking, " +
-                               "not replying to someone.");
+                if (attributed) AppendCast(history, snap, record, from);
+                else            AppendMonologue(history, record, from);
             }
 
             if (ctx.Length + history.Length <= Budget || from >= record.Index)
@@ -2980,6 +2977,72 @@ public class Mod : IModV1
             from++;   // give up the oldest line and try again
         }
     }
+
+    /// <summary>
+    /// Earlier lines with nobody's name on them, presented as the confidant's own.
+    ///
+    /// This is the shape the context had before speaker attribution existed, and it is
+    /// still the right one when a scene's archive does not resolve: every line has to be
+    /// attributed to somebody, and the confidant is the only name available.
+    ///
+    /// The wording is load-bearing. Calling this block "the conversation so far" made the
+    /// model read the lines as the other person's and answer them — replacing Ryuji
+    /// explaining the gym's pricing, it came back with "Fair enough, bro, that's a small
+    /// price," which is a reply to himself.
+    /// </summary>
+    private void AppendMonologue(
+        System.Text.StringBuilder history, RecordPlan record, int from)
+    {
+        history.Append(" You have just said, oldest first:");
+        for (int i = from; i < record.Index; i++)
+        {
+            string said = _plan[i].Generated ?? _plan[i].Original;
+            if (said.Length > 0) history.Append(" \"").Append(said).Append('"');
+        }
+        history.Append(" Carry on from your own last line — you are still talking, " +
+                       "not replying to someone.");
+    }
+
+    /// <summary>
+    /// Earlier lines with their speakers named — the scene as a script rather than a
+    /// monologue.
+    ///
+    /// This is the half of attribution that improves lines rather than protecting them.
+    /// The records the filter declines to rewrite are not obstacles; they are the other
+    /// half of the conversation, and until now the mod had no way to say so. A Takemi
+    /// line that follows her patient's father asking a question can now answer the
+    /// question, instead of being a plausible sentence dropped into the gap.
+    ///
+    /// The closing instruction changes with the last speaker, because "carry on from your
+    /// own last line" is exactly wrong when the last line was somebody else's.
+    /// </summary>
+    private void AppendCast(
+        System.Text.StringBuilder history, SocialLinkSnapshot snap, RecordPlan record, int from)
+    {
+        history.Append(" The conversation so far, oldest first:");
+        for (int i = from; i < record.Index; i++)
+        {
+            string said = _plan[i].Generated ?? _plan[i].Original;
+            if (said.Length == 0) continue;
+
+            history.Append(' ')
+                   .Append(IsConfidantLine(snap, _plan[i]) ? "You" : SpeakerLabel(_plan[i]))
+                   .Append(": \"").Append(said).Append('"');
+        }
+
+        RecordPlan previous = _plan[record.Index - 1];
+        history.Append(IsConfidantLine(snap, previous)
+            ? " Carry on from your own last line — you are still talking, not replying to someone."
+            : $" Reply to what {SpeakerLabel(previous)} just said.");
+    }
+
+    private bool IsConfidantLine(SocialLinkSnapshot snap, RecordPlan record) =>
+        ConfidantNames.IsSpokenBy(snap.ConfidantId, record.Speaker);
+
+    /// A name for a line the prompt has to attribute to somebody. Unlabelled bubbles are
+    /// common — narration, and anyone the scene has not introduced yet.
+    private static string SpeakerLabel(RecordPlan record) =>
+        record.Speaker.Length > 0 ? record.Speaker : "Someone else";
 
     /// <summary>
     /// True when a candidate line says what the previous one already said.
