@@ -6024,3 +6024,111 @@ parse rewrites nothing at all, where yesterday it rewrote everything. So the gat
 behind `speaker_filter_enabled`, off by default, and the first run produces the log that
 says whether the attribution is trustworthy. Turning it on is a decision made with evidence
 in hand, not a hope compiled in.
+
+---
+
+## Chapter 78: The Pointer Was Never the Record
+
+Ch. 75 opened with "every record the interpreter hands us starts with twenty-four bytes we
+have spent the whole project stepping around." A scene later, the count is nought for
+sixty-five:
+
+```
+[SPEAKER] 0/65 records attributed; none
+[SPEAKER]   #0 ? spk=65535
+```
+
+Not a partial failure, not a wrong speaker id. `BmdMessage.TryParse` never once returned
+true against live memory.
+
+### The line that settles it
+
+```
+[WATCH] in-pool record=0x4211C245E3 cursor=0x7 "Girl's Father"
+```
+
+`Girl's Father` is a speaker name, and a speaker name is a bare NUL-terminated string —
+it has no page count, no page table, no header of any kind. The interpreter loaded its
+address into RAX and started fetching characters, exactly as it does for a line of
+dialogue.
+
+So `mov rax,[rbx+0x20]` is not a message record. It is *the string currently being drawn*.
+The struct that owns it is somewhere else, and everything Ch. 75 built on top of that
+address was built on a misreading.
+
+The `[GAP]` dumps say the same thing from the other side:
+
+```
+[GAP] 27B between #3 and #4: 0A F2 23 00 00 F1 21 F2 05 FF FF F1 41 F7 61 09 01 01 ...
+```
+
+Twenty-seven bytes between one bubble and the next, and not one of them is ASCII. A
+twenty-four byte name would be unmissable there. There is no header between the texts.
+
+### Where the wrong number came from
+
+Ch. 75's confirmation was that the layout predicted the text at `+0x28`, and `0x1C + 4·2 +
+4` is `0x28` for a two-page message. That felt like the layout agreeing with a measurement.
+
+It was not a measurement. `+0x28` came from `AdvancePoolCursor`, which matches a record
+address to a text run *within a window*:
+
+```csharp
+const int HeaderWindow = 0x80;
+...
+if (textOff - offset > HeaderWindow) break;
+```
+
+`0x28` was one observation of a distance that the code permits to be anything up to `0x80`.
+A tolerance got written down as a fact, and then a documented file format was accepted
+because it reproduced the fact.
+
+This is not the Ch. 74 failure — a rule that was true and stopped being true. It is worse
+and simpler: a number that was never load-bearing, promoted to evidence because it agreed
+with what I already wanted to believe. The right question about `+0x28` was "how was that
+obtained?", and I did not ask it.
+
+### What is still standing
+
+Three things, all worth keeping:
+
+- **The file is real and findable.** `MSG1 at 0x4211C22450 (8736B)` — the magic search
+  works, the declared size is plausible, and the first line's text lands at `file+0x1D4`.
+  Everything about locating the archive held; only the interpretation of its interior did
+  not.
+- **Speaker names live near the end of it.** `0x4211C245E3` is `file+0x2193` of `0x2220` —
+  the last hundred and forty bytes. That is where a name array belongs, and the game
+  reading strings out of it is direct evidence the array is there.
+- **The rejection filter did its job.** `TryParse` was strict about NUL padding precisely
+  so it would refuse rubbish, and when the layout turned out to be wrong it refused
+  everything rather than inventing sixty-five plausible names. A loose parser would have
+  attributed this scene confidently and wrongly, and the log would have looked like
+  success.
+
+### The thing the game handed over unasked
+
+It draws the speaker's name. Through the same interpreter, from a fixed address, re-read
+every time the bubble changes:
+
+```
+15:44:58.253  record=0x4211C22938 "So it seems her body's developed"
+15:44:58.254  record=0x4211C245E3 "Girl's Father"
+```
+
+One millisecond apart. Who is speaking is observable without parsing anything at all —
+which is Ch. 65's lesson arriving a second time, from a different direction: *ask the
+consumer, not the format*.
+
+It is not a complete answer, because pre-generation runs eight records ahead of the player
+and this only reports the line being drawn now. But it is a free, exact ground truth for
+the current line, and that makes it something better than a fallback — it is a way to
+check whatever the format-parsing eventually claims.
+
+### What happens next is a hex dump, not another hypothesis
+
+Two hypotheses have now been offered for the interior of this file and one has been tested.
+The next step is not a third. The file's first `0x60` bytes, the `0x60` bytes ahead of the
+first line of text, and the tail where the names live are all cheap to log, and between
+them they say what the dialogue table actually contains and where the headers actually are.
+
+Guessing the layout has been tried. Reading it has not.
