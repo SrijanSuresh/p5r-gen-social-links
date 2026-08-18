@@ -52,6 +52,25 @@ internal sealed class RecordPlan
     /// moment (Ch. 64).
     internal string Original { get; init; } = string.Empty;
 
+    /// <summary>
+    /// The BMD symbol for this message, e.g. "MSG_001_5_0", or empty when the header
+    /// could not be located. Diagnostic rather than load-bearing: it is what makes a
+    /// mis-grouped record obvious in the log, because names run in script order.
+    /// </summary>
+    internal string Name { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Index into the scene's speaker table, or <see cref="BmdMessage.NoSpeaker"/> for
+    /// narration and for records whose header was not found.
+    ///
+    /// Unknown and narration deliberately share a value. Both mean "not attributable to
+    /// the confidant", and the safe response to either is the same: leave the line alone.
+    /// </summary>
+    internal int SpeakerId { get; set; } = BmdMessage.NoSpeaker;
+
+    /// <summary>Resolved display name for <see cref="SpeakerId"/>, when the table is known.</summary>
+    internal string Speaker { get; set; } = string.Empty;
+
     internal RecordState State { get; set; } = RecordState.Pending;
 
     /// The generated replacement, once it exists.
@@ -83,6 +102,12 @@ internal sealed class RecordPlan
     /// right up until the interpreter reads it.
     internal bool IsWritable => State != RecordState.Rendered;
 
-    public override string ToString() =>
-        $"#{Index} {State} cap={Capacity} \"{Original[..System.Math.Min(Original.Length, 32)]}\"";
+    public override string ToString()
+    {
+        string who = Speaker.Length > 0 ? Speaker
+                   : SpeakerId != BmdMessage.NoSpeaker ? $"spk{SpeakerId}"
+                   : "-";
+        return $"#{Index} {State} cap={Capacity} {who} " +
+               $"\"{Original[..System.Math.Min(Original.Length, 32)]}\"";
+    }
 }

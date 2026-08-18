@@ -49,6 +49,7 @@ public class Mod : IModV1
     private readonly byte[]              _recordBuf = new byte[128];
     private readonly byte[]              _mirrorBuf = new byte[128];
     private readonly byte[]              _headerBuf = new byte[BmdMessage.HeaderBytes];
+    private readonly byte[]              _headerWindow = new byte[BmdMessage.MaxHeaderSpan];
 
     // Guards the pool write path. Flushing now happens from two places — the poll tick
     // and the thread-pool continuation that finishes a generation — and both walk the
@@ -3222,20 +3223,81 @@ public class Mod : IModV1
                 line.Append(AsciiPreview(poolBase + (nuint)off, len));
             }
 
+            // Who says it. The scanner found this record by its text; the header sits a
+            // page-table's width behind that, and TryFindHeader recovers it (Ch. 75).
+            bool found = TryReadPoolHeader(poolBase, slots[start].Off, out BmdMessage header);
+
             _plan.Add(new RecordPlan
             {
-                Index    = i,
-                Capacity = capacity + (count - 1),
-                Original = line.ToString().Trim(),
+                Index     = i,
+                Capacity  = capacity + (count - 1),
+                Original  = line.ToString().Trim(),
+                Name      = found ? header.Name : string.Empty,
+                SpeakerId = found ? header.SpeakerId : BmdMessage.NoSpeaker,
             });
         }
 
         LogSlotSeparators(poolBase, slots);
+        LogSpeakerCensus();
 
         _modLog!.Info($"[PLAN] {_plan.Count} records; " +
                       $"capacity {MinCapacity()}-{MaxCapacity()} chars");
         for (int i = 0; i < Math.Min(4, _plan.Count); i++)
             _modLog!.Info($"[PLAN]   {_plan[i]}");
+    }
+
+    /// <summary>
+    /// Read the BMD header belonging to the text run at <paramref name="textOff"/> inside
+    /// an armed pool.
+    ///
+    /// The window is the bytes immediately before the run, so the search reads only memory
+    /// the scanner has already walked, and through ReadProcessMemory so a region freed
+    /// between arming and planning fails instead of faulting.
+    /// </summary>
+    private bool TryReadPoolHeader(nuint poolBase, int textOff, out BmdMessage header)
+    {
+        header = default;
+
+        int span = Math.Min(textOff, BmdMessage.MaxHeaderSpan);
+        if (span < BmdMessage.HeaderBytes) return false;
+
+        int windowStart = textOff - span;
+        if (!MemoryGuard.TryRead(poolBase + (nuint)windowStart, _headerWindow, span)) return false;
+
+        return BmdMessage.TryFindHeader(_headerWindow, span, out header, out _);
+    }
+
+    /// <summary>
+    /// Report which speakers the scene contains, and how much of it we could attribute.
+    ///
+    /// The census is the evidence, not the feature. If the layout in Ch. 75 is right this
+    /// prints a handful of ids in script order with names beside them; if it is wrong it
+    /// prints a scatter of one-offs, or nothing at all, and no behaviour has changed yet
+    /// either way. Nothing keys off SpeakerId until a real scene has produced this line.
+    /// </summary>
+    private void LogSpeakerCensus()
+    {
+        var counts  = new System.Collections.Generic.Dictionary<int, int>();
+        int unknown = 0;
+
+        foreach (RecordPlan record in _plan)
+        {
+            if (record.Name.Length == 0) { unknown++; continue; }
+            counts.TryGetValue(record.SpeakerId, out int n);
+            counts[record.SpeakerId] = n + 1;
+        }
+
+        var parts = new System.Collections.Generic.List<string>();
+        foreach (var pair in counts)
+            parts.Add($"{(pair.Key == BmdMessage.NoSpeaker ? "narration" : $"spk{pair.Key}")}" +
+                      $"x{pair.Value}");
+
+        _modLog!.Info($"[SPEAKER] {_plan.Count - unknown}/{_plan.Count} records attributed; " +
+                      $"{(parts.Count > 0 ? string.Join(", ", parts) : "none")}");
+
+        for (int i = 0; i < Math.Min(6, _plan.Count); i++)
+            _modLog!.Info($"[SPEAKER]   #{i} {(_plan[i].Name.Length > 0 ? _plan[i].Name : "?")} " +
+                          $"spk={_plan[i].SpeakerId}");
     }
 
     /// <summary>
