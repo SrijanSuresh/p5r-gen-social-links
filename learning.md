@@ -6335,3 +6335,115 @@ This is the same defect as the 429 storm of Ch. 72, in the same place, found the
 by reading the *server's* log because the mod's log was silent. The rule that keeps being
 relearned is that a failure which is handled is not a failure which is understood, and the
 handler is exactly where the log line belongs.
+
+## Chapter 81: The Format Knows Who Talks, Not Who Listens
+
+Attribution closed one half of a question and made the other half visible. The BMD tells us
+who speaks a line, so Takemi's patient no longer gets rewritten in Takemi's voice. What the
+file does not contain anywhere is who a line is spoken *to*.
+
+The symptom, from the clinic scene:
+
+```
+[SPEAKER]   [0] Takemi
+[SPEAKER]   [1] Girl's Father
+[SPEAKER]   [2] Sick Girl
+```
+
+Three people in a room, and a prompt that says — in every one of the three world-grounding
+strings — `"Joker — the person you are talking to"`. So Takemi gets handed a father asking
+about his daughter's treatment and answers the protagonist. She tells the father about
+"your parents". She answers a nine-year-old's "can I go to school tomorrow?" with a line
+pitched at a high-school boy who is standing silently in the corner.
+
+Every one of those is the same defect: the scene has a speaker and an addressee, and only
+one of them is modelled.
+
+### Why there is nothing to parse
+
+The instinct after Ch. 79 is to go looking for an addressee field. There isn't one, and the
+reason is structural rather than an oversight.
+
+`MessageDialog` is 24 bytes of name, a page count, a speaker id, and a page table. That is
+the whole header. The renderer needs a speaker id because it draws the name above the
+bubble — the addressee is never drawn, so the renderer never needs it, so it was never
+stored. A format stores what its consumer reads.
+
+This is the opposite situation to the one the project has been in for eighty chapters. The
+lesson of Ch. 65 was *ask the consumer, not the heap*: stop inferring what the game can
+hand you. Here the game cannot hand us anything, because it never knew. Inference is not
+the lazy option this time; it is the only option, and the job is to pick an inference whose
+failures are cheap.
+
+### Turn-taking is observable even when the addressee is not
+
+What the archive does give us is the full sequence of speakers, in script order, for the
+whole scene — including records the player has not reached. That is enough for a turn model:
+
+```
+line i-1   spoken by  Girl's Father
+line i     spoken by  Takemi          →  Takemi is answering the Girl's Father
+```
+
+Three rules cover the scene:
+
+1. **The previous line was someone else's** → they are the addressee. You answer whoever
+   just spoke to you. This is the case that fixes the clinic.
+2. **The previous line was also yours** → the addressee carries forward. A character
+   speaking three bubbles in a row is still talking to the same person; the turn did not
+   change hands just because their sentence ran long.
+3. **There is no previous line** → the addressee is Joker. A hang-out exists because the
+   player initiated it, and the opening line of a scene is aimed at them.
+
+Rule 3 is also the whole-scene answer for a solo hang-out, which is most of them. Ryuji at
+the gym is 21 records of Ryuji, so rule 2 carries Joker forward from rule 3 and the
+addressee never changes. The model has to be right about the common case before it is
+allowed to be clever about the rare one.
+
+### The protagonist is a party to every scene and a speaker in none
+
+Joker never appears in a speaker table. He is silent by design — the player's lines are
+menu selections, which is exactly why `SEL` records exist and why rewriting one changes
+what a button says without changing what it does.
+
+So the addressee set is not the speaker table. It is the speaker table **plus** the
+protagonist, and the protagonist is the default. That asymmetry is worth stating in code
+rather than leaving implicit, because "who can be addressed" and "who can speak" look like
+the same list right up until the silent party matters.
+
+### Where the addressee goes in the prompt, and why it is not the system half
+
+The obvious place is the system prompt, next to the character notes. That would be a
+measurable mistake.
+
+Ch. 72's note on `max_chars` applies directly: llama-server reuses the KV cache for the
+longest identical prefix between requests, the system prompt is that prefix, and baking a
+per-record number into it took generation from ~1.5 s to ~3.5 s. The addressee is not quite
+per-record — it is stable for long runs and changes only when the turn does — but a
+three-party scene changes it often enough to cost real cache invalidations, and there is no
+upside to paying them.
+
+So the restructuring is:
+
+- **System half** becomes addressee-neutral. The world grounding stops saying "Joker — the
+  person you are talking to" and says only what is permanently true: that Joker leads the
+  Phantom Thieves, or that you do not know he does.
+- **User half** carries `[You are speaking to: …]`, alongside the character budget that is
+  already there for the same reason.
+
+That split is the actual fix. The two facts were conflated in one string — who Joker is in
+the world, and who happens to be listening right now — and only the first belongs in a
+cached prefix. Pulling them apart is what lets the second one vary at all.
+
+### What failure looks like
+
+Rule 1 is wrong whenever a scene has a character answer someone other than the last
+speaker, which real dialogue does. The cost is a line aimed at the wrong person in a room
+where both are present — which is the current behaviour for every multi-party line, so the
+floor does not move.
+
+Rule 3 is wrong when a scene opens mid-conversation between two NPCs. Same floor: today
+that line is aimed at Joker too.
+
+This is the shape to want from an inference. It cannot do worse than the assumption it
+replaces, because the assumption it replaces is one of its own cases.
