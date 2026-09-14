@@ -85,6 +85,18 @@ internal sealed class RecordPlan
     /// <summary>Resolved display name for <see cref="SpeakerId"/>, when the table is known.</summary>
     internal string Speaker { get; set; } = string.Empty;
 
+    /// <summary>
+    /// True when this record is a <c>SEL</c> — the list of replies the player picks from,
+    /// not a line anybody says.
+    ///
+    /// Two separate things need it. It is the one record kind that must never be
+    /// rewritten, because changing what the buttons say without changing what they do is
+    /// worse than a mis-attributed line (Ch. 80). And it is the only place the
+    /// protagonist speaks, so it is his turn as far as the addressee model is concerned
+    /// (Ch. 81) — a confidant answering a menu choice is answering Joker.
+    /// </summary>
+    internal bool IsSelection { get; set; }
+
     internal RecordState State { get; set; } = RecordState.Pending;
 
     /// The generated replacement, once it exists.

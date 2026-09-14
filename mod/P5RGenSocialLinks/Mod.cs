@@ -3376,6 +3376,7 @@ public class Mod : IModV1
             string name      = string.Empty;
             string speaker   = string.Empty;
             int    speakerId = BmdMessage.NoSpeaker;
+            bool   selection = false;
 
             if (haveArchive)
             {
@@ -3384,18 +3385,20 @@ public class Mod : IModV1
                 {
                     name      = entry.Name;
                     speakerId = entry.SpeakerId;
+                    selection = entry.IsSelection;
                     archive.TryGetSpeakerName(speakerId, out speaker);
                 }
             }
 
             _plan.Add(new RecordPlan
             {
-                Index     = i,
-                Capacity  = capacity + (count - 1),
-                Original  = line.ToString().Trim(),
-                Name      = name,
-                SpeakerId = speakerId,
-                Speaker   = speaker,
+                Index       = i,
+                Capacity    = capacity + (count - 1),
+                Original    = line.ToString().Trim(),
+                Name        = name,
+                SpeakerId   = speakerId,
+                Speaker     = speaker,
+                IsSelection = selection,
             });
         }
 
