@@ -123,11 +123,21 @@ internal sealed class RecordPlan
     /// </summary>
     internal bool WasWritten { get; set; }
 
+    /// <summary>
     /// True while the record may still be overwritten. Written is included on purpose:
     /// a pre-generated line is a floor that a reactive generation is allowed to raise,
     /// right up until the interpreter reads it.
+    ///
+    /// <see cref="IsSelection"/> is checked here rather than in the speaker filter because
+    /// Ch. 80's rule is "never, regardless" and the filter is none of those things: it can
+    /// be switched off in <c>GenDialogue.json</c>, it goes idle when a scene's archive does
+    /// not resolve, and it declines to act at all when nothing attributes to the confidant.
+    /// A selection survived every one of those paths — protected only incidentally, by
+    /// having no speaker to match. Protection that depends on a config flag is not the
+    /// rule the chapter states.
+    /// </summary>
     internal bool IsWritable =>
-        State != RecordState.Rendered && State != RecordState.Foreign;
+        !IsSelection && State != RecordState.Rendered && State != RecordState.Foreign;
 
     public override string ToString()
     {

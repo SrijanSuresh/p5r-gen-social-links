@@ -2885,13 +2885,18 @@ public class Mod : IModV1
     {
         if (_plan.Count == 0) return;
 
-        int written = 0, pending = 0, tooSmall = 0, foreign = 0;
+        int written = 0, pending = 0, tooSmall = 0, foreign = 0, menus = 0;
         var gaps = new System.Text.StringBuilder();
         foreach (RecordPlan record in _plan)
         {
             bool replaced = record.WasWritten;
             if (replaced) { written++; continue; }
             if (record.Original.Length < 8) continue;   // never a candidate
+
+            // A menu is not a line we failed to replace. "Yes, I'm sure!" is fourteen
+            // characters in a roomy slot, so without this it cleared both the length and
+            // capacity floors and was counted as a miss.
+            if (record.IsSelection) { menus++; continue; }
 
             // Another character's line is not a miss. Counting it as one would report a
             // Takemi scene shared with a patient and her father as half-failed, when
@@ -2911,6 +2916,7 @@ public class Mod : IModV1
         int percent    = candidates == 0 ? 0 : written * 100 / candidates;
         _modLog!.Info($"[SCENE] replaced {written}/{candidates} records ({percent}%)" +
                       (foreign  > 0 ? $", {foreign} left to other speakers" : "") +
+                      (menus    > 0 ? $", {menus} selections left alone" : "") +
                       (tooSmall > 0 ? $", {tooSmall} too short to try" : "") +
                       (gaps.Length > 0 ? $" — missed {gaps}" : ""));
     }
@@ -3225,6 +3231,16 @@ public class Mod : IModV1
         {
             RecordPlan record = _plan[i];
             if (record.State != RecordState.Pending) continue;
+
+            // A selection is the list of replies the player picks from, so there is
+            // nothing here to say in character and the write is forbidden outright
+            // (Ch. 80). Taking it out of the queue as well as out of the write path saves
+            // an inference that could never have been used.
+            if (record.IsSelection)
+            {
+                record.State = RecordState.Rendered;   // permanently out of the way
+                continue;
+            }
 
             // Records whose scripted line is too short to be a spoken line are skipped
             // rather than generated for. A three-character record is a fragment of UI,
