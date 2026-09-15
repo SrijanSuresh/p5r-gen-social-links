@@ -86,6 +86,21 @@ internal sealed class RecordPlan
     internal string Speaker { get; set; } = string.Empty;
 
     /// <summary>
+    /// Who this line is spoken to, or empty when the scene changed turn to somebody it
+    /// did not name.
+    ///
+    /// Derived from the turn order rather than read from the file, because the format has
+    /// no addressee field and could not have one — the renderer never draws the listener,
+    /// so it was never stored (Ch. 81). Resolved once per plan: it depends only on the
+    /// speaker ids, which are fixed at arm time.
+    ///
+    /// Empty and <see cref="Addressee.Protagonist"/> are different answers. Empty means
+    /// "somebody, but we cannot say who", and the prompt omits the line instead of
+    /// claiming Joker.
+    /// </summary>
+    internal string Addressee { get; set; } = string.Empty;
+
+    /// <summary>
     /// True when this record is a <c>SEL</c> — the list of replies the player picks from,
     /// not a line anybody says.
     ///

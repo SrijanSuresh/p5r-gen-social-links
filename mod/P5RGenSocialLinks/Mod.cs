@@ -3418,6 +3418,8 @@ public class Mod : IModV1
             });
         }
 
+        ResolveAddressees();
+
         LogSlotSeparators(poolBase, slots);
         LogSpeakerCensus();
 
@@ -3559,6 +3561,47 @@ public class Mod : IModV1
             }
             _modLog!.Info($"[BMDHEX] {tag} +{off:X4}  {hex} |{ascii}|");
         }
+    }
+
+    /// <summary>
+    /// Work out who each line is spoken to, for the whole scene, at arm time.
+    ///
+    /// Once per plan rather than once per request. The answer depends only on the speaker
+    /// ids and the record kinds, both fixed when the scene is armed, so recomputing it per
+    /// generation would walk the plan backwards on every line to reach the same string.
+    ///
+    /// The log line is the evidence. A solo hang-out should print one addressee for the
+    /// whole scene and a rank-up should print the cast changing hands; a scatter means the
+    /// turn model is reading the speaker table wrong, and that is visible here before it
+    /// is visible in a generated line.
+    /// </summary>
+    private void ResolveAddressees()
+    {
+        if (_plan.Count == 0) return;
+
+        var turns = new Addressee.Turn[_plan.Count];
+        for (int i = 0; i < _plan.Count; i++)
+            turns[i] = new Addressee.Turn(_plan[i].SpeakerId, _plan[i].Speaker,
+                                          _plan[i].IsSelection);
+
+        var counts = new System.Collections.Generic.Dictionary<string, int>(StringComparer.Ordinal);
+        for (int i = 0; i < _plan.Count; i++)
+        {
+            string to = Addressee.Resolve(turns, i);
+            _plan[i].Addressee = to;
+
+            string key = to.Length > 0 ? to : "(unnamed)";
+            counts.TryGetValue(key, out int n);
+            counts[key] = n + 1;
+        }
+
+        var summary = new System.Text.StringBuilder();
+        foreach (var pair in counts)
+        {
+            if (summary.Length > 0) summary.Append(", ");
+            summary.Append(pair.Key).Append(" x").Append(pair.Value);
+        }
+        _modLog!.Info($"[ADDRESSEE] {summary}");
     }
 
     /// <summary>
