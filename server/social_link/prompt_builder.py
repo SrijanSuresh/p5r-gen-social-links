@@ -6,23 +6,30 @@ from .tier import tier_note as _tier_note
 
 TEAMMATE_GROUNDING = (
     "You are a member of the Phantom Thieves of Hearts, the secret group led by "
-    "Joker — the person you are talking to. You steal corrupt hearts together and "
-    "you trust him completely. Never speak of the Phantom Thieves as enemies, "
-    "strangers, or a group you are outside of or hunting."
+    "Joker. You steal corrupt hearts together and you trust him completely. Never "
+    "speak of the Phantom Thieves as enemies, strangers, or a group you are outside "
+    "of or hunting."
 )
 
 CONFIDANT_GROUNDING = (
-    "You know that Joker — the person you are talking to — leads the Phantom Thieves "
-    "of Hearts, and you keep that secret. You are not a member yourself. Never treat "
-    "the Phantom Thieves as your enemies."
+    "You know that Joker leads the Phantom Thieves of Hearts, and you keep that "
+    "secret. You are not a member yourself. Never treat the Phantom Thieves as your "
+    "enemies."
 )
 
 UNAWARE_GROUNDING = (
-    "You do NOT know that Joker — the person you are talking to — is connected to the "
-    "Phantom Thieves of Hearts. To you he is an ordinary high-school student. Only "
-    "ever refer to the Phantom Thieves the way the public does, as rumour and news, "
-    "and never imply he is involved."
+    "You do NOT know that Joker is connected to the Phantom Thieves of Hearts. To you "
+    "he is an ordinary high-school student. Only ever refer to the Phantom Thieves the "
+    "way the public does, as rumour and news, and never imply he is involved."
 )
+
+
+# None of the three says "the person you are talking to" any more, and that omission is
+# the point. Two different facts were welded into one string: what Joker permanently is in
+# this world, and who happens to be listening to this particular line. Only the first
+# belongs in a system prompt, because the system prompt is the KV-cache prefix — see the
+# placement note in build_prompt. Prising them apart is what lets the second one vary at
+# all, and a confidant speaking to somebody else still needs the world facts intact.
 
 
 def _world_grounding(confidant: "Confidant") -> str:
@@ -75,6 +82,10 @@ Rules:
 - Do NOT start your response with the character's own name.
 - Match the emotional closeness appropriate for rank {rank}/10.
 - Do NOT repeat the player's words verbatim; respond naturally.
+- You will be told who you are speaking to. Aim the line at that person. If it
+  is someone other than Joker, do not address him and do not describe the person
+  you are addressing in the third person: he is in the room and listening, but
+  they are the one you are talking to.
 - If you are told which line you are replacing, keep its purpose and move the
   conversation the same distance forward. Do not restate a line you already said.
 - If you are shown what you just said, continue from it. This is one conversation,
@@ -95,11 +106,48 @@ Rules:
 """
 
 
+PROTAGONIST = "Joker"
+
+
+def _addressee_note(addressee: str, speaker_name: str) -> str:
+    """
+    One line naming who this reply is aimed at, or "" when there is nothing to claim.
+
+    Three cases, and the empty one matters as much as the others. The mod sends an empty
+    string when it knows the turn changed hands but not to whom: a scene whose archive did
+    not resolve, or the reactive path that has no record to derive a turn order from.
+    Filling that in with "Joker" would restore the exact assumption this exists to remove,
+    so an unknown addressee produces no line at all and the model falls back to inferring
+    from the conversation history, which is where it was before.
+    """
+    name = (addressee or "").strip()
+    if not name:
+        return ""
+
+    # Defensive: the turn model never returns the speaker's own name, because a run of
+    # their own bubbles is skipped rather than answered. If it ever did, "You are speaking
+    # to Takemi" in a Takemi line is worse than saying nothing.
+    if name.casefold() == (speaker_name or "").casefold():
+        return ""
+
+    if name == PROTAGONIST:
+        return f"[You are speaking to {PROTAGONIST}.]"
+
+    # Naming Joker as present is not padding. Without it the model reads "speaking to the
+    # Girl's Father" as a scene Joker is absent from, and starts describing him in the
+    # third person to his face.
+    return (
+        f"[You are speaking to {name}, not to {PROTAGONIST}. "
+        f"{PROTAGONIST} is present and listening, but this line is aimed at {name}.]"
+    )
+
+
 def build_prompt(
     confidant_id: int,
     rank: int,
     context: str,
     max_chars: int = 56,
+    addressee: str = "",
 ) -> tuple[str, str]:
     """
     Return (system_prompt, user_prompt) for the LLM.
@@ -109,6 +157,11 @@ def build_prompt(
     for clipping the result — the model treats a length rule as a strong suggestion — but
     a model aiming at 30 characters overruns by a word, while one aiming at 56 overruns
     by a clause.
+
+    ``addressee`` is who the line is spoken to, which the mod derives from the
+    scene's turn order rather than reading out of the file, because the format has no
+    such field (Ch. 81). It joins ``max_chars`` in the user half for the same cache
+    reason, and an empty value is omitted rather than defaulted to Joker.
     """
     confidant: Confidant = get_confidant(confidant_id)
     system = SYSTEM_TEMPLATE.format(
@@ -143,9 +196,15 @@ def build_prompt(
     # still failing. Asking for 85% leaves room for the overshoot to land inside.
     target = max(12, max_chars * 85 // 100)
     max_words = max(3, target // 5)
+
+    # Ahead of the length rule on purpose. Who you are talking to changes what the
+    # whole line is for, while the budget only changes how long it runs, and the model
+    # weights the earlier instruction more heavily.
+    note = _addressee_note(addressee, confidant.name)
     user = (
         f"[Scene context: {context}]\n"
-        f"[Aim for about {target} characters, roughly {max_words} words. "
+        + (f"{note}\n" if note else "")
+        + f"[Aim for about {target} characters, roughly {max_words} words. "
         f"Finish the sentence — a complete short line beats a longer unfinished one.]\n"
         f"{confidant.name}:"
     )
