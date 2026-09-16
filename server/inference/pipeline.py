@@ -58,6 +58,7 @@ class InferencePipeline:
         rank: int,
         context: str,
         max_chars: int | None = None,
+        addressee: str = "",
     ) -> str:
         """
         Produce one line, clipped to what the destination can actually display.
@@ -69,9 +70,15 @@ class InferencePipeline:
         on screen, which reads as a bug rather than as a short line.
 
         None keeps the configured default, for callers that have no record in hand.
+
+        ``addressee`` is who the line is spoken to. It defaults to empty rather than to
+        Joker: the caller that cannot derive a turn order has no business asserting one,
+        and build_prompt omits the claim entirely when it is blank.
         """
         budget = self._cfg.max_response_chars if max_chars is None else max_chars
-        system_prompt, user_prompt = build_prompt(confidant_id, rank, context, budget)
+        system_prompt, user_prompt = build_prompt(
+            confidant_id, rank, context, budget, addressee
+        )
 
         response = self._model.create_chat_completion(
             messages=[
