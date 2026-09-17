@@ -10,15 +10,19 @@ from social_link.tier import tier_note, tier_label, TIER_LABELS
 @pytest.mark.parametrize("rank,expected_fragment", [
     (1, "just met"),
     (2, "just met"),
-    (3, "Acquaintances"),
-    (5, "Acquaintances"),
-    (6, "Close friends"),
-    (8, "Close friends"),
-    (9, "Deepest bond"),
-    (10, "Deepest bond"),
+    (3, "acquaintances"),
+    (5, "acquaintances"),
+    (6, "close friends"),
+    (8, "close friends"),
+    (9, "deepest bond"),
+    (10, "deepest bond"),
 ])
 def test_tier_note_correct_text(rank: int, expected_fragment: str) -> None:
-    assert expected_fragment in tier_note(rank)
+    # Case-insensitive because the tier word is no longer sentence-initial: the notes
+    # name Joker as the subject of the bond, so "Close friends." became "You and Joker
+    # are close friends." (Ch. 81). What the test is pinning is which tier a rank maps
+    # to, not where the capital letter falls.
+    assert expected_fragment in tier_note(rank).casefold()
 
 
 def test_tier_note_returns_string() -> None:
@@ -53,3 +57,13 @@ def test_tier_labels_dict_covers_all_ranks() -> None:
     for rank in range(1, 11):
         matches = [label for label, r in TIER_LABELS.items() if rank in r]
         assert len(matches) == 1, f"Rank {rank} matched {len(matches)} labels"
+
+
+def test_every_tier_note_names_whose_bond_it_describes() -> None:
+    """
+    The rank measures the confidant's bond with the protagonist. The note it produces can
+    end up in a prompt aimed at a third party, so leaving the subject implicit let the
+    model read it as advice about the listener (Ch. 81).
+    """
+    for rank in range(1, 11):
+        assert "Joker" in tier_note(rank), f"rank {rank} leaves its subject implicit"

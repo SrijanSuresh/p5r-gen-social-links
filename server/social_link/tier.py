@@ -4,14 +4,28 @@ from __future__ import annotations
 
 
 def tier_note(rank: int) -> str:
-    """Return relationship-tier guidance text for the given Social Link rank (1-10)."""
+    """
+    Relationship-tier guidance for a Social Link rank (1-10).
+
+    Every line names Joker, and that is not decoration. The rank measures the confidant's
+    bond with the protagonist and nobody else, but the note sits in a prompt that may be
+    aimed at a third party: a rank-up scene has a cast, and "Close friends, comfortable
+    banter" read as advice about the listener had Takemi bantering with a sick child's
+    father on their first meeting (Ch. 81).
+
+    Naming the subject costs two words and makes the note true whoever is being addressed.
+    """
     if rank <= 2:
-        return "You have just met. Keep tone polite but reserved; do not use pet names."
+        return ("You and Joker have just met. Keep tone polite but reserved; "
+                "do not use pet names for him.")
     if rank <= 5:
-        return "Acquaintances warming up. Casual, friendly; some shared history implied."
+        return ("You and Joker are acquaintances warming up. Casual and friendly "
+                "with him; some shared history implied.")
     if rank <= 8:
-        return "Close friends. Comfortable banter, genuine emotional investment."
-    return "Deepest bond. Speak with trust, vulnerability, and warmth."
+        return ("You and Joker are close friends. Comfortable banter with him, "
+                "genuine emotional investment.")
+    return ("You and Joker share your deepest bond. Speak to him with trust, "
+            "vulnerability, and warmth.")
 
 
 # Tier label strings for logging / display

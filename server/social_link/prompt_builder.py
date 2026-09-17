@@ -80,7 +80,8 @@ Rules:
   so a shorter line that finishes always beats a longer one that does not.
 - Do NOT break character, reference that you are an AI, or use meta-commentary.
 - Do NOT start your response with the character's own name.
-- Match the emotional closeness appropriate for rank {rank}/10.
+- Match the emotional closeness appropriate for rank {rank}/10. That rank is
+  your bond with Joker specifically, not with whoever you are addressing.
 - Do NOT repeat the player's words verbatim; respond naturally.
 - You will be told who you are speaking to. Aim the line at that person. If it
   is someone other than Joker, do not address him and do not describe the person
