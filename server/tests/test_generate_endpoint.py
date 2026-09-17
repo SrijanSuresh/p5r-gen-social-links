@@ -72,3 +72,43 @@ async def test_generate_session_id_increments(client_with_mock: AsyncClient) -> 
     r1 = await client_with_mock.post("/generate", json=RYUJI_REQUEST)
     r2 = await client_with_mock.post("/generate", json=RYUJI_REQUEST)
     assert r2.json()["session_id"] > r1.json()["session_id"]
+
+
+# --- the addressee reaches the pipeline, and absence is not an error ------------
+#
+# The field is the last link in a chain that starts in a hex dump: the archive names a
+# record's speaker, the turn order turns that into a listener, and only here does it
+# become something the model can read. A silent drop anywhere along it looks exactly
+# like the bug it fixes (Ch. 81).
+
+
+@pytest.mark.asyncio
+async def test_generate_forwards_the_addressee_to_the_pipeline(
+    client_with_mock: AsyncClient, mock_pipeline
+) -> None:
+    body = {**RYUJI_REQUEST, "addressee": "Girl's Father"}
+    r = await client_with_mock.post("/generate", json=body)
+
+    assert r.status_code == 200
+    assert "Girl's Father" in mock_pipeline.generate.call_args.args
+
+
+@pytest.mark.asyncio
+async def test_generate_defaults_the_addressee_to_empty(
+    client_with_mock: AsyncClient, mock_pipeline
+) -> None:
+    # An older mod build does not send the field at all. It has to keep working, and the
+    # prompt has to omit the claim rather than default it to Joker.
+    r = await client_with_mock.post("/generate", json=RYUJI_REQUEST)
+
+    assert r.status_code == 200
+    assert mock_pipeline.generate.call_args.args[-1] == ""
+
+
+@pytest.mark.asyncio
+async def test_generate_rejects_an_implausibly_long_addressee(
+    client_with_mock: AsyncClient,
+) -> None:
+    bad = {**RYUJI_REQUEST, "addressee": "x" * 65}
+    r = await client_with_mock.post("/generate", json=bad)
+    assert r.status_code == 422

@@ -89,6 +89,17 @@ class GenerateRequest(BaseModel):
     # working against a newer server and simply gets the configured default.
     max_chars: int | None = Field(default=None, ge=8, le=512)
 
+    # Who the line is spoken to. The mod derives it from the scene's turn order, because
+    # the BMD has no addressee field and never could: the renderer draws the speaker's
+    # name above the bubble and never the listener's (Ch. 81).
+    #
+    # Defaults to empty, and empty is a real answer rather than a missing one. The mod
+    # sends it when the turn demonstrably changed hands to somebody the scene did not
+    # name, and when the request came from the reactive path that has no record to derive
+    # a turn order from. The prompt then omits the claim instead of asserting Joker,
+    # which is also what an older mod build gets by not sending the field at all.
+    addressee: str = Field(default="", max_length=64)
+
 
 class GenerateResponse(BaseModel):
     text: str
@@ -167,6 +178,7 @@ async def generate(req: GenerateRequest) -> GenerateResponse:
             req.rank,
             req.context,
             req.max_chars,
+            req.addressee,
         )
 
     try:
