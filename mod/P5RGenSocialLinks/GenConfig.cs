@@ -118,6 +118,23 @@ internal sealed class GenConfig
     public bool SpeakerFilterEnabled { get; init; } = true;
 
     /// <summary>
+    /// Tell the server who each line is spoken to, derived from the scene's turn order.
+    ///
+    /// Attribution decides whose voice a line is written in; this decides who it is aimed
+    /// at. Without it the prompt assumes the listener is always the protagonist, so Takemi
+    /// told a patient's father about "your parents" and answered a child's question as
+    /// though Joker had asked it (Ch. 81).
+    ///
+    /// On by default, and cheaper to trust than the filter: an addressee only changes
+    /// prompt text, so a wrong one costs one line's aim and never a byte of game memory.
+    /// The switch exists because the turn model is an inference rather than a parse, and
+    /// comparing a scene with it against the same scene without it is the only way to
+    /// judge whether the inference is earning its place.
+    /// </summary>
+    [JsonPropertyName("addressee_enabled")]
+    public bool AddresseeEnabled { get; init; } = true;
+
+    /// <summary>
     /// Dump the scene archive's header, the bytes ahead of its first line, and its tail.
     ///
     /// A dozen log lines once per armed scene. On while the BMD interior is still being

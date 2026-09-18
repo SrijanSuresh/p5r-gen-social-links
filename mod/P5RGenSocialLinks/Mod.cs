@@ -3115,7 +3115,7 @@ public class Mod : IModV1
                     Context       = BuildRecordContext(snap, record),
                     CharacterName = Memory.ConfidantNames.Resolve(snap.ConfidantId),
                     MaxChars      = record.Capacity,
-                    Addressee     = record.Addressee,
+                    Addressee     = _cfg.AddresseeEnabled ? record.Addressee : string.Empty,
                 };
 
                 string text = await _llmClient!.GenerateAsync(req, cts.Token);
