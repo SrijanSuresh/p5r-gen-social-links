@@ -288,10 +288,86 @@ Ch. 75–80. The rule that finally worked: **every stored address in a BMD is re
 position of the field that stores it.** Nothing in the documentation says so; one hex dump
 did.
 
-**Next up:** who a line is spoken *to*. Attribution says who is talking, but the prompt still
-assumes the listener is always Joker — so Takemi tells a child's father about "your parents",
-and answers "can I go to school tomorrow?" with a line aimed at the protagonist. The scene
-has an addressee as well as a speaker, and only one of them is modelled.
+### ✅ Addressee modelling
+
+Attribution said who was talking. The prompt still assumed the listener was always Joker, in
+the plainest possible way — all three world-grounding strings contained the words *"Joker —
+the person you are talking to"*. So Takemi told a sick child's father about "your parents",
+and answered "can I go to school tomorrow?" with a line pitched at the high-school boy
+standing silently in the corner.
+
+The BMD cannot help here. `MessageDialog` is a name, a page count, a speaker id and a page
+table — there is no addressee field, and there could not be one: the renderer draws the
+speaker's name above the bubble and never draws the listener, so it was never stored. A
+format holds what its consumer reads. After eighty chapters of *stop inferring what the game
+can hand you*, this is the case where the game genuinely never knew.
+
+What the archive does give us is every speaker in script order for the whole scene. That is
+enough for a turn model, and one rule covers it:
+
+> **The addressee of a line is the most recent earlier speaker who is not the line's own
+> speaker — and the protagonist when there is none.**
+
+The three cases it was written from all fall out of that single rule:
+
+| Scene shape | Walk back finds | Addressee |
+|---|---|---|
+| The father asks, Takemi answers | a different speaker | **Girl's Father** |
+| Takemi runs three bubbles long | only herself, then the father | **Girl's Father** (carried) |
+| Ryuji, 21 records, alone at the gym | nobody else, ever | **Joker** |
+| The player picks a reply, then Takemi speaks | a `SEL` record | **Joker** |
+
+That last row is the one the format pays for twice. A selection is the only place the
+protagonist speaks — he is silent by design — so the addressee set is the speaker table
+*plus* him, and `SEL` counts as his turn.
+
+**Where the fact goes matters as much as what it is.** The obvious home for an addressee is
+the system prompt, next to the character notes, and that would be a measurable mistake:
+llama-server reuses the KV cache for the longest identical prefix between requests, the
+system prompt *is* that prefix, and baking a per-line value into it took generation from
+~1.5 s to ~3.5 s when `max_chars` tried it (Ch. 72). So the two facts that had been welded
+into one string got prised apart — what Joker permanently is in this world stays in the
+cached half, and who happens to be listening moves to the user half beside the length rule:
+
+```
+[Scene context: ...]
+[You are speaking to Girl's Father, not to Joker. Joker is present and listening,
+ but this line is aimed at Girl's Father.]
+[Aim for about 51 characters, roughly 10 words. ...]
+Tae Takemi:
+```
+
+Naming Joker as *present* is not padding. Without it the model reads the scene as one he
+has left and starts describing him in the third person to his face.
+
+The same defect turned out to be one layer down as well. `tier_note` returned "Close
+friends. Comfortable banter" for rank 6 — true of the confidant's bond with Joker, and read
+by the model as advice about whoever was being addressed, which had Takemi bantering with a
+stranger on their first meeting. Every tier note now names its subject.
+
+**Two unknowns that are deliberately not guessed:**
+
+- An empty addressee is not "Joker". When the turn demonstrably changed hands to somebody
+  the scene did not name, the prompt omits the claim rather than asserting the protagonist
+  — which is exactly the assumption the feature exists to remove.
+- A `SEL` record is now refused by `RecordPlan.IsWritable` itself, not by the speaker
+  filter. Ch. 80's rule is "never, regardless", and the filter is none of those things: it
+  can be switched off, it goes idle when an archive does not resolve, and it declines to
+  act when nothing attributes to the confidant. A selection survived all three paths
+  protected only incidentally, by having no speaker to match.
+
+Failure is bounded by construction. Rule one is wrong when a character answers someone
+other than the last speaker; rule three is wrong when a scene opens mid-conversation
+between two NPCs. Both cost a line aimed at the wrong person in a room where both are
+present — which is the behaviour for *every* multi-party line today, so the floor cannot
+move. `addressee_enabled` in `GenDialogue.json` turns it off for an A/B on the same scene,
+because a turn model is an inference rather than a parse and that comparison is the only
+way to judge it.
+
+**Next up:** Phase 5's input channel, and an in-game run of the selection-record
+hypothesis. Ch. 80 proposed that `SEL` headers move their count from `0x18` to `0x1A`, the
+parser ships behind the hole mechanism so a wrong guess costs coverage rather than
+correctness, and no live scene has confirmed it yet.
 
 ---
 
