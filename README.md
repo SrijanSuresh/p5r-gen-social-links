@@ -5,7 +5,7 @@
 A [Reloaded-II](https://reloaded-project.github.io/Reloaded-II/) mod that replaces Persona 5 Royal's scripted Social Link dialogue with live AI generation — running entirely on your local GPU. No cloud, no API keys, no internet. Every conversation is unique.
 
 [![CI](https://github.com/SrijanSuresh/p5r-gen-social-links/actions/workflows/ci.yml/badge.svg)](https://github.com/SrijanSuresh/p5r-gen-social-links/actions/workflows/ci.yml)
-![Tests](https://img.shields.io/badge/tests-234%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-355%20passing-brightgreen)
 ![.NET](https://img.shields.io/badge/.NET-8.0-512BD4)
 ![Python](https://img.shields.io/badge/Python-3.13-3776AB)
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D4)
@@ -79,7 +79,7 @@ pool is *and* how far the player has got, and the mod writes ahead of that posit
 |---|---|---|
 | `PointerChainResolver` | C# | Walks `[moduleBase + 0x2A63EF0] → [CMM + 0x48]` to find the active session struct, VirtualQuery-guarding every dereference |
 | `SocialLinkReader` | C# | Reads confidant ID, rank level, and scene number from the resolved struct |
-| `LineCounterMonitor` | C# | Polls `0x006FFC28` (discovered via Cheat Engine) — fires on each dialogue line advance |
+| `AdvancePoolCursor` | C# | Turns the hook's record pointer into a position in the plan, and freezes every record at or behind it |
 | `DialogueBridge` | C# | Leading-edge throttle (3s), rolling session history (8 entries), hash-based dedup, context budget management |
 | `MsgInterpreterWatch` | C# | Five injected instructions ahead of `P5R.exe+17A3D27` copy the record pointer and cursor to a fixed slab; a 5 ms sampler turns that into a sequence |
 | `RecordPlan` | C# | Per-record life cycle — Pending → InFlight → Ready → Written → Rendered — plus capacity and the scripted line being replaced |
@@ -103,8 +103,8 @@ Switched backend from auto-gptq to llama-cpp-python. Wired real Llama-3.1-8B-Ins
 **Confirmed working:**
 - All 22 Social Link characters recognised by the inference pipeline
 - Real inference latency: <2s on RTX 4060 after CUDA warmup
-- Per-line trigger: `LineCounterMonitor` fires on each dialogue advance
-- CI: GitHub Actions runs Python tests + .NET build on every push
+- Per-line trigger: the interpreter hook reports each record as it is read (it replaced an `0x006FFC28` line-counter poll found in Cheat Engine)
+- CI: GitHub Actions runs Python tests, the .NET build and the .NET parser tests on every push
 
 ### ✅ Phase 3 — Dialogue write-back
 
@@ -468,8 +468,16 @@ Keep the window open while playing; closing it stops both processes.
 ```powershell
 cd server
 python -m pytest tests/ -q
-# 234 passed, 2 skipped
+# 282 passed, 2 skipped
+
+cd ..
+dotnet test mod/P5RGenSocialLinks.Tests/P5RGenSocialLinks.Tests.csproj
+# 73 passed
 ```
+The .NET suite covers the byte-layout parsers — BMD headers, the archive, speaker
+matching, the turn model. Its project links those source files in rather than referencing
+the mod assembly, so it runs anywhere: the parsers take a `byte[]` and return a struct,
+while the mod itself needs Reloaded and Win32.
 No GPU, model, or vendored binary needed — the inference backend is exercised through
 `httpx.MockTransport` and stub processes.
 
@@ -480,30 +488,31 @@ No GPU, model, or vendored binary needed — the inference backend is exercised 
 ```
 p5r-gen-social-links/
 ├── mod/P5RGenSocialLinks/       # C# Reloaded-II mod
-│   ├── Memory/                  # Pointer chain, struct reading, write-back
+│   ├── Memory/                  # Pointer chain, BMD parsing, speaker + addressee, write-back
 │   ├── Server/                  # HTTP client, health checker
 │   ├── Mod.cs                   # Entry point, poll loop, hook wiring
 │   ├── DialogueBridge.cs        # LLM dispatch, throttle, session history
 │   └── GenDialogue.json         # Runtime config (no recompile needed)
+├── mod/P5RGenSocialLinks.Tests/ # 73 tests (xunit) over the byte-layout parsers
 ├── server/                      # Python inference server
 │   ├── inference/               # Pipeline, llama-server client + supervisor, queue, postprocessor
 │   ├── vendor/                  # llama-server.exe + CUDA runtime (gitignored, fetched)
 │   ├── social_link/             # Arcana roster, prompt builder, tier mapping
-│   ├── tests/                   # 234 tests (pytest)
+│   ├── tests/                   # 282 tests (pytest)
 │   └── main.py                  # FastAPI app
 ├── scripts/fetch-llama-server.ps1  # Downloads prebuilt llama.cpp CUDA binaries
 ├── scripts/redate.sh            # Restamps branch commits to the PR day
 ├── docs/                        # Screenshots and a sample session log
 ├── scripts/verify-signature.py  # Proves a SigScan pattern is unique in p5r.exe
-├── learning.md                  # 74-chapter technical journal (the real docs)
-└── .github/workflows/ci.yml     # Python tests + .NET build on push
+├── learning.md                  # 75-chapter technical journal (the real docs)
+└── .github/workflows/ci.yml     # Python tests, .NET build, .NET tests on push
 ```
 
 ---
 
 ## learning.md
 
-`learning.md` is a 74-chapter technical journal written alongside the code — covering ASLR and pointer arithmetic, Triton block-pointer math, 4-bit quantization, BF script format, CI design, process lifetime and Windows Job Objects, hardware watchpoints and the `DR0`-`DR7` registers, writing an inline assembly stub that must not disturb the flags register, and why searching for something the system can hand you is the expensive kind of mistake. It exists because this project was built as a learning exercise as much as a mod.
+`learning.md` is a 75-chapter technical journal (numbered to Ch. 81; six numbers were skipped) written alongside the code — covering ASLR and pointer arithmetic, Triton block-pointer math, 4-bit quantization, BF script format, CI design, process lifetime and Windows Job Objects, hardware watchpoints and the `DR0`-`DR7` registers, writing an inline assembly stub that must not disturb the flags register, and why searching for something the system can hand you is the expensive kind of mistake. It exists because this project was built as a learning exercise as much as a mod.
 
 ---
 
