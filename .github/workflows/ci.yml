@@ -2,7 +2,11 @@ name: CI
 
 on:
   push:
-    branches: ["main", "feature/**"]
+    # Both prefixes on purpose. CLAUDE.md mandates feat/<short-topic> and every branch
+    # since feat/dialogue-text-ptr-confirm has used it, so a pattern matching only
+    # feature/** meant no push to a current branch ran CI at all — the first signal
+    # arrived when the PR was opened, after the work was finished.
+    branches: ["main", "feat/**", "feature/**"]
   pull_request:
     branches: ["main"]
 
