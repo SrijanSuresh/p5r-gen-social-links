@@ -6447,3 +6447,82 @@ that line is aimed at Joker too.
 
 This is the shape to want from an inference. It cannot do worse than the assumption it
 replaces, because the assumption it replaces is one of its own cases.
+
+## Chapter 82: Four Thousand Lines Is Not a Design
+
+`Mod.cs` is 4,219 lines. The README describes it as "entry point, poll loop, hook wiring",
+which was true at a few hundred lines and is now a polite fiction: it holds 160 members,
+61% of the C# in the project, and the file is the only thing they have in common.
+
+It got there honestly, and that is the part worth understanding. Nothing in this project
+was designed up front, because nothing could be — the whole point of chapters 50 through
+80 was that the memory layout was unknown and every hypothesis about it was wrong at least
+once. When you do not know whether a buffer is ASCII or UTF-16, in the heap or the mapped
+file, the cheapest place to put the next probe is next to the last probe. Each one of those
+decisions was right. The sum of them is a god object.
+
+### What a split can and cannot fix
+
+C# `partial` lets one class live in several files. That is exactly the right tool here and
+it is important to be clear about how little it does:
+
+- **It does not change behaviour.** The compiler concatenates the parts. Same class, same
+  fields, same accessibility, same emitted IL.
+- **It does not decouple anything.** Every part still reaches the same 50-odd private
+  fields. `_plan`, `_poolSlots`, `_writeLock` and `_bmdTextPool` remain shared mutable
+  state; moving a method to another file does not make it stop touching them.
+- **It does make the shape visible.** Once the offset-discovery code sits in
+  `Mod.Discovery.cs` and nothing else references it, the question "is any of this still
+  load-bearing?" becomes answerable by reading one file instead of grepping 4,000 lines.
+
+That last point is the whole justification. This is not the refactor; it is the measurement
+that makes the refactor safe. Ch. 73 deleted the heap search only after the hook made it
+provably redundant, and the same order applies here: separate first, then delete what the
+separation shows to be unreachable.
+
+### Why extraction, not decomposition
+
+The honest decomposition is to pull the pool writer and the scene planner into their own
+classes with their own state. That is a bigger change than it looks: `TryArmFromRecord`
+writes `_poolSlots`, `_poolRecords`, `_poolNextRecord` and `_plan`, and `AdvancePoolCursor`
+reads three of those and mutates the fourth. Splitting them into real objects means
+deciding who owns the cursor, and getting that wrong reintroduces Ch. 71 — two bugs behind
+one cursor that different events moved for different reasons.
+
+So the state stays where it is, and only the code moves. A change that cannot alter
+behaviour is one the build and 81 tests can fully verify, which is the right kind of change
+to make to code that runs inside somebody else's process.
+
+### The boundary problem, and why formatting solved it
+
+Moving whole members out of a file by machine needs to know where each one ends. Brace
+counting is the obvious approach and it is wrong in general: a brace inside a string
+literal or a comment counts the same as a real one.
+
+This file happens to make it easy. Every member is declared at four-space indent, and
+nested blocks inside a method are indented deeper, so a line matching `^    \}` can only be
+a member's close. Expression-bodied members open no brace at all and end on their
+semicolon. Running both rules over the whole file found 160 members with zero overlaps and
+left exactly five lines outside any of them — the class declaration, its opening brace, and
+three section-divider comments.
+
+That last number is the check that mattered. A boundary finder that is subtly wrong does
+not fail loudly; it moves half a method and the error surfaces as a compile error in a file
+you were not editing. Counting what the tool *failed* to classify, and recognising all five
+of them, is cheaper than trusting it.
+
+### The six files
+
+| Part | What belongs in it |
+|---|---|
+| `Mod.cs` | Fields, `Start`, the poll loop, Reloaded's lifecycle entry points |
+| `Mod.Hooks.cs` | The injected-code surface: every hook's setup and its callback |
+| `Mod.Pool.cs` | Arming a region, tracking the cursor, writing bytes and mirroring the twin |
+| `Mod.Scene.cs` | The plan: what records a scene has, who speaks them, who they are spoken to |
+| `Mod.Generation.cs` | Prompt context, the pre-generation queue, talking to the server |
+| `Mod.Discovery.cs` | The offset-discovery era, kept together so it can be judged together |
+| `Mod.Text.cs` | ASCII and English-shape heuristics, used by several of the above |
+
+`Mod.Discovery.cs` is the one with a purpose beyond tidiness. It is a holding pen: the
+answer to "what did we stop needing when the interpreter hook landed?" and the subject of
+the next chapter.
