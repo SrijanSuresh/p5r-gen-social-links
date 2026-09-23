@@ -6526,3 +6526,103 @@ of them, is cheaper than trusting it.
 `Mod.Discovery.cs` is the one with a purpose beyond tidiness. It is a holding pen: the
 answer to "what did we stop needing when the interpreter hook landed?" and the subject of
 the next chapter.
+
+## Chapter 83: The Diagnostic That Was Load-Bearing
+
+With the offset-discovery code gathered into one file, the question Ch. 82 set up became
+answerable: how much of it is still reachable? The answer was not the one I expected, and
+the interesting part is the thing that nearly went wrong.
+
+### Counting callers is the easy half
+
+A reference count over all nine source files sorted the 22 members of `Mod.Discovery.cs`
+into three groups:
+
+```
+TryReadString                  NO CALLERS                       DEAD
+TryLogBmdStrings               NO CALLERS                       DEAD
+TryWriteToSessionDesc          NO CALLERS                       DEAD
+FollowTextObjChain             Mod.Discovery.cs only            internal-only
+ProbeD0Array                   Mod.Discovery.cs only            internal-only
+...
+FindAsciiEnglishBuf            Generation, Pool, Pool.Scan      LIVE
+TryFindBfBuffer                Mod.cs                           LIVE
+```
+
+Three members have no callers at all. `SetupBfDispatchHook` turned out to be the same
+story one level up: the BF opcode dispatch hook is written, has a delegate, a field and a
+callback — and nothing ever calls the setup method, so that hook has never been installed
+in any session. Dead code that *looks* like an active hook is worse than dead code, because
+every future reader has to work out whether the game is being patched or not.
+
+### "Referenced from live code" is not the same as "on a live path"
+
+The members marked LIVE above are called from `PollLoopAsync` — but a call site in the poll
+loop can still sit inside `if (_cfg.StructDiffEnabled)`, which `GenDialogue.json` describes
+as "diagnostics for the offset-discovery era" and ships `false`. Checking the gate at each
+site, rather than the file it lives in, split LIVE again:
+
+| Entry point | Gate |
+|---|---|
+| `TryFindBfBufferFromSnapshot`, `ProbeBfLine`, `TryReadTextAddr` | `struct_diff_enabled` |
+| `TryScanBmdVicinity`, `SweepHeapForUtf16` | `struct_diff_enabled` |
+| `TryFindBfBuffer` | **none — every poll tick** |
+| `OnGameMemcpy` | **none — installed in `Start`** |
+
+So two thirds of the BF-script discovery chain runs in every session with diagnostics off.
+`OnGameMemcpy` is the expensive one: it hooks a function its own comment calls "one of the
+hottest functions in the process", and what it does there is collect up to 150 large-copy
+destinations and log up to 40 UTF-16 strings — both of them answers to questions that
+Ch. 60 and Ch. 65 settled. Deleting it removes a patch from somebody else's process, which
+is the best kind of deletion this project has.
+
+### The trap
+
+The chain is: `OnGameMemcpy` fills `_largeCopyDsts` → `TryFindBfBuffer` finds
+`_bfBufferBase` → `ProbeBfLine` scrapes `_currentMsgId` out of BF bytecode.
+
+`_currentMsgId` is diagnostics. Except for this line in the poll loop:
+
+```csharp
+if (_cfg.HeapScanEnabled && _currentMsgId != 0 && _heapPools.Count == 0)
+    TryFindHeapDialoguePool();
+```
+
+`heap_scan_enabled` is the fallback the config promises for "a scene that ends up with no
+pool armed at all" — deliberately kept. And its trigger condition is `_currentMsgId != 0`,
+which is set *only* by the diagnostic chain I was about to delete. Deleting it would have
+left the switch in place, the function in place, the config comment in place, and the
+fallback permanently unable to fire. Nothing would have failed; a safety net would just
+have quietly stopped existing.
+
+This is a specific, recurring shape: a diagnostic grows a second job, and nothing in the
+code says so. The reference count sees `_currentMsgId` used in both places and cannot tell
+which use is incidental.
+
+### Fixing the trigger before removing its source
+
+The fix is not to keep the chain. It is to notice that the precondition was never the right
+one. "A message id has been scraped out of BF bytecode" is an artefact of how the pool used
+to be found, and the config comment already names the cost:
+
+> The scan also could not start until a message was dispatched, so the opening lines of
+> every scene played before anything could be written.
+
+What the heap scan actually needs is a hang-out in progress, which the mod knows directly
+from the CMM session read. Re-triggering it on that fixes the stated defect — the scan can
+start when the scene arms instead of after the first line — and the dependency on the BF
+chain disappears as a side effect rather than as a sacrifice.
+
+Order matters: the trigger changes first, in its own commit, while the old source is still
+there to compare against. Then the chain goes.
+
+### What survives, and why
+
+`FindAsciiEnglishBuf` has three callers on live paths — the scene-script capture, the pool
+writer, and the heap scan. It is not discovery code at all; it was only ever filed next to
+it. It moves to `Mod.Text.cs` with the other recognisers.
+
+The rest of the ASCII and English-shape heuristics stay too, for the reason Ch. 82 gave:
+they stopped being a way of *locating* the pool and remain a way of *recognising* a line
+once an address is in hand. The interpreter serves menus and item names through the same
+loop, and arming on a record still requires the preview to look like dialogue.
