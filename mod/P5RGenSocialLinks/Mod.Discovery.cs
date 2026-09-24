@@ -93,16 +93,6 @@ public partial class Mod
         return 0;
     }
 
-    private static unsafe string TryReadString(nuint addr)
-    {
-        if (addr < unchecked((nuint)0x1000000UL)) return "";
-        if (!Memory.MemoryGuard.IsReadable(addr, 32)) return "?";
-        byte* p = (byte*)addr;
-        var sb = new System.Text.StringBuilder(32);
-        for (int i = 0; i < 32 && p[i] != 0; i++)
-            sb.Append(p[i] >= 0x20 && p[i] <= 0x7E ? (char)p[i] : '·');
-        return sb.ToString();
-    }
 
     /// <summary>
     /// Runs every poll tick while in a session. Scans the first 1024 bytes of the
@@ -1136,83 +1126,6 @@ public partial class Mod
         }
     }
 
-    private unsafe void TryLogBmdStrings()
-    {
-        const int MaxScan  = 16384;
-        const int MaxPrint = 30;
-
-        byte* p = (byte*)_bmdBase;
-        int count = 0;
-        int i = 0;
-
-        while (i < MaxScan && count < MaxPrint)
-        {
-            if (p[i] == 0) { i++; continue; }
-
-            int start = i;
-            while (i < MaxScan && p[i] != 0) i++;
-            int len = i - start;
-            if (len < 4) continue;
-
-            var sb = new System.Text.StringBuilder(Math.Min(len, 120) + 4);
-            int printEnd = Math.Min(i, start + 120);
-            for (int j = start; j < printEnd; j++)
-            {
-                byte c = p[j];
-                sb.Append(c >= 0x20 && c < 0x7F ? (char)c : '.');
-            }
-            if (len > 120) sb.Append('…');
-
-            _modLog!.Info($"[BMD][{count:D3}] +0x{start:X4} len={len}: \"{sb}\"");
-            count++;
-        }
-
-        _modLog!.Info($"[BMD] Logged {count} strings from 0x{_bmdBase:X}.");
-
-        // Reverse-scan: find WHERE in the BMD the known string offsets (0x0120, 0x013E, 0x0158)
-        // are stored, to identify the offset table location and entry size.
-        nuint bmdBase = _bmdBase;
-        uint[] knownOffsets = { 0x0120u, 0x013Eu, 0x0158u };
-        for (int pos = 4; pos < 1024; pos++)
-        {
-            if (!Memory.MemoryGuard.IsReadable(bmdBase + (nuint)pos, 4)) break;
-            byte* sp = (byte*)(bmdBase + (nuint)pos);
-
-            uint v32 = (uint)(sp[0] | (sp[1] << 8) | (sp[2] << 16) | (sp[3] << 24));
-            foreach (uint ko in knownOffsets)
-                if (v32 == ko)
-                    _modLog!.Info($"[BMD] OffsetScan: known=0x{ko:X} found as uint32 at bmd+0x{pos:X}");
-
-            if (pos < 1023)
-            {
-                ushort v16 = (ushort)(sp[0] | (sp[1] << 8));
-                foreach (uint ko in knownOffsets)
-                    if (v16 == ko)
-                        _modLog!.Info($"[BMD] OffsetScan: known=0x{ko:X} found as uint16 at bmd+0x{pos:X}");
-            }
-        }
-    }
-
-    private static unsafe bool TryWriteToSessionDesc(nuint session, string text)
-    {
-        nuint addr = session + 0x9B0;
-        if (!Memory.MemoryGuard.IsReadable(addr, 4)) return false;
-
-        byte* cur = (byte*)addr;
-        // Measure existing string length — must not exceed it to avoid overwriting adjacent data.
-        int origLen = 0;
-        while (origLen < 200 && cur[origLen] != 0) origLen++;
-        if (origLen < 4) return false;  // empty/binary slot
-
-        if (!Memory.MemoryGuard.IsWritable(addr, origLen + 1)) return false;
-
-        byte[] encoded = System.Text.Encoding.UTF8.GetBytes(text);
-        int writeLen   = Math.Min(encoded.Length, origLen);
-        fixed (byte* src = encoded)
-            System.Buffer.MemoryCopy(src, cur, origLen, writeLen);
-        cur[writeLen] = 0;
-        return true;
-    }
 
     // Write LLM text directly to the address captured from session+0xD0 at msgId
     // confirmation time. The game pauses BF execution while a message is displayed,
