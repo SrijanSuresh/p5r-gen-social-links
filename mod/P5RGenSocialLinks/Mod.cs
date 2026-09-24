@@ -95,17 +95,6 @@ public partial class Mod : IModV1
 
     private IHook<MemcpyInnerDelegate>? _memcpyHook;
 
-    // BF opcode dispatcher hook: FUN_14024EE00.
-    // Called for every BF instruction. RCX=channel(0x2B), RDX=opcode type byte,
-    // R8=opcode_struct[+0x08], R9=opcode_struct[+0x10].
-    // When RDX==5 this is a dialogue instruction — log R8/R9 to find the text pointer.
-    // Return type is nuint (not void) — the dispatcher may return a status value
-    // that callers (e.g. FUN_141844f20) check. Declaring void leaves RAX garbage.
-    [Function(CallingConventions.Microsoft)]
-    private delegate nuint BfOpcodeDispatchDelegate(nuint channel, nuint typeAndFlags,
-                                                     nuint arg2, nuint arg3);
-
-    private IHook<BfOpcodeDispatchDelegate>? _bfDispatchHook;
 
     // Dialogue heap sits above 256 GB; CLR/runtime copies are all below 4 GB.
     private static readonly nuint HeapLow = unchecked((nuint)0x4000000000UL);
@@ -267,10 +256,6 @@ public partial class Mod : IModV1
 
     private bool _hookActive;
 
-
-    // Diagnostic: bare pass-through — if this crashes, the hook address/convention is wrong.
-    // If this is stable, the crash is in our logging/memory-read code above.
-    private static int _bfCallCount;
 
     // Windows x64 user-mode addresses are capped at 128 TB (bit 47).
     // Values above this are data misread as pointers — reject them.
@@ -456,7 +441,6 @@ public partial class Mod : IModV1
         _cts.Cancel();
         _conversationHook?.Disable();
         _memcpyHook?.Disable();
-        _bfDispatchHook?.Disable();
         _diffScanner.Reset();
         _logger?.WriteLine("[P5RGenSocialLinks] Suspended.");
     }
@@ -465,7 +449,6 @@ public partial class Mod : IModV1
     {
         _conversationHook?.Enable();
         _memcpyHook?.Enable();
-        _bfDispatchHook?.Enable();
         StartPollLoop();
         _logger?.WriteLine("[P5RGenSocialLinks] Resumed.");
     }
@@ -478,7 +461,6 @@ public partial class Mod : IModV1
         _llmClient?.Dispose();
         _conversationHook?.Disable();
         _memcpyHook?.Disable();
-        _bfDispatchHook?.Disable();
         _msgWatch?.Dispose();
         _msgWatch = null;
         _diffScanner.Reset();

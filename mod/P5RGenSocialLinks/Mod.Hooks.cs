@@ -26,37 +26,7 @@ namespace P5RGenSocialLinks;
 /// </summary>
 public partial class Mod
 {
-    private unsafe void SetupBfDispatchHook()
-    {
-        if (_hooks is null) return;
-        try
-        {
-            nuint moduleBase = (nuint)Process.GetCurrentProcess().MainModule!.BaseAddress;
-            nuint addr = moduleBase + 0x24EE00;
 
-            // Sanity-check: log first 8 bytes so we can verify this is a real function
-            // prologue and not a data section or already-patched trampoline.
-            byte* p = (byte*)addr;
-            string byteDump = $"{p[0]:X2} {p[1]:X2} {p[2]:X2} {p[3]:X2} {p[4]:X2} {p[5]:X2} {p[6]:X2} {p[7]:X2}";
-            _logger!.WriteLine($"[P5RGenSocialLinks] BfDispatch target 0x{addr:X} bytes: {byteDump}");
-
-            _bfDispatchHook = _hooks.CreateHook<BfOpcodeDispatchDelegate>(
-                OnBfOpcodeDispatch, (long)addr).Activate();
-            _logger!.WriteLine($"[P5RGenSocialLinks] BfDispatch hook ACTIVE at 0x{addr:X}");
-        }
-        catch (Exception ex)
-        {
-            _logger!.WriteLine($"[P5RGenSocialLinks] BfDispatch hook FAILED: {ex.GetType().Name}: {ex.Message}");
-        }
-    }
-
-    private unsafe nuint OnBfOpcodeDispatch(nuint channel, nuint typeAndFlags,
-                                             nuint arg2, nuint arg3)
-    {
-        nuint result = _bfDispatchHook!.OriginalFunction(channel, typeAndFlags, arg2, arg3);
-        System.Threading.Interlocked.Increment(ref _bfCallCount);
-        return result;
-    }
 
     private void SetupMemcpyHook()
     {
