@@ -40,9 +40,11 @@
   // Fall back to scanning the heap for the dialogue pool.
   //
   // Superseded by the interpreter hook, which gets the region from an address the game
-  // itself read: microseconds instead of 33 seconds, and exact instead of ranked. The
-  // scan also could not start until a message was dispatched, so the opening lines of
-  // every scene played before anything could be written.
+  // itself read: microseconds instead of 33 seconds, and exact instead of ranked.
+  //
+  // It now starts as soon as a hang-out is active. It used to wait for a message id
+  // scraped out of BF bytecode, which cost the opening lines of every scene and quietly
+  // tied this fallback to a diagnostic chain that is no longer there.
   //
   // Turn on only if a scene ends up with no pool armed at all.
   "heap_scan_enabled": false,

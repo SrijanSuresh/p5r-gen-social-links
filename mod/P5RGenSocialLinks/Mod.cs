@@ -412,10 +412,18 @@ public partial class Mod : IModV1
                 }
             }
 
-            // Primary target: the heap dialogue pool. The mapped-file scans below reach
-            // only the global item/skill tables — the live conversation is on the heap,
-            // as ASCII, confirmed at 0x41DD7F6389 / 0x42102CAAA9.
-            if (_cfg.HeapScanEnabled && _currentMsgId != 0 && _heapPools.Count == 0)
+            // Fallback target: the heap dialogue pool, for a scene the interpreter hook
+            // left with nothing armed. The mapped-file scans reach only the global
+            // item/skill tables — the live conversation is on the heap, as ASCII,
+            // confirmed at 0x41DD7F6389 / 0x42102CAAA9.
+            //
+            // Triggered on an active hang-out, not on a scraped message id. The old
+            // condition was `_currentMsgId != 0`, which only ProbeBfLine ever set, so the
+            // fallback depended on the whole BF-bytecode discovery chain being alive to
+            // fire at all — and that chain is diagnostics (Ch. 83). It also cost the
+            // opening lines of every scene, because a message had to be dispatched before
+            // the scan could begin. A live session is the condition this always wanted.
+            if (_cfg.HeapScanEnabled && live is not null && _heapPools.Count == 0)
                 TryFindHeapDialoguePool();
 
             // Diagnostic sweeps, off by default now that the pool location is known.
