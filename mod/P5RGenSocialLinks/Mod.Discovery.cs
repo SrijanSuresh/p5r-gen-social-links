@@ -575,35 +575,6 @@ public partial class Mod
         return hits;
     }
 
-    /// <summary>
-    /// Buffer-based counterpart to <see cref="FindAsciiEnglish"/>. Operates on a copy made
-    /// by <see cref="MemoryGuard.TryRead"/> so a region freed mid-scan cannot fault.
-    /// </summary>
-    private static System.Collections.Generic.List<(nuint Addr, string Text)>
-        FindAsciiEnglishBuf(byte[] buf, int len, nuint baseAddr, int maxHits)
-    {
-        var hits = new System.Collections.Generic.List<(nuint, string)>();
-        int i = 0;
-
-        while (i < len && hits.Count < maxHits)
-        {
-            while (i < len && !IsPrintable(buf[i])) i++;
-            int begin = i;
-            while (i < len && IsPrintable(buf[i])) i++;
-
-            int slen = i - begin;
-            if (slen < 10 || slen > 400) continue;
-
-            // Byte-level pre-check before allocating. A full scan covers ~1.5 GB, and
-            // materialising a string for every printable run produced millions of
-            // allocations per pass — enough GC pressure to visibly stutter the game.
-            if (!QuickEnglishBytes(buf, begin, slen)) continue;
-
-            string s = System.Text.Encoding.ASCII.GetString(buf, begin, slen);
-            if (IsEnglishString(s)) hits.Add((baseAddr + (nuint)begin, s));
-        }
-        return hits;
-    }
 
     /// <summary>
     /// Follows the message object at session+0xC8 — populated exactly while a message is
