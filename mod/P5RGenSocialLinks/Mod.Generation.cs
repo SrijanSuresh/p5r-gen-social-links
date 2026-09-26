@@ -62,6 +62,22 @@ public partial class Mod
     /// characters server-side, and a 36-slot scene at ~40 characters each would exceed it
     /// on its own and crowd out the rolling session history.
     /// </remarks>
+    /// <summary>
+    /// True when <paramref name="line"/> contains text this scene already generated.
+    ///
+    /// Containment rather than equality: a captured slot run is a fragment of a record's
+    /// text, so a generated line shows up inside it rather than as the whole of it.
+    /// </summary>
+    private bool WasGenerated(string line)
+    {
+        foreach (RecordPlan record in _plan)
+        {
+            string? made = record.Generated;
+            if (made is not null && made.Length > 0 && line.Contains(made)) return true;
+        }
+        return false;
+    }
+
     private string[] CaptureSceneScript(nuint poolBase, int scanLen, int maxLines, int maxChars)
     {
         var lines = new System.Collections.Generic.List<string>();
@@ -81,6 +97,17 @@ public partial class Mod
                 // Consecutive slots repeat the same line often enough that the raw list
                 // wastes most of the budget on duplicates.
                 if (!seen.Add(line)) continue;
+
+                // Refuse anything we generated. The pool is the only copy of the script
+                // and a write is destructive, so a capture that happens after the hook
+                // path has already written would otherwise hand the model its own output
+                // back as "the scene's original dialogue" and compound drift.
+                //
+                // Checked against the plan rather than a single cached string. The field
+                // this used to read was only ever written by the reactive dispatch path,
+                // which pre-generation replaced and Ch. 83 deleted - leaving a guard that
+                // compiled, read as a safeguard, and could never fire.
+                if (WasGenerated(line)) continue;
 
                 lines.Add(line);
                 used += line.Length + 1;
