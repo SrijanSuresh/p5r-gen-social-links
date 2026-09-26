@@ -28,63 +28,6 @@ public partial class Mod
 {
 
 
-    private void SetupMemcpyHook()
-    {
-        if (_hooks is null)
-        {
-            _logger!.WriteLine("[P5RGenSocialLinks] Memcpy inner hook skipped — IReloadedHooks null.");
-            return;
-        }
-        try
-        {
-            nuint moduleBase = (nuint)Process.GetCurrentProcess().MainModule!.BaseAddress;
-            nuint addr = moduleBase + 0x5A8570;
-            _memcpyHook = _hooks.CreateHook<MemcpyInnerDelegate>(OnGameMemcpy, (long)addr).Activate();
-            _logger!.WriteLine($"[P5RGenSocialLinks] Memcpy inner hook ACTIVE at 0x{addr:X}");
-        }
-        catch (Exception ex)
-        {
-            _logger!.WriteLine($"[P5RGenSocialLinks] Memcpy hook FAILED: {ex.GetType().Name}: {ex.Message}");
-        }
-    }
-
-    private unsafe void OnGameMemcpy(nuint dst, nuint src, nuint count)
-    {
-        _memcpyHook!.OriginalFunction(dst, src, count);
-
-        // Large-copy tracking: heap-to-heap only, for BF script discovery.
-        if (dst >= HeapLow && src >= HeapLow && count >= 500 && count <= 500_000)
-        {
-            lock (_largeCopyLock)
-            {
-                if (_largeCopyDsts.Count < 150)
-                    _largeCopyDsts.Add(dst);
-            }
-        }
-
-        // UTF-16 dialogue detection. The earlier ASCII probe concluded dialogue never
-        // flows through this function, but it could not have seen wide-char text at all —
-        // interleaved nulls end every ASCII run after one character. This retries that
-        // question with the right encoding.
-        //
-        // The prefilter reads 8 bytes and rejects nearly every copy the game makes, so
-        // the expensive scan runs only on plausible wide strings. That matters: this is
-        // one of the hottest functions in the process.
-        if (_utf16CpyLogged >= 40 || count < 16 || count > 800) return;
-        if (!Memory.MemoryGuard.IsReadable(dst, (int)count)) return;
-
-        byte* d = (byte*)dst;
-        if (d[1] != 0 || d[3] != 0 || d[5] != 0 || d[7] != 0)      return;
-        if (!IsPrintable(d[0]) || !IsPrintable(d[2]) ||
-            !IsPrintable(d[4]) || !IsPrintable(d[6]))              return;
-
-        var wide = FindUtf16English(dst, (int)count, 1);
-        if (wide.Count == 0) return;
-
-        _utf16CpyLogged++;
-        _modLog!.Info($"[UTF16cpy] src=0x{src:X} dst=0x{dst:X} n={count}: \"{wide[0].Text}\"");
-    }
-
     /// <summary>
     /// Locate the message interpreter's byte-fetch instruction and record its address.
     ///

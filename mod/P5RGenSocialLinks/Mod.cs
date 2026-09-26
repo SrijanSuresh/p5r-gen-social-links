@@ -91,18 +91,7 @@ public partial class Mod : IModV1
             FunctionAttribute.Register.r10,
             FunctionAttribute.Register.r8 },
         FunctionAttribute.Register.rax, false)]
-    private delegate void MemcpyInnerDelegate(nuint dst, nuint src, nuint count);
 
-    private IHook<MemcpyInnerDelegate>? _memcpyHook;
-
-
-    // Dialogue heap sits above 256 GB; CLR/runtime copies are all below 4 GB.
-    private static readonly nuint HeapLow = unchecked((nuint)0x4000000000UL);
-
-    // Cached BF script buffer address — found by TryFindBfBuffer() on any tick,
-    // then used by ProbeBfLine() for the rest of the session.
-    private nuint  _bfBufferBase;
-    private int    _bfBufferOff;   // session struct offset where we found it (for logging)
 
     // BMD text pool: the first page in the ±512KB bfBase vicinity that has ≥5 English
     // dialogue strings (null-terminated, ≥2 spaces, ≥10 printable chars). Found once
@@ -157,12 +146,6 @@ public partial class Mod : IModV1
     // size or its scripted text was only ever necessary while the buffer was a guess.
     private readonly System.Collections.Generic.List<RecordPlan> _plan = new();
 
-    // UTF-16 hunt state. _utf16CpyLogged caps the memcpy log; the sweep cursor lets a
-    // multi-GB heap scan resume across ticks instead of stalling one.
-    private int   _utf16CpyLogged;
-    private nuint _heapSweepCursor;
-    private int   _utf16SweepHits;
-    private bool  _heapSweepDone;
 
     // Every game object pointer observed so far lands in 0x42xxxxxxxx, while the linear
     // sweep starts at HeapLow (0x4000000000) and spends whole sessions crawling through
@@ -178,15 +161,6 @@ public partial class Mod : IModV1
     // dialogue and must not be modified.
     private static readonly nuint GameHeapEnd = unchecked((nuint)0x4400000000UL);
 
-    // Pointers harvested from the per-message D0 array — swept before the linear scan,
-    // since they point at objects the game is using for the message on screen right now.
-    private readonly System.Collections.Generic.List<nuint> _sweepSeeds = new();
-    private readonly object _seedLock = new();
-
-    // Most recent LLM response. Written on the async LLM thread; read volatilely on the
-    // game thread inside OnGameMemcpy so no lock is needed (reference read/write is
-    // atomic on x64, and we only need eventual visibility, not strict ordering).
-    private volatile string? _lastLlmText;
 
     /// <summary>
     /// The scene's original scripted lines, read out of the pool before we overwrite it.
@@ -201,11 +175,6 @@ public partial class Mod : IModV1
     /// </summary>
     private readonly System.Collections.Generic.List<string> _sceneScript = new();
 
-    // Large-copy log: OnGameMemcpy records the dst of every heap-to-heap copy
-    // ≥ 500 bytes. TryFindBfBuffer probes these at session start to locate the
-    // BF script buffer, which is loaded in one bulk copy before session detection.
-    private readonly System.Collections.Generic.List<nuint> _largeCopyDsts = new();
-    private readonly object _largeCopyLock = new();
 
     private GenConfig _cfg = new();
 
@@ -240,8 +209,7 @@ public partial class Mod : IModV1
 
             TryActivateHook();
             TryResolveMsgInterpreter();
-            SetupMemcpyHook();
-            // BfDispatch hook crashes regardless of handler — abandoned, hunting text ptr via CE instead
+                // BfDispatch hook crashes regardless of handler — abandoned, hunting text ptr via CE instead
             StartPollLoop();
 
             _modLog.Always($"[P5RGenSocialLinks] Started — hook:{(_hookActive ? "ON" : "OFF")} poll:ON");
@@ -257,23 +225,9 @@ public partial class Mod : IModV1
     private bool _hookActive;
 
 
-    // Windows x64 user-mode addresses are capped at 128 TB (bit 47).
-    // Values above this are data misread as pointers — reject them.
-    private static readonly nuint UserAddrMax = unchecked((nuint)0x7FFFFFFFFFFFUL);
-
-
     // ── Poll loop — session lifecycle + text pool discovery ───────────────
 
     private readonly StructDiffScanner _diffScanner = new();
-    private uint   _lastBfPc;        // change-detection: fires only when PC moves (32-bit per mov [rbx+20],eax)
-    private ushort _msgIdCandidate;  // current candidate from the last BF instruction window
-    private int    _msgIdStreak;     // consecutive windows with the same candidate
-    private ushort _currentMsgId;    // last confirmed msg_id (3+ consecutive windows)
-    private nuint  _capturedSession; // session address when _currentMsgId was last confirmed
-    private nuint  _confirmedBfBase; // real BF script base (session+0x18, memory-mapped <4 GB)
-    private nuint  _bmdBase;         // BMD text table found by TryScanForBmd(); 0 until found
-    private bool   _bmdScanDone;     // true after the one-shot scan fires this session
-    private nuint  _currentMsgTextAddr; // session+0xD0 snapshot at msgId confirmation — direct write target
 
 
     // Reusable scan buffer — the heap sweep reads hundreds of megabytes per pass and
@@ -310,17 +264,6 @@ public partial class Mod : IModV1
                 {
                     _diffScanner.Reset();
                     _bridge!.ResetSession();
-                    _lastBfPc        = 0;
-                    _bfBufferBase    = 0;
-                    _bfBufferOff     = 0;
-                    _currentMsgId    = 0;
-                    _msgIdCandidate  = 0;
-                    _msgIdStreak     = 0;
-                    _capturedSession = 0;
-                    _confirmedBfBase = 0;
-                    _bmdBase             = 0;
-                    _bmdScanDone         = false;
-                    _currentMsgTextAddr  = 0;
                     _bmdTextPool         = 0;
                     _bmdScanDoneV2       = false;
                     _bmdScanAttempts     = 0;
@@ -336,12 +279,6 @@ public partial class Mod : IModV1
                     // Cleared with the session: the next hang-out is a different scene,
                     // and a stale script would describe a conversation that already ended.
                     _sceneScript.Clear();
-                    _utf16CpyLogged      = 0;
-                    _heapSweepCursor     = 0;
-                    _utf16SweepHits      = 0;
-                    _heapSweepDone       = false;
-                    _lastLlmText         = null;
-                    lock (_largeCopyLock) _largeCopyDsts.Clear();
                     _sessionActive = false;
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
                 }
@@ -382,34 +319,18 @@ public partial class Mod : IModV1
                 PumpPregen(live);
             }
 
-            // BF buffer discovery: live scan of session struct every tick.
-            TryFindBfBuffer(session);
-
-            // Always maintain the diff snapshot — TryFindBfBufferFromSnapshot reads it
-            // to catch the BF script pointer even after it has been cleared from live
-            // memory (it exists for only one poll interval at session+0x60).
-            string? diff = _diffScanner.Diff(session);
-            if (_cfg.StructDiffEnabled && diff is not null)
-                _modLog!.Info($"[P5RGenSocialLinks] {diff}");
-
-            // Snapshot-based discovery: catches transient ptrs that TryFindBfBuffer
-            // missed because the game set+cleared them between our two live reads.
-            TryFindBfBufferFromSnapshot(session);
-
-            // BF line probe: read current dialogue text from bfBase+pc on every tick.
-            ProbeBfLine(session);
-
-            // Lazy textAddr re-probe: session+0xD0 may not be populated at BF-PC detection
-            // time (cold first-message path). Retry every tick until the C++ dialogue
-            // system catches up; the LLM latency (3-30s) gives us plenty of cycles.
-            if (_currentMsgId != 0 && _currentMsgTextAddr == 0 && _capturedSession != 0)
+            // Struct field diffs, the one diagnostic from the discovery era worth its
+            // cost: it reads the session struct it already has and prints what moved,
+            // which is how the layout in the README was established.
+            //
+            // The BF-bytecode discovery that used to live here is gone (Ch. 83). It
+            // scraped a message id out of the script buffer to drive a reactive write
+            // path that pre-generation replaced, and two thirds of it ran on every tick
+            // with diagnostics switched off.
+            if (_cfg.StructDiffEnabled)
             {
-                nuint recovered = TryReadTextAddr(_capturedSession);
-                if (recovered != 0)
-                {
-                    _currentMsgTextAddr = recovered;
-                    _modLog!.Info($"[MSG] TextAddr recovered=0x{recovered:X} (msgId=0x{_currentMsgId:X})");
-                }
+                string? diff = _diffScanner.Diff(session);
+                if (diff is not null) _modLog!.Info($"[P5RGenSocialLinks] {diff}");
             }
 
             // Fallback target: the heap dialogue pool, for a scene the interpreter hook
@@ -425,20 +346,6 @@ public partial class Mod : IModV1
             // the scan could begin. A live session is the condition this always wanted.
             if (_cfg.HeapScanEnabled && live is not null && _heapPools.Count == 0)
                 TryFindHeapDialoguePool();
-
-            // Diagnostic sweeps, off by default now that the pool location is known.
-            if (_cfg.StructDiffEnabled)
-            {
-                if (_confirmedBfBase != 0 && !_bmdScanDoneV2) TryScanBmdVicinity();
-                if (_currentMsgId != 0)                       SweepHeapForUtf16();
-            }
-
-            // One-shot BMD scan per session — fires once after first msgId confirmation.
-            if (_confirmedBfBase != 0 && _bmdBase == 0 && !_bmdScanDone)
-            {
-                _bmdScanDone = true;
-                TryScanForBmd();
-            }
         }
     }
 
@@ -448,7 +355,6 @@ public partial class Mod : IModV1
     {
         _cts.Cancel();
         _conversationHook?.Disable();
-        _memcpyHook?.Disable();
         _diffScanner.Reset();
         _logger?.WriteLine("[P5RGenSocialLinks] Suspended.");
     }
@@ -456,7 +362,6 @@ public partial class Mod : IModV1
     public void Resume()
     {
         _conversationHook?.Enable();
-        _memcpyHook?.Enable();
         StartPollLoop();
         _logger?.WriteLine("[P5RGenSocialLinks] Resumed.");
     }
@@ -468,7 +373,6 @@ public partial class Mod : IModV1
         _timer?.Dispose();
         _llmClient?.Dispose();
         _conversationHook?.Disable();
-        _memcpyHook?.Disable();
         _msgWatch?.Dispose();
         _msgWatch = null;
         _diffScanner.Reset();

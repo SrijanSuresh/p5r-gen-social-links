@@ -82,10 +82,6 @@ public partial class Mod
                 // wastes most of the budget on duplicates.
                 if (!seen.Add(line)) continue;
 
-                // Refuse anything we generated. Arming can recur mid-session, and feeding
-                // the model its own output back as "the script" would compound drift.
-                if (_lastLlmText != null && line.Contains(_lastLlmText)) continue;
-
                 lines.Add(line);
                 used += line.Length + 1;
                 if (lines.Count >= maxLines || used >= maxChars) return lines.ToArray();
@@ -94,62 +90,6 @@ public partial class Mod
         return lines.ToArray();
     }
 
-    /// <summary>
-    /// The reactive generation, fired by a message dispatch. Inert while pre-generation
-    /// is on.
-    ///
-    /// Leaving both running does not merely waste inference — the server answers one
-    /// request at a time and 429s the rest, so a dispatch arriving mid-queue would take
-    /// the slot the queue was about to use and neither path would keep up. Worse, this
-    /// path fires for every msgId including ones that are not spoken lines: msgId 0x348
-    /// recurred through a whole hang-out and consumed a record each time, which is how a
-    /// 22-record scene ran out at 22/22 with lines still to come.
-    /// </summary>
-    private async System.Threading.Tasks.Task DispatchMsgLlmAsync(
-        SocialLinkSnapshot snap, ushort msgId, nuint session)
-    {
-        if (_cfg.PregenLookahead > 0) return;
-
-        using var cts = new System.Threading.CancellationTokenSource(
-            TimeSpan.FromSeconds(_cfg.TimeoutSeconds));
-        try
-        {
-            // Pydantic rejects context over 1024 chars with a 422, which would surface as
-            // a silent generation failure rather than an obvious error. The script is
-            // already budgeted well under this; the clamp guards against the pieces
-            // growing independently and quietly crossing the limit.
-            string ctx = Memory.ContextBuilder.Build(snap) + ScriptContext() + $" [msg_0x{msgId:X}]";
-            if (ctx.Length > 1000) ctx = ctx[..1000];
-            var req = new Server.GenerateRequest
-            {
-                ConfidantId   = snap.ConfidantId,
-                Rank          = snap.RankLevel,
-                Context       = ctx,
-                CharacterName = Memory.ConfidantNames.Resolve(snap.ConfidantId),
-            };
-
-            string text = await _llmClient!.GenerateAsync(req, cts.Token);
-            if (string.IsNullOrWhiteSpace(text)) return;
-
-            // Cache immediately so OnGameMemcpy can use it on the next text copy.
-            _lastLlmText = text;
-            _modLog!.Info($"[LLM] msgId=0x{msgId:X}: \"{text[..Math.Min(text.Length, 100)]}\"");
-            bool wrote      = TryWriteToBmd(msgId, text);
-            int  poolWrites = WritePoolStrings(text);
-            int  heapWrites = WriteNextRecordReactive(text);
-            _modLog!.Info($"[LLM] msgId=0x{msgId:X} — ptrWrite={(wrote ? "OK" : "skip")} " +
-                          $"poolWrites={poolWrites} heapWrites={heapWrites}");
-        }
-        catch (Server.InferenceInFlightException)  { /* server busy, ignore */ }
-        catch (OperationCanceledException)
-        {
-            _modLog!.Warn("[LLM] Timeout — keeping original dialogue.");
-        }
-        catch (Exception ex) when (ex is not OutOfMemoryException)
-        {
-            _modLog!.Warn($"[LLM] Error: {ex.Message}");
-        }
-    }
 
     /// <summary>
     /// Context for one specific record: the scene, the line being replaced, and what has

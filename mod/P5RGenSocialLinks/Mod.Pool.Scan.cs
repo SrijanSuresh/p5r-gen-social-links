@@ -210,13 +210,10 @@ public partial class Mod
         if (_heapPools.Count == 0) return;
         _poolIsHeap = true;
 
-        // Before the pending write below, for the reason in Ch. 64: this is the
-        // last moment each record still holds its scripted line.
+        // Ch. 64: this is the last moment each record still holds its scripted line, so
+        // the plan is captured before anything is written over it.
         BuildRecordPlan();
         _modLog!.Info($"[POOL] {_heapPools.Count} regions armed for write");
-
-        string? pending = _lastLlmText;
-        if (pending != null) WriteNextRecordReactive(pending);
     }
 
     /// <summary>
