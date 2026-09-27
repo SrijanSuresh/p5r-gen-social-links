@@ -16,13 +16,16 @@
   // How often (ms) the session-change poll loop runs.
   "poll_interval_ms": 500,
 
-  // Diagnostics for the offset-discovery era: struct field diffs, BF instruction dumps,
-  // the per-message session dumps (BndScan / D0Direct / SessHeapPtrs), and the mapped-file
-  // and UTF-16 heap sweeps.
+  // Log what changed in the CMM session struct between poll ticks.
   //
-  // Keep false during play. The sweeps run every poll tick and scan tens of megabytes
-  // each, which is enough to stutter the game, and the dialogue pool write path does not
-  // depend on any of it. Turn on only when a pool stops being found.
+  // This is all that is left of the offset-discovery diagnostics. The BF instruction
+  // dumps, the per-message session dumps and the mapped-file and UTF-16 heap sweeps are
+  // gone: they answered questions the interpreter hook settled, and two thirds of that
+  // machinery ran on every tick with this switch off.
+  //
+  // What remains is cheap — it reads the struct the poll loop already has and prints the
+  // bytes that moved, which is how the layout in the README was established. Still off by
+  // default, because it prints on every tick a field changes.
   "struct_diff_enabled": false,
 
   // Master switch for writing generated text into the game's dialogue pool.

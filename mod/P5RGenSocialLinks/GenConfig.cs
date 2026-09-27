@@ -24,8 +24,14 @@ internal sealed class GenConfig
     [JsonPropertyName("poll_interval_ms")]
     public int PollIntervalMs { get; init; } = 500;
 
-    // When true, logs every BF instruction byte-dump ([BFInstr]) and StructDiff slot changes.
-    // Defaults off — the [MSG] and [LLM] events are sufficient for normal operation.
+    /// <summary>
+    /// Log what changed in the CMM session struct between poll ticks.
+    ///
+    /// The only survivor of the offset-discovery diagnostics (Ch. 83). It reads the struct
+    /// the poll loop already holds and prints the bytes that moved, which is how the
+    /// layout documented in the README was worked out. Off by default: it prints on every
+    /// tick a field changes, and the [PLAN], [SPEAKER] and [SCENE] lines cover normal play.
+    /// </summary>
     [JsonPropertyName("struct_diff_enabled")]
     public bool StructDiffEnabled { get; init; } = false;
 
