@@ -6626,3 +6626,90 @@ The rest of the ASCII and English-shape heuristics stay too, for the reason Ch. 
 they stopped being a way of *locating* the pool and remain a way of *recognising* a line
 once an address is in hand. The interpreter serves menus and item names through the same
 loop, and arming on a record still requires the preview to look like dialogue.
+
+## Chapter 84: Two Writers, and Only One of Them Knew the Rules
+
+Deleting the discovery chain left a question I had not thought to ask: how many things in
+this mod write dialogue into the game?
+
+The answer was two, and the second one had been there the whole time.
+
+### The path nobody was looking at
+
+`DialogueBridge` is the Phase 2 design, preserved intact. `OnCmmExecEvent` fires once per
+hang-out line and calls it:
+
+```csharp
+if (_bridge!.PoolBase == 0 && fireCount <= 5)
+{
+    nuint pool = DialogueTextPoolFinder.Find(session, ...);
+    if (pool != 0) _bridge!.SetPoolBase(pool);
+}
+_bridge!.DispatchAsync(snap, ContextBuilder.Build(snap), lineIndex: fireCount, ...);
+```
+
+and inside `DispatchAsync`, after its own HTTP round trip:
+
+```csharp
+int targetSlot = capturedLineIndex + 1;
+bool wrote = DialogueWriter.WriteAtLineIndex(capturedPool, targetSlot, text);
+```
+
+`WriteAtLineIndex` finds its target by counting null terminators from the pool base. That
+is the model of the buffer from Ch. 58 — a pile of strings — which Ch. 66 replaced with the
+MSG1 format. Every safety rule learned after Phase 2 lives in the record-indexed writer and
+none of them lives here:
+
+| Rule | Where it is enforced | Does the legacy writer obey it? |
+|---|---|---|
+| Freeze a record once the interpreter reads it (Ch. 71) | `RecordState.Rendered` | No |
+| Leave another speaker's lines alone (Ch. 77) | `RecordState.Foreign` | No |
+| Never rewrite a selection (Ch. 80) | `RecordPlan.IsWritable` | No |
+| Verify the twin byte-for-byte before mirroring (Ch. 66) | `MirrorToTwin` | No |
+| Clamp to the record's own capacity | `WriteRecord` | Only to the string's length |
+
+I had just finished moving the selection guard out of the speaker filter and into
+`IsWritable`, on the grounds that protection which depends on a config flag is not the rule
+Ch. 80 states. That reasoning was right and the conclusion was incomplete: a guard on one
+writer is not a rule about the system when a second writer exists.
+
+### It was also competing for the one inference slot
+
+The server runs one generation at a time and answers 429 to anything overlapping — Ch. 72
+is entirely about scheduling around that. `DispatchAsync` makes its own request on every
+CMM event, with its own 3-second throttle, for a line the pre-generation queue is also
+planning to produce. Two independent schedulers against a single-slot server, and only one
+of them was being measured.
+
+Its request is also the Phase 2 shape: session-level context, no record capacity, no
+speaker, and — as of yesterday — no addressee. So the better path and the worse path were
+racing, and the worse one wrote last.
+
+### Why this was invisible
+
+Nothing about it looks dead. `_bridge` is non-null, `DispatchAsync` is called from two
+places, the write is logged, and `DialogueTextPoolFinder` is a real function that really
+searches. The README even lists `DialogueBridge` as a live component — "LLM dispatch,
+throttle, session history, hash-based dedup" — all of which it genuinely does.
+
+What made it survive is that it fails *quietly*. If `DialogueTextPoolFinder.Find` returns
+zero, `capturedPool` is zero, the write is skipped, and the only cost is a wasted
+inference. The log line for that case says "Write-back: FAILED", which reads as a known
+limitation rather than as a second writer that occasionally succeeds.
+
+The reference count in Ch. 83 could never have found this. Every symbol involved is
+referenced, from live code, with no config gate. It took asking a different question —
+not "what is unreachable" but "what else does the thing I am protecting?"
+
+### What goes
+
+`DialogueBridge`, `DialogueWriter`, `DialogueTextPoolFinder` and `SessionHistory` all
+belong to that one path and go together. `ContextBuilder` stays: the record-indexed
+generator still opens every prompt with it.
+
+The `!_hookActive` fallback in the poll loop went too. It existed so that a build where the
+interpreter signature failed to resolve would still generate *something* — but what it
+generated was written by the legacy writer, so with that writer gone the fallback produces
+a line nobody can place. A mod that cannot find the interpreter now says so and leaves the
+scripted dialogue alone, which is the behaviour the project has chosen every other time the
+question came up.
