@@ -16,15 +16,7 @@ public partial class Mod : IModV1
     private ILoggerV2?        _logger;
     private ModLogger?        _modLog;
     private LLMClient?        _llmClient;
-    private DialogueBridge?   _bridge;
     private SocialLinkReader? _reader;
-
-    private sealed class LoggerAdapter : DialogueBridge.ILogger
-    {
-        private readonly ILoggerV2 _inner;
-        internal LoggerAdapter(ILoggerV2 inner) => _inner = inner;
-        public void WriteLine(string msg) => _inner.WriteLine(msg);
-    }
 
     private PeriodicTimer?          _timer;
     private Task?                   _pollTask;
@@ -201,7 +193,6 @@ public partial class Mod : IModV1
                 msg => _logger!.WriteLine(msg));
             _logger.WriteLine("[P5RGenSocialLinks] SocialLinkReader OK.");
 
-            _bridge = new DialogueBridge(_llmClient!, new LoggerAdapter(_logger!), _cfg);
             _logger.WriteLine("[P5RGenSocialLinks] DialogueBridge OK.");
 
             loader.GetController<IReloadedHooks>()?.TryGetTarget(out _hooks);
@@ -263,7 +254,6 @@ public partial class Mod : IModV1
                 if (lastSession != 0)
                 {
                     _diffScanner.Reset();
-                    _bridge!.ResetSession();
                     _bmdTextPool         = 0;
                     _bmdScanDoneV2       = false;
                     _bmdScanAttempts     = 0;
@@ -297,12 +287,6 @@ public partial class Mod : IModV1
                 _modLog!.Info(
                     $"[P5RGenSocialLinks] Hang-out: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber} (0x{session:X})");
                 _sessionActive = true;
-
-                // Fallback dispatch if hook isn't active.
-                if (!_hookActive)
-                    _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap),
-                                          lineIndex: 0,
-                                          maxChars: NextRecordCapacity());
 
                 continue;
             }

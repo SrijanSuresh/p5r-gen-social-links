@@ -149,24 +149,13 @@ public partial class Mod
             _modLog!.Info(
                 $"[P5RGenSocialLinks] CmmExec #{fireCount}: Confidant={snap.ConfidantId} Rank={snap.RankLevel} Scene={snap.SceneNumber}");
 
-            // Retry text pool discovery on first few fires — the BF interpreter may not have
-            // decompressed the script into heap memory at raw session-detection time, but it
-            // is guaranteed to be loaded by the time CmmExecEvent fires for the first line.
-            if (_bridge!.PoolBase == 0 && fireCount <= 5)
-            {
-                nuint pool = Memory.DialogueTextPoolFinder.Find(session, msg => _modLog!.Info(msg));
-                if (pool != 0)
-                {
-                    _bridge!.SetPoolBase(pool);
-                    _modLog!.Info($"[P5RGenSocialLinks] Text pool found on fire #{fireCount}: 0x{pool:X}");
-                }
-            }
-
-            bool dispatched = _bridge!.DispatchAsync(snap, ContextBuilder.Build(snap),
-                                                       lineIndex: fireCount,
-                                                       maxChars: NextRecordCapacity());
-            if (!dispatched)
-                _modLog!.Info($"[P5RGenSocialLinks] CmmExec #{fireCount}: throttled.");
+            // Nothing is dispatched from here any more. This used to generate a line
+            // through DialogueBridge and write it by counting null terminators from a
+            // pool base, which obeyed none of the rules the record writer enforces and
+            // competed with pre-generation for the server's single slot (Ch. 84).
+            //
+            // The event is still worth hooking: it is the one moment the game announces
+            // a hang-out, which is what the snapshot above is logged for.
         }
         catch (Exception ex)
         {
