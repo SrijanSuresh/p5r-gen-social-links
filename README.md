@@ -80,10 +80,10 @@ pool is *and* how far the player has got, and the mod writes ahead of that posit
 | `PointerChainResolver` | C# | Walks `[moduleBase + 0x2A63EF0] → [CMM + 0x48]` to find the active session struct, VirtualQuery-guarding every dereference |
 | `SocialLinkReader` | C# | Reads confidant ID, rank level, and scene number from the resolved struct |
 | `AdvancePoolCursor` | C# | Turns the hook's record pointer into a position in the plan, and freezes every record at or behind it |
-| `DialogueBridge` | C# | Leading-edge throttle (3s), rolling session history (8 entries), hash-based dedup, context budget management |
+| `Addressee` | C# | Derives who each line is spoken to from the order the scene's speakers take their turns |
 | `MsgInterpreterWatch` | C# | Five injected instructions ahead of `P5R.exe+17A3D27` copy the record pointer and cursor to a fixed slab; a 5 ms sampler turns that into a sequence |
 | `RecordPlan` | C# | Per-record life cycle — Pending → InFlight → Ready → Written → Rendered — plus capacity and the scripted line being replaced |
-| `DialogueWriter` | C# | Legacy write-back stub, superseded by record-indexed writes in `Mod.cs` |
+| `Mod.Text.cs` | C# | ASCII and English-shape heuristics — no longer how the pool is *found*, still how a line is *recognised* |
 | `InferencePipeline` | Python | Builds character-faithful prompts with rank-tier emotional guidance, then calls the backend |
 | `LlamaServerClient` | Python | HTTP client for `llama-server`, speaking OpenAI chat-completions |
 | `LlamaServerProcess` | Python | Spawns and supervises `llama-server.exe`; waits for weights, reaps on exit |
@@ -364,6 +364,64 @@ move. `addressee_enabled` in `GenDialogue.json` turns it off for an A/B on the s
 because a turn model is an inference rather than a parse and that comparison is the only
 way to judge it.
 
+### ✅ One writer, and a smaller one
+
+Two cleanups that belong together, because the first is what made the second findable.
+
+`Mod.cs` was 4,219 lines — 61% of the C# in the project, 160 members, and the file was the
+only thing they had in common. It got that way honestly: when you do not know whether a
+buffer is ASCII or UTF-16, in the heap or the mapped file, the cheapest place for the next
+probe is next to the last one. Each of those calls was right; the sum was a god object.
+
+Splitting it into `partial class Mod` files changes no behaviour at all — the compiler
+concatenates the parts, the fields stay shared, the IL is the same. That is the point: a
+change the build and the test suite can fully verify, made to code that runs inside
+somebody else's process. What it bought was the ability to ask one answerable question.
+With the offset-discovery code gathered in `Mod.Discovery.cs`, "is any of this still
+load-bearing?" became a matter of reading one file.
+
+| | Before | After |
+|---|---|---|
+| `Mod.cs` | 4,219 lines | **369** |
+| Largest file | 4,219 lines | 863 (`Mod.Pool.cs`) |
+| C# total | 6,793 lines | **5,188** |
+
+**What came out.** The BF-bytecode discovery chain — and with it a hook on a function its
+own comment called "one of the hottest functions in the process", installed in every
+session, collecting large-copy destinations and logging UTF-16 strings to answer questions
+Ch. 60 and Ch. 65 had already settled.
+
+It nearly took a safety net with it. `heap_scan_enabled` is the deliberately-kept fallback
+for a scene that ends up with no pool armed, and its trigger was `_currentMsgId != 0` — a
+value *only* the diagnostic chain ever set. Deleting the chain would have left the switch,
+the function and the config comment all in place and the fallback permanently unable to
+fire. Nothing would have failed. So the trigger moved first, in its own commit, to the
+thing it always wanted: an active hang-out. That also fixes a defect the config already
+confessed to — the scan used to wait for a dispatched message, so the opening lines of
+every scene played before it could begin.
+
+**And then the thing worth finding.** `DialogueBridge` is the Phase 2 design, preserved
+intact and still wired in: its own LLM request on every CMM event, written into the pool by
+`DialogueWriter.WriteAtLineIndex`, which counts null terminators from a base address. That
+is the "pool is a pile of strings" model from Ch. 58, which Ch. 66 replaced with the MSG1
+format. Every rule learned after Phase 2 lives in the record writer and none of them lived
+here:
+
+| Rule | Enforced in | Obeyed by the legacy writer? |
+|---|---|---|
+| Freeze a record once the interpreter reads it | `RecordState.Rendered` | No |
+| Leave another speaker's lines alone | `RecordState.Foreign` | No |
+| Never rewrite a selection | `RecordPlan.IsWritable` | No |
+| Verify the twin byte-for-byte first | `MirrorToTwin` | No |
+
+It was also making its own request against a server that runs one generation at a time and
+429s the rest — two independent schedulers for a single slot, only one of them measured.
+
+Nothing about it looked dead. Every symbol was referenced, from live code, with no config
+gate, and the README listed it as a working component. The reference count that found the
+rest could never have found this one; it took asking a different question — not "what is
+unreachable" but "what else writes to the thing I just finished protecting?"
+
 **Next up:** Phase 5's input channel, and an in-game run of the selection-record
 hypothesis. Ch. 80 proposed that `SEL` headers move their count from `0x18` to `0x1A`, the
 parser ships behind the hole mechanism so a wrong guess costs coverage rather than
@@ -490,8 +548,11 @@ p5r-gen-social-links/
 ├── mod/P5RGenSocialLinks/       # C# Reloaded-II mod
 │   ├── Memory/                  # Pointer chain, BMD parsing, speaker + addressee, write-back
 │   ├── Server/                  # HTTP client, health checker
-│   ├── Mod.cs                   # Entry point, poll loop, hook wiring
-│   ├── DialogueBridge.cs        # LLM dispatch, throttle, session history
+│   ├── Mod.cs                   # Entry point, poll loop, Reloaded lifecycle (369 lines)
+│   ├── Mod.Hooks.cs             # The injected-code surface
+│   ├── Mod.Pool*.cs             # Arming, cursor tracking, the record writer, heap fallback
+│   ├── Mod.Scene.cs             # The plan: records, capacities, speakers, addressees
+│   ├── Mod.Generation.cs        # Prompt context and the pre-generation queue
 │   └── GenDialogue.json         # Runtime config (no recompile needed)
 ├── mod/P5RGenSocialLinks.Tests/ # 73 tests (xunit) over the byte-layout parsers
 ├── server/                      # Python inference server
