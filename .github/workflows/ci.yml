@@ -29,8 +29,13 @@ jobs:
       - name: Install dev dependencies
         run: pip install -r requirements-dev.txt
 
+      # test_kernel.py is no longer excluded. It used to fail collection without torch;
+      # now torch lives behind a try/except and the GPU cases skip with a reason that says
+      # which dependency is missing. Excluding the file by name is part of how a compile
+      # error in the kernel stayed hidden for eighty chapters (learning.md Ch. 85), and
+      # the contract those cases check is covered on the CPU by test_kernel_reference.py.
       - name: Run tests (no GPU, no model)
-        run: python -m pytest tests/ --ignore=tests/test_kernel.py -v
+        run: python -m pytest tests/ -v
 
   dotnet-build:
     name: Mod build (.NET)
