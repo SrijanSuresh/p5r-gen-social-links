@@ -37,6 +37,29 @@ class PackingError(ValueError):
     """A tensor's shape or values do not match the packed int4 layout."""
 
 
+def check_shapes(k_dim: int, packed_rows: int, group_size: int) -> None:
+    """
+    Validate the shape relationships every implementation shares.
+
+    Lives here rather than in the Triton wrapper so it can be tested without a GPU — or
+    without torch, which is in neither requirements file. The wrapper calls this; the
+    tests call it directly.
+
+    Raises:
+        PackingError: K disagrees with the packed row count, or does not divide into
+            whole quantization groups.
+    """
+    packed_k = packed_rows * 2
+    if packed_k != k_dim:
+        raise PackingError(
+            f"activations have K={k_dim} but packed weights hold K={packed_k}"
+        )
+    if group_size <= 0:
+        raise PackingError(f"group_size must be positive, got {group_size}")
+    if k_dim % group_size != 0:
+        raise PackingError(f"K={k_dim} is not a multiple of group_size={group_size}")
+
+
 def pack_int4(weights: list[list[int]]) -> list[list[int]]:
     """
     Pack a ``[K, N]`` grid of 4-bit weights into ``[K // 2, N]`` bytes.

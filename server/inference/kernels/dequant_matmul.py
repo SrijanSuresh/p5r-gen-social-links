@@ -22,6 +22,8 @@ import triton                           # type: ignore[import-untyped]
 import triton.language as tl            # type: ignore[import-untyped]
 import torch
 
+from inference.kernels.reference import check_shapes
+
 
 @triton.autotune(
     configs=[
@@ -151,13 +153,9 @@ def dequant_matmul(
 
     # K arrives twice — from the activations and from the packed row count — and a
     # disagreement is a caller bug that would otherwise read as noise in the output.
-    packed_k = w_packed.shape[0] * 2
-    if packed_k != K:
-        raise ValueError(
-            f"activations have K={K} but packed weights hold K={packed_k}"
-        )
-    if group_size <= 0 or K % group_size != 0:
-        raise ValueError(f"K={K} is not a positive multiple of group_size={group_size}")
+    # Checked by the reference module so the rule holds for both implementations and can
+    # be tested without a GPU.
+    check_shapes(K, w_packed.shape[0], group_size)
 
     out = torch.empty((M, N), device=a.device, dtype=torch.float16)
 

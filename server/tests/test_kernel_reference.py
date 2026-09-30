@@ -13,6 +13,7 @@ import pytest
 
 from inference.kernels.reference import (
     PackingError,
+    check_shapes,
     dequant_matmul_reference,
     dequantize,
     pack_int4,
@@ -147,3 +148,30 @@ def test_matmul_rejects_mismatched_shapes() -> None:
         )
     with pytest.raises(PackingError, match="no activations"):
         dequant_matmul_reference([], [[0]], [[1.0]], [[0]], group_size=2)
+
+
+# --- the shape contract, shared with the Triton wrapper -----------------------
+#
+# The wrapper defers to check_shapes so these rules hold for both implementations and can
+# be tested without torch, which is in neither requirements file.
+
+
+def test_check_shapes_accepts_a_consistent_problem() -> None:
+    check_shapes(k_dim=128, packed_rows=64, group_size=32)
+
+
+def test_check_shapes_rejects_a_k_mismatch() -> None:
+    with pytest.raises(PackingError, match="packed weights hold K=8"):
+        check_shapes(k_dim=16, packed_rows=4, group_size=8)
+
+
+def test_check_shapes_rejects_a_group_size_that_does_not_divide_k() -> None:
+    with pytest.raises(PackingError, match="multiple of group_size"):
+        check_shapes(k_dim=128, packed_rows=64, group_size=30)
+
+
+def test_check_shapes_rejects_a_nonpositive_group_size() -> None:
+    with pytest.raises(PackingError, match="positive"):
+        check_shapes(k_dim=128, packed_rows=64, group_size=0)
+    with pytest.raises(PackingError, match="positive"):
+        check_shapes(k_dim=128, packed_rows=64, group_size=-32)
