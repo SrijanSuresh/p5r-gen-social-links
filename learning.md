@@ -6713,3 +6713,53 @@ generated was written by the legacy writer, so with that writer gone the fallbac
 a line nobody can place. A mod that cannot find the interpreter now says so and leaves the
 scripted dialogue alone, which is the behaviour the project has chosen every other time the
 question came up.
+
+## Chapter 86: A Kernel Is Not an Engine
+
+With the kernel corrected and its contract pinned, the obvious next question is what it
+would take to actually serve a request through it. The answer is worth writing down,
+because the kernel's existence makes the Triton backend look much closer than it is.
+
+`dequant_matmul` computes `a @ dequantize(W)` for one quantized weight matrix. That is the
+arithmetic inside **one linear layer**. Llama-3.1-8B has 32 blocks, each containing four
+projections in attention and three in the MLP, and around all of that sits everything the
+kernel does not do:
+
+| Missing | Why it is not optional |
+|---|---|
+| Weight loader | The packed int4 layout has to come from somewhere. GGUF stores Q4_K_M, which is a different packing from the one `reference.py` documents — blocks of 32 with their own super-scales, not two plain nibbles per byte. |
+| Tokenizer | A prompt is text; the kernel consumes tensors. |
+| RMSNorm, RoPE, attention, SwiGLU | A transformer block is mostly *not* matmuls, and the parts that are not are where the subtle bugs live. |
+| KV cache | Without one, generating the 32nd token re-reads the whole prompt. This is the difference between a second a line and a minute a line. |
+| Sampling | Temperature, top-p and repetition penalty are already in `ModelConfig` and already shape the prompt's expectations. |
+| Chat-completions shim | So `InferencePipeline` does not change — see below. |
+
+That last row is the one piece already paid for. `ChatCompletionBackend` in `pipeline.py` is
+a `Protocol`, structural rather than nominal, which is what let inference move out of
+process in Ch. 62 without touching the pipeline's logic. Anything that answers
+`create_chat_completion` satisfies it — `llama_cpp.Llama` did, `LlamaServerClient` does, a
+`MagicMock` does under test. A Triton engine would too, and the pipeline would not notice.
+
+### The seam, and why it refuses loudly
+
+`INFERENCE_BACKEND` now selects between `llama` and `triton`. Selecting `triton` does not
+half-work: it raises with the table above rendered as a list, and tells you to run with the
+default. Two error types, because the remedies differ — `UnknownBackendError` for a
+misspelled name, which the person who set the variable fixes, and `BackendNotBuiltError`
+for this, which somebody fixes by writing code.
+
+Neither stops the API from starting. The mod already treats an unreachable server as
+"leave the scripted dialogue alone", so a server that comes up and answers 503 is strictly
+better than one that refuses to boot: the failure is visible in one place, in a log line
+that explains itself, instead of arriving as a connection error the mod cannot describe.
+
+### Why name the gap at all
+
+The alternative is a `TODO` and a half-built module, and this project has already seen
+what that costs. The Triton kernel sat in the repo for eighty chapters looking finished —
+autotuner, five configs, forty lines of block-pointer commentary, a test — and did not
+compile. Nothing lied; the code simply implied more than it delivered, and the three
+layers of test infrastructure that should have said so were all pointed slightly away.
+
+A list of six concrete missing pieces cannot imply that. It is also the honest answer to
+"is the Triton backend done", which is a question the README was close to answering wrong.
