@@ -12,6 +12,13 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import uvicorn
 
+from inference.backend import (
+    Backend,
+    BackendNotBuiltError,
+    UnknownBackendError,
+    require_available,
+    resolve as resolve_backend,
+)
 from inference.config import LlamaServerConfig, ModelConfig
 from inference.llama_client import LlamaServerClient, LlamaServerError
 from inference.llama_process import LlamaServerProcess, LlamaServerStartupError
@@ -32,6 +39,15 @@ _server_cfg = LlamaServerConfig()
 _process: LlamaServerProcess | None = None
 _client: LlamaServerClient | None = None
 
+# Which engine serves requests. Resolved once at import so a bad INFERENCE_BACKEND is a
+# startup problem rather than a surprise on the first hang-out.
+_backend: Backend = Backend.LLAMA_SERVER
+_backend_error: str | None = None
+try:
+    _backend = resolve_backend()
+except UnknownBackendError as exc:
+    _backend_error = str(exc)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -43,11 +59,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     learning.md Ch. 62.
     """
     global _pipeline, _process, _client
-    if os.getenv("MOCK_LLM"):
+    if _backend_error is not None:
+        # A misspelled backend name is the operator's mistake and worth being loud about,
+        # but it must not stop the API coming up: the mod treats an unreachable server as
+        # "leave the scripted dialogue alone", which is the right outcome either way.
+        log.error("%s. /generate will return 503.", _backend_error)
+        _pipeline = None
+    elif os.getenv("MOCK_LLM"):
         log.info("MOCK_LLM=1 — skipping model load, returning canned responses.")
         _pipeline = _MOCK
     else:
         try:
+            # Refuses here, with the full list of what is missing, rather than failing
+            # somewhere deeper on the first request.
+            require_available(_backend)
+
             if _server_cfg.autostart:
                 _process = LlamaServerProcess(_server_cfg, _cfg)
                 _process.start()  # returns only once the weights are resident
@@ -63,6 +89,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             # Narrow: a backend that will not start is expected and recoverable, and
             # the message already carries the child's exit code and log tail.
             log.warning("llama-server unavailable (%s). /generate will return 503.", exc)
+        except BackendNotBuiltError as exc:
+            # Selecting the unfinished backend is a configuration choice, not a crash.
+            log.error("%s", exc)
 
     yield
 
@@ -152,7 +181,8 @@ async def model_info() -> dict[str, object]:
         "temperature":  _cfg.temperature,
         # Inference runs out of process; surfacing where and whether we spawned it
         # makes a misconfigured LLAMA_AUTOSTART=0 diagnosable from the mod's log.
-        "backend":         "llama-server",
+        "backend":         _backend.value,
+        "backend_detail":  "llama-server" if _backend is Backend.LLAMA_SERVER else "not built",
         "backend_url":     _server_cfg.base_url,
         "backend_managed": _process is not None and _process.is_running,
     }
