@@ -6763,3 +6763,79 @@ layers of test infrastructure that should have said so were all pointed slightly
 
 A list of six concrete missing pieces cannot imply that. It is also the honest answer to
 "is the Triton backend done", which is a question the README was close to answering wrong.
+
+## Chapter 87: The Input Channel Was Never the Hard Part
+
+Phase 5 is the player typing their own line and the NPC answering it. The README has
+carried the same note for weeks: "the timing is already solved... what remains unsolved is
+the input channel itself (Reloaded console, a server-hosted page, or an in-game field with
+IME work)."
+
+Three options, and the choice is less balanced than it looks.
+
+**An in-game text field** is the one that would feel right and the one nobody should build
+first. P5R draws its own UI; a field means hooking the input path, rendering glyphs with
+the game's own font atlas, and handling IME composition for anybody typing Japanese. Every
+one of those is a project, and all three have to work before a single line can be typed.
+
+**The Reloaded console** is nearly free and nearly useless. It is a separate window, so
+typing into it means alt-tabbing out of a fullscreen game, and it is not guaranteed to be
+visible at all — the loader can run without a console attached.
+
+**A page served by the Python server** costs almost nothing, because every piece of it
+already exists. The server is already running, already on loopback, already a hard
+dependency, and already the thing that builds prompts. A browser already solves text entry,
+IME, clipboard, and font rendering. So the channel is one route that accepts a string and
+one page that posts to it.
+
+That is the whole decision, and it is the easy half.
+
+### What is actually hard: the typed line has to arrive on the right record
+
+Pre-generation exists because reacting cannot win. Inference sustains ~0.7 lines/sec and a
+reader advances at up to 1.7, so the queue runs eight records ahead of the player (Ch. 72).
+
+Now consider a player who stops and types for ten seconds. That pause is exactly when the
+queue catches up: by the time they press enter, all eight lookahead records have been
+generated and written, including the one they are about to read. The reply to their line
+needs to land on the record right after the cursor — which is a record the queue has
+already filled with something else.
+
+So the typed line cannot simply be appended to the next request that happens to arrive.
+The next request is for a record the player will not reach for several bubbles. Answering
+there produces a confidant who responds to something said half a scene ago, which is worse
+than not having the feature.
+
+The record after the cursor has to be **reopened** — returned to `Pending`, regenerated
+with the typed line in its context, and rewritten before the player advances. Which is
+safe to do, and safe for exactly the reason Ch. 72 established as an invariant:
+
+> A record is writable until the interpreter reads it, and frozen afterwards.
+
+The record after the cursor has not been read. `RecordPlan.IsWritable` already says so, the
+render freeze already protects everything behind it, and `FlushReadyRecords` already
+refuses to write behind the player. The machinery that makes typed input safe was built
+while fixing a bug that had nothing to do with typed input.
+
+### Why the server holds the line rather than the mod asking for it
+
+The mod polls; it does not listen. There is no socket into the game process, and adding one
+means another thread inside somebody else's address space for no gain.
+
+So the page posts to the server, the server holds one pending line with a timestamp, and
+the mod consumes it on a poll it is already making. One line, not a queue: if the player
+types twice before the mod picks it up, the second line is the one they meant. And a
+timestamp, because a line typed and then abandoned — the player closes the tab, or walks
+away — must not surface in a scene half an hour later. It expires.
+
+### The shape of the slice
+
+What lands here is the channel and the prompt support: a store, two routes, a page, and
+`player_line` threaded into the user half of the prompt next to the addressee, where it
+belongs — Joker's line is the thing being replied to, and the system prompt stays
+byte-identical so the KV-cache prefix survives (Ch. 81).
+
+What does not land here is the mod reopening the record. That needs a poll, a state
+transition back to `Pending`, and a decision about what happens when the player advances
+mid-generation. It is named in the README as the remaining work rather than implied by a
+feature that half-exists — which is the mistake Ch. 85 and Ch. 86 are both about.
