@@ -114,3 +114,44 @@ def test_world_grounding_still_places_the_speaker() -> None:
 def test_the_rules_tell_the_model_an_addressee_is_coming() -> None:
     system, _ = build_prompt(TAKEMI, 5, "clinic")
     assert "told who you are speaking to" in system
+
+
+# --- the player's typed line (Phase 5) ---------------------------------------
+
+
+def test_a_typed_line_is_quoted_and_attributed_to_joker() -> None:
+    _, user = build_prompt(TAKEMI, 5, "clinic", player_line="is she going to be okay?")
+    # Quoted and labelled, so the model can tell Joker's own words from scene
+    # description. Unquoted it reads as more stage direction and gets summarised.
+    assert '[Joker just said to you: "is she going to be okay?"]' in user
+
+
+def test_no_typed_line_leaves_the_prompt_as_it_was() -> None:
+    _, with_empty = build_prompt(TAKEMI, 5, "clinic", player_line="")
+    _, without_arg = build_prompt(TAKEMI, 5, "clinic")
+    assert with_empty == without_arg
+
+    _, whitespace_only = build_prompt(TAKEMI, 5, "clinic", player_line="   ")
+    assert whitespace_only == without_arg
+
+
+def test_a_typed_line_never_touches_the_system_prompt() -> None:
+    # Same KV-cache reason as the addressee: the prefix has to stay byte-identical
+    # across a scene, and a typed line arrives mid-scene.
+    quiet, _ = build_prompt(TAKEMI, 5, "clinic")
+    typed, _ = build_prompt(TAKEMI, 5, "clinic", player_line="you okay?")
+    assert quiet == typed
+
+
+def test_a_typed_line_comes_after_the_addressee_and_before_the_budget() -> None:
+    # Who you are talking to, then what they said, then how long the answer may be.
+    _, user = build_prompt(
+        TAKEMI, 5, "clinic", addressee=FATHER, player_line="is she going to be okay?"
+    )
+    assert user.index(FATHER) < user.index("Joker just said") < user.index("Aim for about")
+
+
+def test_the_rules_tell_the_model_a_typed_line_outranks_the_script() -> None:
+    system, _ = build_prompt(TAKEMI, 5, "clinic")
+    assert "answer it directly" in system
+    assert "outranks the scripted line" in system
