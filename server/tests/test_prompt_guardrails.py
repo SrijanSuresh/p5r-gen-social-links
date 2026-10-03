@@ -1,5 +1,6 @@
 """Guardrail tests for the prompt builder output contract."""
 
+from inference.config import ModelConfig
 from social_link.prompt_builder import build_prompt
 
 
@@ -13,9 +14,48 @@ def test_user_prompt_ends_with_character_name_colon() -> None:
     assert user.strip().endswith("Makoto Niijima:")
 
 
-def test_system_prompt_does_not_exceed_2048_chars() -> None:
+# Chars per token for English, conservatively. The real figure is nearer 4; 3 leaves the
+# bound on the safe side of a prompt full of names and punctuation, which tokenize worse.
+CHARS_PER_TOKEN = 3
+
+
+def test_the_prompt_leaves_room_to_generate_inside_n_ctx() -> None:
+    """
+    Bound the prompt by the window it actually has to fit in.
+
+    This used to assert a flat `< 4096` characters, which is a round number rather than a
+    constraint, and the prompt had grown to within 114 characters of it — so the next
+    feature to add a rule would have failed the check whatever that rule was. The limit
+    that exists is `ModelConfig.n_ctx`, minus the tokens reserved for the answer.
+
+    Deriving it from the config also means changing `n_ctx` moves this automatically,
+    instead of leaving a magic number that used to be right.
+    """
+    cfg = ModelConfig()
+    budget_chars = (cfg.n_ctx - cfg.max_tokens) * CHARS_PER_TOKEN
+
+    # A 1024-character context is the most Pydantic will accept on /generate, so this is
+    # the largest prompt the server can be asked to build.
     system, user = build_prompt(confidant_id=1, rank=1, context="x" * 1024)
-    assert len(system) + len(user) < 4096, "Combined prompt exceeds safe context window"
+    total = len(system) + len(user)
+
+    assert total < budget_chars, (
+        f"prompt is {total} chars; n_ctx={cfg.n_ctx} leaves room for about "
+        f"{budget_chars} once {cfg.max_tokens} tokens are reserved for the answer"
+    )
+
+
+def test_the_system_half_stays_well_inside_the_window_on_its_own() -> None:
+    # The system prompt is the KV-cache prefix, so its length is paid once per scene
+    # rather than once per line (Ch. 81). It is still the half that grows every time a
+    # rule is added, and this is the line that will notice when it has gone too far.
+    cfg = ModelConfig()
+    system, _ = build_prompt(confidant_id=1, rank=1, context="scene")
+
+    half_the_window = cfg.n_ctx * CHARS_PER_TOKEN // 2
+    assert len(system) < half_the_window, (
+        f"system prompt is {len(system)} chars, over half the {cfg.n_ctx}-token window"
+    )
 
 # --- Phantom Thieves grounding ------------------------------------------------
 #

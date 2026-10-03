@@ -87,6 +87,8 @@ Rules:
   is someone other than Joker, do not address him and do not describe the person
   you are addressing in the third person: he is in the room and listening, but
   they are the one you are talking to.
+- If you are shown a line Joker just said, answer it directly. He chose to say it, so
+  it outranks the scripted line you are replacing.
 - If you are told which line you are replacing, keep its purpose and move the
   conversation the same distance forward. Do not restate a line you already said.
 - If you are shown what you just said, continue from it. This is one conversation,
@@ -143,12 +145,28 @@ def _addressee_note(addressee: str, speaker_name: str) -> str:
     )
 
 
+def _player_note(player_line: str) -> str:
+    """
+    One line carrying what the player typed, or "" when they typed nothing.
+
+    Quoted and labelled rather than folded into the scene context, because the model has
+    to be able to tell Joker's own words from a description of the scene. Unquoted, a
+    typed line reads as more stage direction and gets summarised instead of answered.
+    """
+    said = (player_line or "").strip()
+    if not said:
+        return ""
+    return f'[Joker just said to you: "{said}"]'
+
+
+
 def build_prompt(
     confidant_id: int,
     rank: int,
     context: str,
     max_chars: int = 56,
     addressee: str = "",
+    player_line: str = "",
 ) -> tuple[str, str]:
     """
     Return (system_prompt, user_prompt) for the LLM.
@@ -163,6 +181,10 @@ def build_prompt(
     scene's turn order rather than reading out of the file, because the format has no
     such field (Ch. 81). It joins ``max_chars`` in the user half for the same cache
     reason, and an empty value is omitted rather than defaulted to Joker.
+
+    ``player_line`` is what the player typed, when Phase 5's input channel has a line
+    waiting. It sits in the user half for the same cache reason and is omitted entirely
+    when empty, so a scene nobody typed into produces a byte-identical prompt.
     """
     confidant: Confidant = get_confidant(confidant_id)
     system = SYSTEM_TEMPLATE.format(
@@ -202,9 +224,11 @@ def build_prompt(
     # whole line is for, while the budget only changes how long it runs, and the model
     # weights the earlier instruction more heavily.
     note = _addressee_note(addressee, confidant.name)
+    said = _player_note(player_line)
     user = (
         f"[Scene context: {context}]\n"
         + (f"{note}\n" if note else "")
+        + (f"{said}\n" if said else "")
         + f"[Aim for about {target} characters, roughly {max_words} words. "
         f"Finish the sentence — a complete short line beats a longer unfinished one.]\n"
         f"{confidant.name}:"
