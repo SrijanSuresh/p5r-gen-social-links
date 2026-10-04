@@ -32,6 +32,7 @@ if not exist "models\Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" (
 
 echo Starting P5R Gen Social Links server (real LLM)...
 echo   API           http://127.0.0.1:8765
+echo   Say something http://127.0.0.1:8765/      (type your own line here)
 echo   llama-server  http://127.0.0.1:8766  (child process)
 echo   child log     logs\llama-server.log
 echo.
