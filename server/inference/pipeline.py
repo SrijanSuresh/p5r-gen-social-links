@@ -59,6 +59,7 @@ class InferencePipeline:
         context: str,
         max_chars: int | None = None,
         addressee: str = "",
+        player_line: str = "",
     ) -> str:
         """
         Produce one line, clipped to what the destination can actually display.
@@ -74,10 +75,15 @@ class InferencePipeline:
         ``addressee`` is who the line is spoken to. It defaults to empty rather than to
         Joker: the caller that cannot derive a turn order has no business asserting one,
         and build_prompt omits the claim entirely when it is blank.
+
+        ``player_line`` is what the player typed, when Phase 5's input channel had a line
+        waiting. Supplied by the caller rather than read from the store here, because
+        deciding *which* record should answer a typed line is the caller's problem — the
+        pipeline has no idea where the player's cursor is (learning.md Ch. 87).
         """
         budget = self._cfg.max_response_chars if max_chars is None else max_chars
         system_prompt, user_prompt = build_prompt(
-            confidant_id, rank, context, budget, addressee
+            confidant_id, rank, context, budget, addressee, player_line
         )
 
         response = self._model.create_chat_completion(

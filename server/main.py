@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 import uvicorn
 
@@ -26,6 +28,8 @@ from inference.pipeline import InferencePipeline
 from inference.queue import InferenceQueue
 from social_link.arcana import get_confidant
 from social_link.mock_responses import get_mock_response
+from social_link.player_input import PlayerInputError, PlayerInputStore
+from social_link.say_page import SAY_PAGE
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +45,10 @@ _client: LlamaServerClient | None = None
 
 # Which engine serves requests. Resolved once at import so a bad INFERENCE_BACKEND is a
 # startup problem rather than a surprise on the first hang-out.
+# Phase 5's input channel. Holds at most one typed line, which expires if nothing
+# collects it (learning.md Ch. 87).
+_player_input = PlayerInputStore()
+
 _backend: Backend = Backend.LLAMA_SERVER
 _backend_error: str | None = None
 try:
@@ -129,10 +137,38 @@ class GenerateRequest(BaseModel):
     # which is also what an older mod build gets by not sending the field at all.
     addressee: str = Field(default="", max_length=64)
 
+    # What the player typed, when Phase 5's input channel had a line waiting.
+    #
+    # Supplied by the caller rather than taken from the store here. /generate is called
+    # several records ahead of the player, so the server cannot tell which request should
+    # answer a typed line — only the mod knows where the cursor is, and answering the
+    # wrong record is worse than not answering at all. The mod collects the line from
+    # GET /player-line and decides.
+    player_line: str = Field(default="", max_length=280)
+
 
 class GenerateResponse(BaseModel):
     text: str
     session_id: int
+
+
+class SayRequest(BaseModel):
+    """A line the player typed into the browser page."""
+
+    # Validated again by player_input.normalise, which strips control characters and
+    # collapses whitespace. This bound is the cheap rejection; that one is the contract.
+    text: str = Field(..., max_length=1024)
+
+
+class SayResponse(BaseModel):
+    accepted: bool
+    text: str
+
+
+class PlayerLineResponse(BaseModel):
+    pending: bool
+    text: str
+    age_seconds: float
 
 
 @app.get("/health")
@@ -158,6 +194,9 @@ async def stats() -> dict[str, object]:
         "total_completions": _queue.total_completions,
         "avg_latency_ms":    _queue.avg_latency_ms,
         "model_loaded":      _pipeline is not None and _pipeline is not _MOCK,
+        "player_lines_submitted": _player_input.submitted_count,
+        "player_lines_collected": _player_input.collected_count,
+        "player_lines_expired":   _player_input.expired_count,
     }
 
 
@@ -189,6 +228,64 @@ async def model_info() -> dict[str, object]:
     return info
 
 
+@app.post("/say", response_model=SayResponse)
+async def say(req: SayRequest) -> SayResponse:
+    """
+    Accept a line the player typed, replacing any line not yet collected.
+
+    The browser page posts here. Replacing rather than queueing is deliberate: if the
+    player types twice before the mod collects, the second line is the one they meant.
+    """
+    try:
+        line = _player_input.submit(req.text)
+    except PlayerInputError as exc:
+        # Narrow: an empty or over-long line is the player's typing, not a server fault.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    log.info("player line: %r", line.text)
+    return SayResponse(accepted=True, text=line.text)
+
+
+@app.get("/player-line", response_model=PlayerLineResponse)
+async def player_line(consume: bool = False) -> PlayerLineResponse:
+    """
+    The pending typed line, for the mod to poll.
+
+    ``consume=false`` (the default) peeks: the mod can see that a line is waiting and
+    decide which record should answer it before committing to collecting it. Only the
+    request that is actually going to use the line should pass ``consume=true``, because
+    a collected line is gone and one typed line must not be answered twice.
+    """
+    line = _player_input.take() if consume else _player_input.peek()
+    if line is None:
+        return PlayerLineResponse(pending=False, text="", age_seconds=0.0)
+
+    return PlayerLineResponse(
+        pending=True,
+        text=line.text,
+        age_seconds=round(line.age_seconds(time.monotonic()), 2),
+    )
+
+
+@app.post("/player-line/clear")
+async def clear_player_line() -> dict[str, str]:
+    """Forget any pending line — called when a hang-out ends."""
+    _player_input.clear()
+    return {"result": "cleared"}
+
+
+@app.get("/", response_class=HTMLResponse)
+async def say_page() -> HTMLResponse:
+    """
+    The typing page.
+
+    Served from here rather than built into the game because a browser already solves
+    text entry, IME composition, clipboard and font rendering — all of which an in-game
+    field would have to implement before a single line could be typed (Ch. 87).
+    """
+    return HTMLResponse(SAY_PAGE)
+
+
 @app.post("/generate", response_model=GenerateResponse)
 async def generate(req: GenerateRequest) -> GenerateResponse:
     if _pipeline is None:
@@ -209,6 +306,7 @@ async def generate(req: GenerateRequest) -> GenerateResponse:
             req.context,
             req.max_chars,
             req.addressee,
+            req.player_line,
         )
 
     try:
