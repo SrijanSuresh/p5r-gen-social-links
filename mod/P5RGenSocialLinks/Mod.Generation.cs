@@ -397,11 +397,6 @@ public partial class Mod
     /// </summary>
     private void PumpPregen(SocialLinkSnapshot snap)
     {
-        // Below this, a complete sentence in character does not fit and the server
-        // correctly returns nothing. Measured: records of 15-21 chars produced
-        // "You can grab a" and "Guess we good to" before fragments were rejected.
-        const int MinGeneratableChars = 24;
-
         int lookahead = _cfg.PregenLookahead;
         if (lookahead <= 0 || _plan.Count == 0) return;
 
@@ -426,21 +421,14 @@ public partial class Mod
             RecordPlan record = _plan[i];
             if (record.State != RecordState.Pending) continue;
 
-            // A selection is the list of replies the player picks from, so there is
-            // nothing here to say in character and the write is forbidden outright
-            // (Ch. 80). Taking it out of the queue as well as out of the write path saves
-            // an inference that could never have been used.
-            if (record.IsSelection)
-            {
-                record.State = RecordState.Rendered;   // permanently out of the way
-                continue;
-            }
-
-            // Records whose scripted line is too short to be a spoken line are skipped
-            // rather than generated for. A three-character record is a fragment of UI,
-            // and replacing it wastes a slow inference on something nobody reads as
-            // dialogue.
-            if (record.Original.Length < 8 || record.Capacity < MinGeneratableChars)
+            // Selections and records too short to hold a sentence are taken out of the
+            // queue for good. A selection must never be rewritten at all (Ch. 80), and a
+            // three-character record is a fragment of UI — replacing it spends a slow
+            // inference on text nobody reads as dialogue.
+            //
+            // The thresholds live in Generatable because the typed-input path applies the
+            // identical test, and a second copy of a threshold is one that drifts.
+            if (!Generatable.IsWorthGenerating(record))
             {
                 record.State = RecordState.Rendered;   // permanently out of the way
                 continue;

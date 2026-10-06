@@ -27,6 +27,8 @@
              Link="Memory/Addressee.cs" />
     <Compile Include="../P5RGenSocialLinks/Memory/RecordPlan.cs"
              Link="Memory/RecordPlan.cs" />
+    <Compile Include="../P5RGenSocialLinks/Memory/Generatable.cs"
+             Link="Memory/Generatable.cs" />
   </ItemGroup>
 
   <ItemGroup>
