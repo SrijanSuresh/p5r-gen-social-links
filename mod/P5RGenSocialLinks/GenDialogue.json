@@ -102,6 +102,25 @@
   // decided either way.
   "addressee_enabled": true,
 
+  // Let the player type their own line and have the confidant answer it.
+  //
+  // Type into the page the server hosts at http://127.0.0.1:8765/ while the game runs.
+  // When a line is waiting, the record you are about to read is taken back: returned to
+  // the queue, regenerated with your line in the prompt, and rewritten before you
+  // advance. Safe because a record stays writable until the interpreter reads it, and
+  // the one being reopened is by definition unread.
+  //
+  // Set false to rule the channel out while diagnosing something else. The [PLAYER] log
+  // lines report every reopen, every collection, and every reply the player outran.
+  "player_input_enabled": true,
+
+  // Poll ticks between checks for a typed line. At the default 500ms tick, 4 is ~2s.
+  //
+  // Every tick would be two loopback requests a second for a whole session to answer
+  // "no" almost every time. Being slightly late costs nothing: the check only peeks, and
+  // the line stays in the store until something collects it or it expires.
+  "player_poll_ticks": 4,
+
   // Dump the scene archive's header, the bytes ahead of its first line, and its tail.
   // A dozen log lines once per armed scene, on while the BMD interior is being worked out.
   "bmd_dump_enabled": true,

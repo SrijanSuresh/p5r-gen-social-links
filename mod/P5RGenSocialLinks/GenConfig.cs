@@ -141,6 +141,38 @@ internal sealed class GenConfig
     public bool AddresseeEnabled { get; init; } = true;
 
     /// <summary>
+    /// Let the player type their own line and have the confidant answer it.
+    ///
+    /// The line arrives through the page the server hosts on 127.0.0.1:8765. When one is
+    /// waiting, the record the player is about to read is taken back — returned to the
+    /// queue, regenerated with the typed line, and rewritten before they advance.
+    ///
+    /// Safe because of the invariant that predates the feature: a record is writable
+    /// until the interpreter reads it (Ch. 72). The record being reopened is by
+    /// definition unread.
+    ///
+    /// On by default. Set false to rule the channel out while diagnosing something else —
+    /// the mod then never polls for a line, and anything typed sits in the store until it
+    /// expires.
+    /// </summary>
+    [JsonPropertyName("player_input_enabled")]
+    public bool PlayerInputEnabled { get; init; } = true;
+
+    /// <summary>
+    /// Poll ticks between checks for a typed line.
+    ///
+    /// The poll loop runs every <see cref="PollIntervalMs"/> (500 ms by default), and
+    /// checking every tick would be two loopback requests a second for the whole session
+    /// to answer "no" almost every time. Four ticks is ~2 s, which is inside the gap
+    /// between a player pressing enter and advancing the bubble.
+    ///
+    /// The check is a peek, not a collection: it costs nothing to be slightly late, and
+    /// nothing is lost if it is.
+    /// </summary>
+    [JsonPropertyName("player_poll_ticks")]
+    public int PlayerPollTicks { get; init; } = 4;
+
+    /// <summary>
     /// Dump the scene archive's header, the bytes ahead of its first line, and its tail.
     ///
     /// A dozen log lines once per armed scene. On while the BMD interior is still being
