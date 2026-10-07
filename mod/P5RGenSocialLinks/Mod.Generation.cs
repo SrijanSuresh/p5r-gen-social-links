@@ -413,6 +413,16 @@ public partial class Mod
         foreach (RecordPlan inFlight in _plan)
             if (inFlight.State == RecordState.InFlight) return;
 
+        // A line the player typed outranks the lookahead. Served before the loop below so
+        // a tick that could do either does this one — otherwise the queue spends it on
+        // record cursor+7 while the reply the player is waiting for sits in the store
+        // (Ch. 88).
+        //
+        // It waits for any in-flight request like everything else. That costs up to about
+        // two seconds, which is worth not plumbing a cancellation token out of
+        // RequestForRecord for: the player has just spent five to fifteen seconds typing.
+        if (TryAnswerPlayerLine(snap)) return;
+
         int from = _poolNextRecord.Count > 0 ? Math.Max(0, _poolNextRecord[0]) : 0;
         int to   = Math.Min(_plan.Count, from + lookahead);
 

@@ -269,6 +269,8 @@ public partial class Mod : IModV1
                     // Cleared with the session: the next hang-out is a different scene,
                     // and a stale script would describe a conversation that already ended.
                     _sceneScript.Clear();
+                    // A line typed at the end of one hang-out must not open the next one.
+                    ClearPlayerInput();
                     _sessionActive = false;
                     _modLog!.Info("[P5RGenSocialLinks] Hang-out ended — session cleared.");
                 }
@@ -299,6 +301,10 @@ public partial class Mod : IModV1
             SocialLinkSnapshot? live = SocialLinkReader.TryReadFromPtr(session);
             if (live is not null)
             {
+                // Before the pump, so a line typed on the previous tick is already known
+                // about when the pump decides what to spend this tick on.
+                PollPlayerInput();
+
                 FlushReadyRecords();
                 PumpPregen(live);
             }
