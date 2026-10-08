@@ -43,6 +43,15 @@ public partial class Mod
     private int _playerPollTick;
 
     /// <summary>
+    /// True once "nowhere to put it" has been reported for the current scene.
+    ///
+    /// The poll keeps finding the same waiting line every couple of seconds, so without
+    /// this the end of a scene with a stranded line prints the same warning for as long
+    /// as the player stands there.
+    /// </summary>
+    private bool _playerNoTargetLogged;
+
+    /// <summary>
     /// Ask the server whether anything has been typed.
     ///
     /// Fire-and-forget on purpose: this runs from the poll loop, which must not block on
@@ -94,11 +103,19 @@ public partial class Mod
             // belongs to another speaker. The line stays in the store rather than being
             // collected and dropped; it will expire on its own if the next scene does not
             // want it.
-            _modLog!.Info("[PLAYER] a line is waiting but no record ahead can answer it");
-            _playerLineWaiting = false;   // stop retrying every tick until the next poke
+            //
+            // Said once. The poll finds the same line again every couple of seconds, and
+            // this is a standing condition rather than an event.
+            if (!_playerNoTargetLogged)
+            {
+                _modLog!.Info("[PLAYER] a line is waiting but no record ahead can answer it");
+                _playerNoTargetLogged = true;
+            }
+            _playerLineWaiting = false;
             return false;
         }
 
+        _playerNoTargetLogged = false;
         RecordPlan target = _plan[index];
 
         // One attempt per detected line. The flag is set again by the next poll if the
@@ -153,7 +170,15 @@ public partial class Mod
                     Context       = BuildRecordContext(snap, record),
                     CharacterName = Memory.ConfidantNames.Resolve(snap.ConfidantId),
                     MaxChars      = record.Capacity,
-                    Addressee     = _cfg.AddresseeEnabled ? record.Addressee : string.Empty,
+
+                    // Joker, not whatever the turn model worked out for this record.
+                    //
+                    // That is not an override of Ch. 81's rule, it is the rule: the
+                    // addressee is the most recent earlier speaker, and the player has
+                    // just become that by typing. A record whose planned addressee was
+                    // the Girl's Father is still answering Joker if Joker is the one who
+                    // spoke last.
+                    Addressee     = _cfg.AddresseeEnabled ? Addressee.Protagonist : string.Empty,
 
                     // The one request that ever carries this. Everything else in the
                     // scene is pre-generation for records the player has not reached.
@@ -218,8 +243,9 @@ public partial class Mod
     /// <summary>Drop any line left in the store when a hang-out ends.</summary>
     private void ClearPlayerInput()
     {
-        _playerLineWaiting = false;
-        _playerPollTick    = 0;
+        _playerLineWaiting    = false;
+        _playerPollTick       = 0;
+        _playerNoTargetLogged = false;
 
         if (!_cfg.PlayerInputEnabled || _llmClient is null) return;
 

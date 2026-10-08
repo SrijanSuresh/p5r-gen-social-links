@@ -133,7 +133,17 @@ public partial class Mod
         var ctx = new System.Text.StringBuilder(ContextBuilder.Build(snap));
 
         ctx.Append(" The line you are replacing is: \"").Append(record.Original).Append('"');
-        ctx.Append(" Say something with the same purpose, in your own words.");
+
+        // "Same purpose" is right for pre-generation and wrong for a reply. The scripted
+        // line was written for a conversation the player has just changed by typing into
+        // it, so telling the model to preserve its purpose sets that instruction against
+        // the typed line the prompt rules say outranks it — and a model given two
+        // conflicting instructions obeys the nearer one (Ch. 88).
+        ctx.Append(record.AnsweringPlayer
+            ? " Joker has just said something to you directly. Answer him. The line above " +
+              "is only there to show where the conversation had got to — you do not have " +
+              "to keep its purpose."
+            : " Say something with the same purpose, in your own words.");
 
         // What the player has actually heard, most recent last. Four lines rather than
         // two: with two, consecutive generations came back as "Yeah, it was a sweet gym"
