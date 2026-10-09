@@ -6926,3 +6926,31 @@ UI rather than dialogue, and a capacity under 24 cannot hold a complete sentence
 path needs the identical test, and a second copy of a threshold is a threshold that drifts.
 Both now live in `Generatable`, which is also the only part of this that is a pure function
 over the plan — so it is the part that can be tested without a game attached.
+
+### Two things only writing it revealed
+
+**The context was arguing with the prompt.** Every pre-generation request carries "The line
+you are replacing is: X" followed by "Say something with the same purpose, in your own
+words." That is right for pre-generation and wrong for a reply: the player has just changed
+what the conversation is about, so preserving the scripted line's purpose sets the context
+directly against the rule in the system prompt that says a typed line outranks it. A model
+handed two conflicting instructions follows the nearer one, and the context is nearer. The
+reply path now says the line above is only there to show where the conversation had got to.
+
+**A config typo was an unobserved task exception.** `HttpClient` rejects
+`127.0.0.1:8765` — a `server_url` missing its scheme — with `InvalidOperationException`
+before it ever tries to connect, not with the `HttpRequestException` that "the server is
+down" produces. The poll and the clear are both fire-and-forget, so that throw escapes onto
+a task nobody awaits: no log line, no crash, just a feature that never works.
+
+Found by building a thirty-line console harness that links `LLMClient.cs` and drives it
+against a real server in mock mode. That is worth more than it sounds. The mod cannot be
+run without P5R and Reloaded, so its HTTP layer had never been *executed* outside the game
+— only unit-tested against literals. Linking one file into a console app made the whole
+client runnable in a second, and the first thing it did was find a bug that unit tests
+asserting on JSON strings could not have.
+
+The harness also pins the behaviours that matter when the server is absent, which is the
+common case for this mod: an unreachable server, a malformed URL and an empty store all
+have to come back as "nothing typed" rather than as an exception, because the mod's answer
+to every failure is to leave the scripted dialogue alone.
