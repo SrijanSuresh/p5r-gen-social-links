@@ -187,6 +187,13 @@ internal sealed class LLMClient : IDisposable
         {
             // Nothing to clear if nobody is listening.
         }
+        catch (InvalidOperationException)
+        {
+            // A server_url with no scheme — "127.0.0.1:8765" instead of
+            // "http://127.0.0.1:8765" — makes HttpClient reject the URI rather than fail
+            // to connect. These run on fire-and-forget tasks, so an escaping throw is an
+            // unobserved task exception rather than anything the log would show.
+        }
         catch (OperationCanceledException)
         {
         }
@@ -209,6 +216,12 @@ internal sealed class LLMClient : IDisposable
         }
         catch (HttpRequestException)
         {
+            return null;
+        }
+        catch (InvalidOperationException)
+        {
+            // A malformed server_url. Reported as "nothing typed", which is the same
+            // outcome as an unreachable server and leaves the scripted dialogue alone.
             return null;
         }
         catch (JsonException)
