@@ -5,7 +5,7 @@
 A [Reloaded-II](https://reloaded-project.github.io/Reloaded-II/) mod that replaces Persona 5 Royal's scripted Social Link dialogue with live AI generation — running entirely on your local GPU. No cloud, no API keys, no internet. Every conversation is unique.
 
 [![CI](https://github.com/SrijanSuresh/p5r-gen-social-links/actions/workflows/ci.yml/badge.svg)](https://github.com/SrijanSuresh/p5r-gen-social-links/actions/workflows/ci.yml)
-![Tests](https://img.shields.io/badge/tests-424%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-447%20passing-brightgreen)
 ![.NET](https://img.shields.io/badge/.NET-8.0-512BD4)
 ![Python](https://img.shields.io/badge/Python-3.13-3776AB)
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D4)
@@ -254,7 +254,16 @@ Verified on two confidants through the same machinery, in one game launch:
 > **Ryuji** — *"Aw, c'mon, that's basic gym etiquette, bro!"*
 > **Takemi** — *"Not quite famous enough to have a decent research budget, anyway."*
 
-### 🔶 Phase 5 — Player custom dialogue *(channel built, mod wiring left)*
+### ✅ Phase 5 — Player custom dialogue *(built end to end; not yet run in-game)*
+
+> Every other phase above is marked done on the strength of a measured scene. This one is
+> not: the channel, the record reopening and the HTTP layer are all built and tested — 104
+> C# tests, 343 Python tests, and a console harness that drives the real client against the
+> real server — but P5R has not been launched against it. What that leaves unverified is
+> the timing, which is the only part that cannot be tested without a player: whether the
+> reply actually lands before the bubble advances. The `[PLAYER]` log lines are there to
+> answer exactly that on the first run.
+
 
 Text input, so the player writes their own line and the NPC answers it.
 
@@ -288,21 +297,57 @@ ahead of the player, so a request that silently grabbed the pending line would h
 confidant reply several bubbles too late — worse than not having the feature. So `/say`
 holds, `GET /player-line` peeks, `?consume=true` collects, and the caller chooses.
 
-**What's left is the mod side, and it is the hard half.** A player who stops to type for
-ten seconds is a player whose entire eight-record lookahead has just finished generating,
-including the record they are about to read. The reply has to land on the record *after the
-cursor* — one the queue has already filled with something else. That record must be
-reopened: returned to `Pending`, regenerated with the typed line, rewritten before the
-player advances.
+**The mod takes a record back.** A player who stops to type for ten seconds is a player
+whose entire eight-record lookahead has just finished generating — including the record
+they are about to read. So the reply cannot go to a fresh record; it has to go to one the
+queue has already filled.
 
-Which is safe, for a reason that predates the feature. Ch. 72's invariant —
+```
+poll (peek)  ->  pick target  ->  collect  ->  generate  ->  write
+every ~2s        first unread     consume      player_line   before the
+                 writable record  the line     in the prompt player advances
+```
+
+Which is safe for a reason that predates the feature. Ch. 72's invariant —
 
 > a record is writable until the interpreter reads it, and frozen afterwards
 
-— already says the record after the cursor is fair game. `RecordPlan.IsWritable` enforces
-it, the render freeze protects everything behind it, and `FlushReadyRecords` already refuses
-to write behind the player. The machinery that makes typed input safe was built while fixing
-a bug that had nothing to do with typed input.
+— already says everything at or after `_poolNextRecord[0]` is fair game. The target is the
+first record there that is still writable and big enough to hold a sentence, and
+**deliberately not the first `Pending` one**: the record that needs reopening is usually
+`Written`, holding a line generated before the player typed.
+
+**Peek, pick, then collect — in that order.** Collecting first and then looking for a
+record loses lines: if nothing writable remains ahead, the line is already out of the store
+with nowhere to go. So the mod peeks on a cadence and only the request that will actually
+use a line consumes it. The collection can still come back empty — the line expired, or
+something else took it — and the record is handed back to the ordinary queue rather than
+left `InFlight` for the rest of the scene.
+
+**The typed line jumps the queue** inside the pump, so a tick that could serve either does
+this one. It still waits for any in-flight request, up to about two seconds; cancelling
+that would mean plumbing a `CancellationTokenSource` onto the plan for a saving nobody who
+just spent ten seconds typing is going to notice.
+
+**One race remains, and it is now audible.** If the player advances past the target during
+generation, `FlushReadyRecords` refuses to write behind the cursor — safe, and previously
+silent. A discarded pre-generated line is routine; a discarded *reply to something the
+player typed* is the feature not working, and the two take the same code path. They now log
+differently:
+
+```
+[PLAYER] reopening #12 (holding "Yeah, it was a sweet gym") to answer a typed line
+[PLAYER] #12 answering: "So... how have you been, really?"
+[PLAYER] #12 reply ready (47/60): "Honestly? Been better. But this helps, man."
+[PLAYER] #12 written, 1 ahead of the player
+```
+
+Two smaller things fell out of writing it. The per-record context said *"say something with
+the same purpose"* as the scripted line, which argues directly against the rule that a typed
+line outranks it — a model given two conflicting instructions follows the nearer one, and
+the context is nearer. And a reply addresses **Joker**, not whatever the turn model computed
+for that record: that is not an override of the addressee rule but an application of it,
+since the player just became the most recent speaker.
 
 ### ✅ Speaker attribution
 A rank-up scene is not one person talking. Takemi's involves a patient and her father, and
@@ -465,10 +510,18 @@ gate, and the README listed it as a working component. The reference count that 
 rest could never have found this one; it took asking a different question — not "what is
 unreachable" but "what else writes to the thing I just finished protecting?"
 
-**Next up:** Phase 5's input channel, and an in-game run of the selection-record
-hypothesis. Ch. 80 proposed that `SEL` headers move their count from `0x18` to `0x1A`, the
-parser ships behind the hole mechanism so a wrong guess costs coverage rather than
-correctness, and no live scene has confirmed it yet.
+**Next up:** three things, all of which need the game rather than more code.
+
+- **One session with typed input.** Phase 5 is built and tested but has never run against
+  P5R. The open question is timing: whether a reply lands before the player advances past
+  the record it was written for. `[PLAYER]` log lines report every reopen, every
+  collection, and every reply the player outran.
+- **The selection-record hypothesis.** Ch. 80 proposed that `SEL` headers move their count
+  from `0x18` to `0x1A`. The parser and its synthetic tests exist, and it ships behind the
+  hole mechanism so a wrong guess costs coverage rather than correctness — but no live
+  scene has confirmed it.
+- **Voices for the other 16 confidants.** Eight have a `speech_style`; the rest degrade to
+  a plain register, which is safe and not the same as being in character.
 
 ---
 
@@ -612,7 +665,7 @@ python -m pytest tests/ -q
 
 cd ..
 dotnet test mod/P5RGenSocialLinks.Tests/P5RGenSocialLinks.Tests.csproj
-# 81 passed
+# 104 passed
 ```
 The .NET suite covers the byte-layout parsers — BMD headers, the archive, speaker
 matching, the turn model. Its project links those source files in rather than referencing
@@ -635,8 +688,9 @@ p5r-gen-social-links/
 │   ├── Mod.Pool*.cs             # Arming, cursor tracking, the record writer, heap fallback
 │   ├── Mod.Scene.cs             # The plan: records, capacities, speakers, addressees
 │   ├── Mod.Generation.cs        # Prompt context and the pre-generation queue
+│   ├── Mod.PlayerInput.cs       # Reopening a record to answer a typed line
 │   └── GenDialogue.json         # Runtime config (no recompile needed)
-├── mod/P5RGenSocialLinks.Tests/ # 81 tests (xunit) over the byte-layout parsers
+├── mod/P5RGenSocialLinks.Tests/ # 104 tests (xunit) over the parsers and the wire contract
 ├── server/                      # Python inference server
 │   ├── inference/               # Pipeline, backend seam, llama-server client, queue, postprocessor
 │   │   └── kernels/             # Triton int4 dequant-matmul + its CPU reference
