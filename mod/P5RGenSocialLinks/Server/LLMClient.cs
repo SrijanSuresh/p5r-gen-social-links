@@ -27,6 +27,22 @@ internal sealed class GenerateRequest
     /// falls back to its configured default.
     /// </summary>
     public int?   MaxChars      { get; init; }
+
+    /// <summary>
+    /// Who this line is spoken to, or empty when it is not known.
+    ///
+    /// The prompt assumed Joker was always the listener, which is right for a hang-out
+    /// and wrong for every rank-up scene with a cast: Takemi was telling a patient's
+    /// father about "your parents" and answering a child's question as though the
+    /// protagonist had asked it (Ch. 81).
+    ///
+    /// Empty is meaningful and is not the same as "Joker". The reactive msgId path has no
+    /// record and therefore no turn order to derive this from, and a scene whose archive
+    /// did not resolve knows the turn changed hands without knowing to whom. Both send
+    /// nothing and the server leaves the addressee out of the prompt, which is where it
+    /// was before this field existed.
+    /// </summary>
+    public string Addressee     { get; init; } = string.Empty;
 }
 
 internal sealed class GenerateResponse

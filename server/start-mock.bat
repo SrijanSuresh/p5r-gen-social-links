@@ -10,5 +10,8 @@ if not exist ".wvenv\Scripts\python.exe" (
 )
 
 echo Starting P5R Gen Social Links server (MOCK mode)...
+echo   API           http://127.0.0.1:8765
+echo   Say something http://127.0.0.1:8765/      (type your own line here)
+echo.
 set MOCK_LLM=1
 .wvenv\Scripts\python main.py

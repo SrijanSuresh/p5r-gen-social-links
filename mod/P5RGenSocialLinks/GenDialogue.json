@@ -16,13 +16,16 @@
   // How often (ms) the session-change poll loop runs.
   "poll_interval_ms": 500,
 
-  // Diagnostics for the offset-discovery era: struct field diffs, BF instruction dumps,
-  // the per-message session dumps (BndScan / D0Direct / SessHeapPtrs), and the mapped-file
-  // and UTF-16 heap sweeps.
+  // Log what changed in the CMM session struct between poll ticks.
   //
-  // Keep false during play. The sweeps run every poll tick and scan tens of megabytes
-  // each, which is enough to stutter the game, and the dialogue pool write path does not
-  // depend on any of it. Turn on only when a pool stops being found.
+  // This is all that is left of the offset-discovery diagnostics. The BF instruction
+  // dumps, the per-message session dumps and the mapped-file and UTF-16 heap sweeps are
+  // gone: they answered questions the interpreter hook settled, and two thirds of that
+  // machinery ran on every tick with this switch off.
+  //
+  // What remains is cheap — it reads the struct the poll loop already has and prints the
+  // bytes that moved, which is how the layout in the README was established. Still off by
+  // default, because it prints on every tick a field changes.
   "struct_diff_enabled": false,
 
   // Master switch for writing generated text into the game's dialogue pool.
@@ -40,9 +43,11 @@
   // Fall back to scanning the heap for the dialogue pool.
   //
   // Superseded by the interpreter hook, which gets the region from an address the game
-  // itself read: microseconds instead of 33 seconds, and exact instead of ranked. The
-  // scan also could not start until a message was dispatched, so the opening lines of
-  // every scene played before anything could be written.
+  // itself read: microseconds instead of 33 seconds, and exact instead of ranked.
+  //
+  // It now starts as soon as a hang-out is active. It used to wait for a message id
+  // scraped out of BF bytecode, which cost the opening lines of every scene and quietly
+  // tied this fallback to a diagnostic chain that is no longer there.
   //
   // Turn on only if a scene ends up with no pool armed at all.
   "heap_scan_enabled": false,
@@ -82,6 +87,20 @@
   // confidant is refused rather than filtered, so a broken chain costs the attribution
   // and not the mod. The [SPEAKER] lines report what it did either way.
   "speaker_filter_enabled": true,
+
+  // Tell the server who each line is spoken to, worked out from the order the scene's
+  // speakers take their turns.
+  //
+  // The speaker filter decides whose voice a line is written in. This decides who it is
+  // aimed at — without it the prompt assumes the listener is always Joker, so Takemi told
+  // a sick child's father about "your parents".
+  //
+  // Safer than the filter: this only changes prompt text, so a wrong answer costs one
+  // line's aim and never a byte of game memory. Set false to hear the same scene without
+  // it — the turn order is an inference, not a parse, and that comparison is the only way
+  // to tell whether it is earning its place. The [ADDRESSEE] log line reports what it
+  // decided either way.
+  "addressee_enabled": true,
 
   // Dump the scene archive's header, the bytes ahead of its first line, and its tail.
   // A dozen log lines once per armed scene, on while the BMD interior is being worked out.

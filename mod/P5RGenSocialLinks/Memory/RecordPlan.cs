@@ -85,6 +85,33 @@ internal sealed class RecordPlan
     /// <summary>Resolved display name for <see cref="SpeakerId"/>, when the table is known.</summary>
     internal string Speaker { get; set; } = string.Empty;
 
+    /// <summary>
+    /// Who this line is spoken to, or empty when the scene changed turn to somebody it
+    /// did not name.
+    ///
+    /// Derived from the turn order rather than read from the file, because the format has
+    /// no addressee field and could not have one — the renderer never draws the listener,
+    /// so it was never stored (Ch. 81). Resolved once per plan: it depends only on the
+    /// speaker ids, which are fixed at arm time.
+    ///
+    /// Empty and <see cref="Addressee.Protagonist"/> are different answers. Empty means
+    /// "somebody, but we cannot say who", and the prompt omits the line instead of
+    /// claiming Joker.
+    /// </summary>
+    internal string Addressee { get; set; } = string.Empty;
+
+    /// <summary>
+    /// True when this record is a <c>SEL</c> — the list of replies the player picks from,
+    /// not a line anybody says.
+    ///
+    /// Two separate things need it. It is the one record kind that must never be
+    /// rewritten, because changing what the buttons say without changing what they do is
+    /// worse than a mis-attributed line (Ch. 80). And it is the only place the
+    /// protagonist speaks, so it is his turn as far as the addressee model is concerned
+    /// (Ch. 81) — a confidant answering a menu choice is answering Joker.
+    /// </summary>
+    internal bool IsSelection { get; set; }
+
     internal RecordState State { get; set; } = RecordState.Pending;
 
     /// The generated replacement, once it exists.
@@ -111,11 +138,21 @@ internal sealed class RecordPlan
     /// </summary>
     internal bool WasWritten { get; set; }
 
+    /// <summary>
     /// True while the record may still be overwritten. Written is included on purpose:
     /// a pre-generated line is a floor that a reactive generation is allowed to raise,
     /// right up until the interpreter reads it.
+    ///
+    /// <see cref="IsSelection"/> is checked here rather than in the speaker filter because
+    /// Ch. 80's rule is "never, regardless" and the filter is none of those things: it can
+    /// be switched off in <c>GenDialogue.json</c>, it goes idle when a scene's archive does
+    /// not resolve, and it declines to act at all when nothing attributes to the confidant.
+    /// A selection survived every one of those paths — protected only incidentally, by
+    /// having no speaker to match. Protection that depends on a config flag is not the
+    /// rule the chapter states.
+    /// </summary>
     internal bool IsWritable =>
-        State != RecordState.Rendered && State != RecordState.Foreign;
+        !IsSelection && State != RecordState.Rendered && State != RecordState.Foreign;
 
     public override string ToString()
     {

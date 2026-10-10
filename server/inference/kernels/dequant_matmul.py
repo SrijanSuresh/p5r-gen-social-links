@@ -22,6 +22,8 @@ import triton                           # type: ignore[import-untyped]
 import triton.language as tl            # type: ignore[import-untyped]
 import torch
 
+from inference.kernels.reference import check_shapes
+
 
 @triton.autotune(
     configs=[
@@ -81,33 +83,49 @@ def dequant_matmul_kernel(
         a_tile = tl.load(a_ptrs, mask=a_mask, other=0.0).to(tl.float16)
 
         # ── Load packed int4 weights W_packed[k_offs//2, col_offs] ──────────
-        # Two int4 values packed per byte along the K dim → address is k//2
+        # Two int4 values share a byte along K, so the byte for k lives at row k//2.
+        # Adjacent k map to the same row on purpose: k and k+1 are the two halves of
+        # one byte, and loading it twice is cheaper than loading half a tile.
         wp_row  = k_offs // 2                                     # [BLOCK_K]
         wp_mask = (wp_row[:, None] < K // 2) & (col_offs[None, :] < N)
         wp_ptrs = W_packed_ptr + wp_row[:, None] * N + col_offs[None, :]
         w_packed = tl.load(wp_ptrs, mask=wp_mask, other=0).to(tl.int8)
 
-        # ── Unpack two int4 values from each byte ────────────────────────────
-        # Low nibble  → weights for even k indices
-        # High nibble → weights for odd  k indices
-        w_lo = (w_packed & 0x0F).to(tl.float16)   # bits [3:0]
-        w_hi = ((w_packed >> 4) & 0x0F).to(tl.float16)  # bits [7:4]
+        # ── Pick the nibble that belongs to each k ───────────────────────────
+        # Mask before shifting: a byte arrives signed, so the high nibble of 0x9F has
+        # to come out as 9 rather than sign-extended to -7.
+        w_lo = (w_packed & 0x0F)                  # bits [3:0] -> even k
+        w_hi = ((w_packed >> 4) & 0x0F)           # bits [7:4] -> odd  k
 
-        # ── Load scale and zero-point for this K group ───────────────────────
-        group_id = k_start // group_size
-        s_ptrs = scales_ptr + group_id * N + col_offs
-        z_ptrs = zeros_ptr  + group_id * N + col_offs
-        s = tl.load(s_ptrs, mask=col_offs < N, other=1.0).to(tl.float16)
-        z = tl.load(z_ptrs, mask=col_offs < N, other=0  ).to(tl.float16)
+        # A select on the parity of k, not a slice. The previous version wrote
+        # `a_tile[::2, :]`, which slices the activation tile's FIRST axis — that axis is
+        # M, not K, so it halved the output rows rather than splitting the reduction, and
+        # the resulting [BLOCK_M//2, BLOCK_N] product could not be accumulated into a
+        # [BLOCK_M, BLOCK_N] tile at all (learning.md Ch. 85).
+        k_is_even = (k_offs % 2) == 0                             # [BLOCK_K]
+        w_q = tl.where(k_is_even[:, None], w_lo, w_hi).to(tl.float16)
+
+        # ── Load scale and zero-point per k, not per tile ────────────────────
+        # Scales are indexed by (group, column) where a group is `group_size` consecutive
+        # k. Reading one group for the whole chunk is only right while BLOCK_K never
+        # crosses a boundary — and the autotuner above offers BLOCK_K=64 against a
+        # group_size that is routinely 32, which silently dequantizes half the tile with
+        # the wrong scale. Indexing per k costs a wider load and cannot go wrong.
+        groups  = k_offs // group_size                            # [BLOCK_K]
+        sz_mask = (k_offs[:, None] < K) & (col_offs[None, :] < N)
+        s_ptrs  = scales_ptr + groups[:, None] * N + col_offs[None, :]
+        z_ptrs  = zeros_ptr  + groups[:, None] * N + col_offs[None, :]
+        s = tl.load(s_ptrs, mask=sz_mask, other=1.0).to(tl.float16)
+        z = tl.load(z_ptrs, mask=sz_mask, other=0  ).to(tl.float16)
 
         # ── Dequantize: float_weight = (int4 - zero) * scale ────────────────
-        w_lo_f = (w_lo - z[None, :]) * s[None, :]
-        w_hi_f = (w_hi - z[None, :]) * s[None, :]
+        # Elementwise now that s and z are [BLOCK_K, BLOCK_N] like the weights.
+        w_f = (w_q - z) * s
 
-        # ── Accumulate: reconstruct full BLOCK_K × BLOCK_N contribution ─────
-        # Interleave lo/hi to recover the original K ordering
-        acc += tl.dot(a_tile[::2, :],  w_lo_f)   # even k rows × lo weights
-        acc += tl.dot(a_tile[1::2, :], w_hi_f)   # odd  k rows × hi weights
+        # ── Accumulate the whole BLOCK_K × BLOCK_N contribution ─────────────
+        # One dot over the full tile: the K ordering was reconstructed by the select
+        # above, so there are no halves left to interleave.
+        acc += tl.dot(a_tile, w_f)
 
     # ── Write output tile ────────────────────────────────────────────────────
     out_mask = (row_offs[:, None] < M) & (col_offs[None, :] < N)
@@ -122,9 +140,22 @@ def dequant_matmul(
     zeros: torch.Tensor,
     group_size: int = 128,
 ) -> torch.Tensor:
-    """Python launch wrapper for the Triton kernel."""
+    """
+    Python launch wrapper for the Triton kernel.
+
+    Correctness is pinned by ``inference.kernels.reference``, which implements the same
+    contract in plain Python and runs without a GPU. ``tests/test_kernel.py`` compares the
+    two whenever CUDA is present; ``tests/test_kernel_reference.py`` tests the contract
+    itself everywhere.
+    """
     M, K = a.shape
-    _, N = w_packed.shape[0] * 2, w_packed.shape[1]  # unpack K from packed dim
+    N = w_packed.shape[1]
+
+    # K arrives twice — from the activations and from the packed row count — and a
+    # disagreement is a caller bug that would otherwise read as noise in the output.
+    # Checked by the reference module so the rule holds for both implementations and can
+    # be tested without a GPU.
+    check_shapes(K, w_packed.shape[0], group_size)
 
     out = torch.empty((M, N), device=a.device, dtype=torch.float16)
 

@@ -6335,3 +6335,507 @@ This is the same defect as the 429 storm of Ch. 72, in the same place, found the
 by reading the *server's* log because the mod's log was silent. The rule that keeps being
 relearned is that a failure which is handled is not a failure which is understood, and the
 handler is exactly where the log line belongs.
+
+## Chapter 81: The Format Knows Who Talks, Not Who Listens
+
+Attribution closed one half of a question and made the other half visible. The BMD tells us
+who speaks a line, so Takemi's patient no longer gets rewritten in Takemi's voice. What the
+file does not contain anywhere is who a line is spoken *to*.
+
+The symptom, from the clinic scene:
+
+```
+[SPEAKER]   [0] Takemi
+[SPEAKER]   [1] Girl's Father
+[SPEAKER]   [2] Sick Girl
+```
+
+Three people in a room, and a prompt that says — in every one of the three world-grounding
+strings — `"Joker — the person you are talking to"`. So Takemi gets handed a father asking
+about his daughter's treatment and answers the protagonist. She tells the father about
+"your parents". She answers a nine-year-old's "can I go to school tomorrow?" with a line
+pitched at a high-school boy who is standing silently in the corner.
+
+Every one of those is the same defect: the scene has a speaker and an addressee, and only
+one of them is modelled.
+
+### Why there is nothing to parse
+
+The instinct after Ch. 79 is to go looking for an addressee field. There isn't one, and the
+reason is structural rather than an oversight.
+
+`MessageDialog` is 24 bytes of name, a page count, a speaker id, and a page table. That is
+the whole header. The renderer needs a speaker id because it draws the name above the
+bubble — the addressee is never drawn, so the renderer never needs it, so it was never
+stored. A format stores what its consumer reads.
+
+This is the opposite situation to the one the project has been in for eighty chapters. The
+lesson of Ch. 65 was *ask the consumer, not the heap*: stop inferring what the game can
+hand you. Here the game cannot hand us anything, because it never knew. Inference is not
+the lazy option this time; it is the only option, and the job is to pick an inference whose
+failures are cheap.
+
+### Turn-taking is observable even when the addressee is not
+
+What the archive does give us is the full sequence of speakers, in script order, for the
+whole scene — including records the player has not reached. That is enough for a turn model:
+
+```
+line i-1   spoken by  Girl's Father
+line i     spoken by  Takemi          →  Takemi is answering the Girl's Father
+```
+
+Three rules cover the scene:
+
+1. **The previous line was someone else's** → they are the addressee. You answer whoever
+   just spoke to you. This is the case that fixes the clinic.
+2. **The previous line was also yours** → the addressee carries forward. A character
+   speaking three bubbles in a row is still talking to the same person; the turn did not
+   change hands just because their sentence ran long.
+3. **There is no previous line** → the addressee is Joker. A hang-out exists because the
+   player initiated it, and the opening line of a scene is aimed at them.
+
+Rule 3 is also the whole-scene answer for a solo hang-out, which is most of them. Ryuji at
+the gym is 21 records of Ryuji, so rule 2 carries Joker forward from rule 3 and the
+addressee never changes. The model has to be right about the common case before it is
+allowed to be clever about the rare one.
+
+### The protagonist is a party to every scene and a speaker in none
+
+Joker never appears in a speaker table. He is silent by design — the player's lines are
+menu selections, which is exactly why `SEL` records exist and why rewriting one changes
+what a button says without changing what it does.
+
+So the addressee set is not the speaker table. It is the speaker table **plus** the
+protagonist, and the protagonist is the default. That asymmetry is worth stating in code
+rather than leaving implicit, because "who can be addressed" and "who can speak" look like
+the same list right up until the silent party matters.
+
+### Where the addressee goes in the prompt, and why it is not the system half
+
+The obvious place is the system prompt, next to the character notes. That would be a
+measurable mistake.
+
+Ch. 72's note on `max_chars` applies directly: llama-server reuses the KV cache for the
+longest identical prefix between requests, the system prompt is that prefix, and baking a
+per-record number into it took generation from ~1.5 s to ~3.5 s. The addressee is not quite
+per-record — it is stable for long runs and changes only when the turn does — but a
+three-party scene changes it often enough to cost real cache invalidations, and there is no
+upside to paying them.
+
+So the restructuring is:
+
+- **System half** becomes addressee-neutral. The world grounding stops saying "Joker — the
+  person you are talking to" and says only what is permanently true: that Joker leads the
+  Phantom Thieves, or that you do not know he does.
+- **User half** carries `[You are speaking to: …]`, alongside the character budget that is
+  already there for the same reason.
+
+That split is the actual fix. The two facts were conflated in one string — who Joker is in
+the world, and who happens to be listening right now — and only the first belongs in a
+cached prefix. Pulling them apart is what lets the second one vary at all.
+
+### What failure looks like
+
+Rule 1 is wrong whenever a scene has a character answer someone other than the last
+speaker, which real dialogue does. The cost is a line aimed at the wrong person in a room
+where both are present — which is the current behaviour for every multi-party line, so the
+floor does not move.
+
+Rule 3 is wrong when a scene opens mid-conversation between two NPCs. Same floor: today
+that line is aimed at Joker too.
+
+This is the shape to want from an inference. It cannot do worse than the assumption it
+replaces, because the assumption it replaces is one of its own cases.
+
+## Chapter 82: Four Thousand Lines Is Not a Design
+
+`Mod.cs` is 4,219 lines. The README describes it as "entry point, poll loop, hook wiring",
+which was true at a few hundred lines and is now a polite fiction: it holds 160 members,
+61% of the C# in the project, and the file is the only thing they have in common.
+
+It got there honestly, and that is the part worth understanding. Nothing in this project
+was designed up front, because nothing could be — the whole point of chapters 50 through
+80 was that the memory layout was unknown and every hypothesis about it was wrong at least
+once. When you do not know whether a buffer is ASCII or UTF-16, in the heap or the mapped
+file, the cheapest place to put the next probe is next to the last probe. Each one of those
+decisions was right. The sum of them is a god object.
+
+### What a split can and cannot fix
+
+C# `partial` lets one class live in several files. That is exactly the right tool here and
+it is important to be clear about how little it does:
+
+- **It does not change behaviour.** The compiler concatenates the parts. Same class, same
+  fields, same accessibility, same emitted IL.
+- **It does not decouple anything.** Every part still reaches the same 50-odd private
+  fields. `_plan`, `_poolSlots`, `_writeLock` and `_bmdTextPool` remain shared mutable
+  state; moving a method to another file does not make it stop touching them.
+- **It does make the shape visible.** Once the offset-discovery code sits in
+  `Mod.Discovery.cs` and nothing else references it, the question "is any of this still
+  load-bearing?" becomes answerable by reading one file instead of grepping 4,000 lines.
+
+That last point is the whole justification. This is not the refactor; it is the measurement
+that makes the refactor safe. Ch. 73 deleted the heap search only after the hook made it
+provably redundant, and the same order applies here: separate first, then delete what the
+separation shows to be unreachable.
+
+### Why extraction, not decomposition
+
+The honest decomposition is to pull the pool writer and the scene planner into their own
+classes with their own state. That is a bigger change than it looks: `TryArmFromRecord`
+writes `_poolSlots`, `_poolRecords`, `_poolNextRecord` and `_plan`, and `AdvancePoolCursor`
+reads three of those and mutates the fourth. Splitting them into real objects means
+deciding who owns the cursor, and getting that wrong reintroduces Ch. 71 — two bugs behind
+one cursor that different events moved for different reasons.
+
+So the state stays where it is, and only the code moves. A change that cannot alter
+behaviour is one the build and 81 tests can fully verify, which is the right kind of change
+to make to code that runs inside somebody else's process.
+
+### The boundary problem, and why formatting solved it
+
+Moving whole members out of a file by machine needs to know where each one ends. Brace
+counting is the obvious approach and it is wrong in general: a brace inside a string
+literal or a comment counts the same as a real one.
+
+This file happens to make it easy. Every member is declared at four-space indent, and
+nested blocks inside a method are indented deeper, so a line matching `^    \}` can only be
+a member's close. Expression-bodied members open no brace at all and end on their
+semicolon. Running both rules over the whole file found 160 members with zero overlaps and
+left exactly five lines outside any of them — the class declaration, its opening brace, and
+three section-divider comments.
+
+That last number is the check that mattered. A boundary finder that is subtly wrong does
+not fail loudly; it moves half a method and the error surfaces as a compile error in a file
+you were not editing. Counting what the tool *failed* to classify, and recognising all five
+of them, is cheaper than trusting it.
+
+### The six files
+
+| Part | What belongs in it |
+|---|---|
+| `Mod.cs` | Fields, `Start`, the poll loop, Reloaded's lifecycle entry points |
+| `Mod.Hooks.cs` | The injected-code surface: every hook's setup and its callback |
+| `Mod.Pool.cs` | Arming a region, tracking the cursor, writing bytes and mirroring the twin |
+| `Mod.Scene.cs` | The plan: what records a scene has, who speaks them, who they are spoken to |
+| `Mod.Generation.cs` | Prompt context, the pre-generation queue, talking to the server |
+| `Mod.Discovery.cs` | The offset-discovery era, kept together so it can be judged together |
+| `Mod.Text.cs` | ASCII and English-shape heuristics, used by several of the above |
+
+`Mod.Discovery.cs` is the one with a purpose beyond tidiness. It is a holding pen: the
+answer to "what did we stop needing when the interpreter hook landed?" and the subject of
+the next chapter.
+
+## Chapter 83: The Diagnostic That Was Load-Bearing
+
+With the offset-discovery code gathered into one file, the question Ch. 82 set up became
+answerable: how much of it is still reachable? The answer was not the one I expected, and
+the interesting part is the thing that nearly went wrong.
+
+### Counting callers is the easy half
+
+A reference count over all nine source files sorted the 22 members of `Mod.Discovery.cs`
+into three groups:
+
+```
+TryReadString                  NO CALLERS                       DEAD
+TryLogBmdStrings               NO CALLERS                       DEAD
+TryWriteToSessionDesc          NO CALLERS                       DEAD
+FollowTextObjChain             Mod.Discovery.cs only            internal-only
+ProbeD0Array                   Mod.Discovery.cs only            internal-only
+...
+FindAsciiEnglishBuf            Generation, Pool, Pool.Scan      LIVE
+TryFindBfBuffer                Mod.cs                           LIVE
+```
+
+Three members have no callers at all. `SetupBfDispatchHook` turned out to be the same
+story one level up: the BF opcode dispatch hook is written, has a delegate, a field and a
+callback — and nothing ever calls the setup method, so that hook has never been installed
+in any session. Dead code that *looks* like an active hook is worse than dead code, because
+every future reader has to work out whether the game is being patched or not.
+
+### "Referenced from live code" is not the same as "on a live path"
+
+The members marked LIVE above are called from `PollLoopAsync` — but a call site in the poll
+loop can still sit inside `if (_cfg.StructDiffEnabled)`, which `GenDialogue.json` describes
+as "diagnostics for the offset-discovery era" and ships `false`. Checking the gate at each
+site, rather than the file it lives in, split LIVE again:
+
+| Entry point | Gate |
+|---|---|
+| `TryFindBfBufferFromSnapshot`, `ProbeBfLine`, `TryReadTextAddr` | `struct_diff_enabled` |
+| `TryScanBmdVicinity`, `SweepHeapForUtf16` | `struct_diff_enabled` |
+| `TryFindBfBuffer` | **none — every poll tick** |
+| `OnGameMemcpy` | **none — installed in `Start`** |
+
+So two thirds of the BF-script discovery chain runs in every session with diagnostics off.
+`OnGameMemcpy` is the expensive one: it hooks a function its own comment calls "one of the
+hottest functions in the process", and what it does there is collect up to 150 large-copy
+destinations and log up to 40 UTF-16 strings — both of them answers to questions that
+Ch. 60 and Ch. 65 settled. Deleting it removes a patch from somebody else's process, which
+is the best kind of deletion this project has.
+
+### The trap
+
+The chain is: `OnGameMemcpy` fills `_largeCopyDsts` → `TryFindBfBuffer` finds
+`_bfBufferBase` → `ProbeBfLine` scrapes `_currentMsgId` out of BF bytecode.
+
+`_currentMsgId` is diagnostics. Except for this line in the poll loop:
+
+```csharp
+if (_cfg.HeapScanEnabled && _currentMsgId != 0 && _heapPools.Count == 0)
+    TryFindHeapDialoguePool();
+```
+
+`heap_scan_enabled` is the fallback the config promises for "a scene that ends up with no
+pool armed at all" — deliberately kept. And its trigger condition is `_currentMsgId != 0`,
+which is set *only* by the diagnostic chain I was about to delete. Deleting it would have
+left the switch in place, the function in place, the config comment in place, and the
+fallback permanently unable to fire. Nothing would have failed; a safety net would just
+have quietly stopped existing.
+
+This is a specific, recurring shape: a diagnostic grows a second job, and nothing in the
+code says so. The reference count sees `_currentMsgId` used in both places and cannot tell
+which use is incidental.
+
+### Fixing the trigger before removing its source
+
+The fix is not to keep the chain. It is to notice that the precondition was never the right
+one. "A message id has been scraped out of BF bytecode" is an artefact of how the pool used
+to be found, and the config comment already names the cost:
+
+> The scan also could not start until a message was dispatched, so the opening lines of
+> every scene played before anything could be written.
+
+What the heap scan actually needs is a hang-out in progress, which the mod knows directly
+from the CMM session read. Re-triggering it on that fixes the stated defect — the scan can
+start when the scene arms instead of after the first line — and the dependency on the BF
+chain disappears as a side effect rather than as a sacrifice.
+
+Order matters: the trigger changes first, in its own commit, while the old source is still
+there to compare against. Then the chain goes.
+
+### What survives, and why
+
+`FindAsciiEnglishBuf` has three callers on live paths — the scene-script capture, the pool
+writer, and the heap scan. It is not discovery code at all; it was only ever filed next to
+it. It moves to `Mod.Text.cs` with the other recognisers.
+
+The rest of the ASCII and English-shape heuristics stay too, for the reason Ch. 82 gave:
+they stopped being a way of *locating* the pool and remain a way of *recognising* a line
+once an address is in hand. The interpreter serves menus and item names through the same
+loop, and arming on a record still requires the preview to look like dialogue.
+
+## Chapter 84: Two Writers, and Only One of Them Knew the Rules
+
+Deleting the discovery chain left a question I had not thought to ask: how many things in
+this mod write dialogue into the game?
+
+The answer was two, and the second one had been there the whole time.
+
+### The path nobody was looking at
+
+`DialogueBridge` is the Phase 2 design, preserved intact. `OnCmmExecEvent` fires once per
+hang-out line and calls it:
+
+```csharp
+if (_bridge!.PoolBase == 0 && fireCount <= 5)
+{
+    nuint pool = DialogueTextPoolFinder.Find(session, ...);
+    if (pool != 0) _bridge!.SetPoolBase(pool);
+}
+_bridge!.DispatchAsync(snap, ContextBuilder.Build(snap), lineIndex: fireCount, ...);
+```
+
+and inside `DispatchAsync`, after its own HTTP round trip:
+
+```csharp
+int targetSlot = capturedLineIndex + 1;
+bool wrote = DialogueWriter.WriteAtLineIndex(capturedPool, targetSlot, text);
+```
+
+`WriteAtLineIndex` finds its target by counting null terminators from the pool base. That
+is the model of the buffer from Ch. 58 — a pile of strings — which Ch. 66 replaced with the
+MSG1 format. Every safety rule learned after Phase 2 lives in the record-indexed writer and
+none of them lives here:
+
+| Rule | Where it is enforced | Does the legacy writer obey it? |
+|---|---|---|
+| Freeze a record once the interpreter reads it (Ch. 71) | `RecordState.Rendered` | No |
+| Leave another speaker's lines alone (Ch. 77) | `RecordState.Foreign` | No |
+| Never rewrite a selection (Ch. 80) | `RecordPlan.IsWritable` | No |
+| Verify the twin byte-for-byte before mirroring (Ch. 66) | `MirrorToTwin` | No |
+| Clamp to the record's own capacity | `WriteRecord` | Only to the string's length |
+
+I had just finished moving the selection guard out of the speaker filter and into
+`IsWritable`, on the grounds that protection which depends on a config flag is not the rule
+Ch. 80 states. That reasoning was right and the conclusion was incomplete: a guard on one
+writer is not a rule about the system when a second writer exists.
+
+### It was also competing for the one inference slot
+
+The server runs one generation at a time and answers 429 to anything overlapping — Ch. 72
+is entirely about scheduling around that. `DispatchAsync` makes its own request on every
+CMM event, with its own 3-second throttle, for a line the pre-generation queue is also
+planning to produce. Two independent schedulers against a single-slot server, and only one
+of them was being measured.
+
+Its request is also the Phase 2 shape: session-level context, no record capacity, no
+speaker, and — as of yesterday — no addressee. So the better path and the worse path were
+racing, and the worse one wrote last.
+
+### Why this was invisible
+
+Nothing about it looks dead. `_bridge` is non-null, `DispatchAsync` is called from two
+places, the write is logged, and `DialogueTextPoolFinder` is a real function that really
+searches. The README even lists `DialogueBridge` as a live component — "LLM dispatch,
+throttle, session history, hash-based dedup" — all of which it genuinely does.
+
+What made it survive is that it fails *quietly*. If `DialogueTextPoolFinder.Find` returns
+zero, `capturedPool` is zero, the write is skipped, and the only cost is a wasted
+inference. The log line for that case says "Write-back: FAILED", which reads as a known
+limitation rather than as a second writer that occasionally succeeds.
+
+The reference count in Ch. 83 could never have found this. Every symbol involved is
+referenced, from live code, with no config gate. It took asking a different question —
+not "what is unreachable" but "what else does the thing I am protecting?"
+
+### What goes
+
+`DialogueBridge`, `DialogueWriter`, `DialogueTextPoolFinder` and `SessionHistory` all
+belong to that one path and go together. `ContextBuilder` stays: the record-indexed
+generator still opens every prompt with it.
+
+The `!_hookActive` fallback in the poll loop went too. It existed so that a build where the
+interpreter signature failed to resolve would still generate *something* — but what it
+generated was written by the legacy writer, so with that writer gone the fallback produces
+a line nobody can place. A mod that cannot find the interpreter now says so and leaves the
+scripted dialogue alone, which is the behaviour the project has chosen every other time the
+question came up.
+
+## Chapter 86: A Kernel Is Not an Engine
+
+With the kernel corrected and its contract pinned, the obvious next question is what it
+would take to actually serve a request through it. The answer is worth writing down,
+because the kernel's existence makes the Triton backend look much closer than it is.
+
+`dequant_matmul` computes `a @ dequantize(W)` for one quantized weight matrix. That is the
+arithmetic inside **one linear layer**. Llama-3.1-8B has 32 blocks, each containing four
+projections in attention and three in the MLP, and around all of that sits everything the
+kernel does not do:
+
+| Missing | Why it is not optional |
+|---|---|
+| Weight loader | The packed int4 layout has to come from somewhere. GGUF stores Q4_K_M, which is a different packing from the one `reference.py` documents — blocks of 32 with their own super-scales, not two plain nibbles per byte. |
+| Tokenizer | A prompt is text; the kernel consumes tensors. |
+| RMSNorm, RoPE, attention, SwiGLU | A transformer block is mostly *not* matmuls, and the parts that are not are where the subtle bugs live. |
+| KV cache | Without one, generating the 32nd token re-reads the whole prompt. This is the difference between a second a line and a minute a line. |
+| Sampling | Temperature, top-p and repetition penalty are already in `ModelConfig` and already shape the prompt's expectations. |
+| Chat-completions shim | So `InferencePipeline` does not change — see below. |
+
+That last row is the one piece already paid for. `ChatCompletionBackend` in `pipeline.py` is
+a `Protocol`, structural rather than nominal, which is what let inference move out of
+process in Ch. 62 without touching the pipeline's logic. Anything that answers
+`create_chat_completion` satisfies it — `llama_cpp.Llama` did, `LlamaServerClient` does, a
+`MagicMock` does under test. A Triton engine would too, and the pipeline would not notice.
+
+### The seam, and why it refuses loudly
+
+`INFERENCE_BACKEND` now selects between `llama` and `triton`. Selecting `triton` does not
+half-work: it raises with the table above rendered as a list, and tells you to run with the
+default. Two error types, because the remedies differ — `UnknownBackendError` for a
+misspelled name, which the person who set the variable fixes, and `BackendNotBuiltError`
+for this, which somebody fixes by writing code.
+
+Neither stops the API from starting. The mod already treats an unreachable server as
+"leave the scripted dialogue alone", so a server that comes up and answers 503 is strictly
+better than one that refuses to boot: the failure is visible in one place, in a log line
+that explains itself, instead of arriving as a connection error the mod cannot describe.
+
+### Why name the gap at all
+
+The alternative is a `TODO` and a half-built module, and this project has already seen
+what that costs. The Triton kernel sat in the repo for eighty chapters looking finished —
+autotuner, five configs, forty lines of block-pointer commentary, a test — and did not
+compile. Nothing lied; the code simply implied more than it delivered, and the three
+layers of test infrastructure that should have said so were all pointed slightly away.
+
+A list of six concrete missing pieces cannot imply that. It is also the honest answer to
+"is the Triton backend done", which is a question the README was close to answering wrong.
+
+## Chapter 87: The Input Channel Was Never the Hard Part
+
+Phase 5 is the player typing their own line and the NPC answering it. The README has
+carried the same note for weeks: "the timing is already solved... what remains unsolved is
+the input channel itself (Reloaded console, a server-hosted page, or an in-game field with
+IME work)."
+
+Three options, and the choice is less balanced than it looks.
+
+**An in-game text field** is the one that would feel right and the one nobody should build
+first. P5R draws its own UI; a field means hooking the input path, rendering glyphs with
+the game's own font atlas, and handling IME composition for anybody typing Japanese. Every
+one of those is a project, and all three have to work before a single line can be typed.
+
+**The Reloaded console** is nearly free and nearly useless. It is a separate window, so
+typing into it means alt-tabbing out of a fullscreen game, and it is not guaranteed to be
+visible at all — the loader can run without a console attached.
+
+**A page served by the Python server** costs almost nothing, because every piece of it
+already exists. The server is already running, already on loopback, already a hard
+dependency, and already the thing that builds prompts. A browser already solves text entry,
+IME, clipboard, and font rendering. So the channel is one route that accepts a string and
+one page that posts to it.
+
+That is the whole decision, and it is the easy half.
+
+### What is actually hard: the typed line has to arrive on the right record
+
+Pre-generation exists because reacting cannot win. Inference sustains ~0.7 lines/sec and a
+reader advances at up to 1.7, so the queue runs eight records ahead of the player (Ch. 72).
+
+Now consider a player who stops and types for ten seconds. That pause is exactly when the
+queue catches up: by the time they press enter, all eight lookahead records have been
+generated and written, including the one they are about to read. The reply to their line
+needs to land on the record right after the cursor — which is a record the queue has
+already filled with something else.
+
+So the typed line cannot simply be appended to the next request that happens to arrive.
+The next request is for a record the player will not reach for several bubbles. Answering
+there produces a confidant who responds to something said half a scene ago, which is worse
+than not having the feature.
+
+The record after the cursor has to be **reopened** — returned to `Pending`, regenerated
+with the typed line in its context, and rewritten before the player advances. Which is
+safe to do, and safe for exactly the reason Ch. 72 established as an invariant:
+
+> A record is writable until the interpreter reads it, and frozen afterwards.
+
+The record after the cursor has not been read. `RecordPlan.IsWritable` already says so, the
+render freeze already protects everything behind it, and `FlushReadyRecords` already
+refuses to write behind the player. The machinery that makes typed input safe was built
+while fixing a bug that had nothing to do with typed input.
+
+### Why the server holds the line rather than the mod asking for it
+
+The mod polls; it does not listen. There is no socket into the game process, and adding one
+means another thread inside somebody else's address space for no gain.
+
+So the page posts to the server, the server holds one pending line with a timestamp, and
+the mod consumes it on a poll it is already making. One line, not a queue: if the player
+types twice before the mod picks it up, the second line is the one they meant. And a
+timestamp, because a line typed and then abandoned — the player closes the tab, or walks
+away — must not surface in a scene half an hour later. It expires.
+
+### The shape of the slice
+
+What lands here is the channel and the prompt support: a store, two routes, a page, and
+`player_line` threaded into the user half of the prompt next to the addressee, where it
+belongs — Joker's line is the thing being replied to, and the system prompt stays
+byte-identical so the KV-cache prefix survives (Ch. 81).
+
+What does not land here is the mod reopening the record. That needs a poll, a state
+transition back to `Pending`, and a decision about what happens when the player advances
+mid-generation. It is named in the README as the remaining work rather than implied by a
+feature that half-exists — which is the mistake Ch. 85 and Ch. 86 are both about.

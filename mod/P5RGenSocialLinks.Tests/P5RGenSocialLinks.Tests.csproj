@@ -23,6 +23,10 @@
              Link="Memory/SpeakerMatch.cs" />
     <Compile Include="../P5RGenSocialLinks/Memory/ConfidantNames.cs"
              Link="Memory/ConfidantNames.cs" />
+    <Compile Include="../P5RGenSocialLinks/Memory/Addressee.cs"
+             Link="Memory/Addressee.cs" />
+    <Compile Include="../P5RGenSocialLinks/Memory/RecordPlan.cs"
+             Link="Memory/RecordPlan.cs" />
   </ItemGroup>
 
   <ItemGroup>

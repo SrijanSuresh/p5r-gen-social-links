@@ -2,7 +2,11 @@ name: CI
 
 on:
   push:
-    branches: ["main", "feature/**"]
+    # Both prefixes on purpose. CLAUDE.md mandates feat/<short-topic> and every branch
+    # since feat/dialogue-text-ptr-confirm has used it, so a pattern matching only
+    # feature/** meant no push to a current branch ran CI at all — the first signal
+    # arrived when the PR was opened, after the work was finished.
+    branches: ["main", "feat/**", "feature/**"]
   pull_request:
     branches: ["main"]
 
@@ -25,8 +29,13 @@ jobs:
       - name: Install dev dependencies
         run: pip install -r requirements-dev.txt
 
+      # test_kernel.py is no longer excluded. It used to fail collection without torch;
+      # now torch lives behind a try/except and the GPU cases skip with a reason that says
+      # which dependency is missing. Excluding the file by name is part of how a compile
+      # error in the kernel stayed hidden for eighty chapters (learning.md Ch. 85), and
+      # the contract those cases check is covered on the CPU by test_kernel_reference.py.
       - name: Run tests (no GPU, no model)
-        run: python -m pytest tests/ --ignore=tests/test_kernel.py -v
+        run: python -m pytest tests/ -v
 
   dotnet-build:
     name: Mod build (.NET)

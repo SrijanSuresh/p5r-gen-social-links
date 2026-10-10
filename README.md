@@ -5,7 +5,7 @@
 A [Reloaded-II](https://reloaded-project.github.io/Reloaded-II/) mod that replaces Persona 5 Royal's scripted Social Link dialogue with live AI generation — running entirely on your local GPU. No cloud, no API keys, no internet. Every conversation is unique.
 
 [![CI](https://github.com/SrijanSuresh/p5r-gen-social-links/actions/workflows/ci.yml/badge.svg)](https://github.com/SrijanSuresh/p5r-gen-social-links/actions/workflows/ci.yml)
-![Tests](https://img.shields.io/badge/tests-234%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-424%20passing-brightgreen)
 ![.NET](https://img.shields.io/badge/.NET-8.0-512BD4)
 ![Python](https://img.shields.io/badge/Python-3.13-3776AB)
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D4)
@@ -79,11 +79,11 @@ pool is *and* how far the player has got, and the mod writes ahead of that posit
 |---|---|---|
 | `PointerChainResolver` | C# | Walks `[moduleBase + 0x2A63EF0] → [CMM + 0x48]` to find the active session struct, VirtualQuery-guarding every dereference |
 | `SocialLinkReader` | C# | Reads confidant ID, rank level, and scene number from the resolved struct |
-| `LineCounterMonitor` | C# | Polls `0x006FFC28` (discovered via Cheat Engine) — fires on each dialogue line advance |
-| `DialogueBridge` | C# | Leading-edge throttle (3s), rolling session history (8 entries), hash-based dedup, context budget management |
+| `AdvancePoolCursor` | C# | Turns the hook's record pointer into a position in the plan, and freezes every record at or behind it |
+| `Addressee` | C# | Derives who each line is spoken to from the order the scene's speakers take their turns |
 | `MsgInterpreterWatch` | C# | Five injected instructions ahead of `P5R.exe+17A3D27` copy the record pointer and cursor to a fixed slab; a 5 ms sampler turns that into a sequence |
 | `RecordPlan` | C# | Per-record life cycle — Pending → InFlight → Ready → Written → Rendered — plus capacity and the scripted line being replaced |
-| `DialogueWriter` | C# | Legacy write-back stub, superseded by record-indexed writes in `Mod.cs` |
+| `Mod.Text.cs` | C# | ASCII and English-shape heuristics — no longer how the pool is *found*, still how a line is *recognised* |
 | `InferencePipeline` | Python | Builds character-faithful prompts with rank-tier emotional guidance, then calls the backend |
 | `LlamaServerClient` | Python | HTTP client for `llama-server`, speaking OpenAI chat-completions |
 | `LlamaServerProcess` | Python | Spawns and supervises `llama-server.exe`; waits for weights, reaps on exit |
@@ -103,8 +103,8 @@ Switched backend from auto-gptq to llama-cpp-python. Wired real Llama-3.1-8B-Ins
 **Confirmed working:**
 - All 22 Social Link characters recognised by the inference pipeline
 - Real inference latency: <2s on RTX 4060 after CUDA warmup
-- Per-line trigger: `LineCounterMonitor` fires on each dialogue advance
-- CI: GitHub Actions runs Python tests + .NET build on every push
+- Per-line trigger: the interpreter hook reports each record as it is read (it replaced an `0x006FFC28` line-counter poll found in Cheat Engine)
+- CI: GitHub Actions runs Python tests, the .NET build and the .NET parser tests on every push
 
 ### ✅ Phase 3 — Dialogue write-back
 
@@ -254,12 +254,55 @@ Verified on two confidants through the same machinery, in one game launch:
 > **Ryuji** — *"Aw, c'mon, that's basic gym etiquette, bro!"*
 > **Takemi** — *"Not quite famous enough to have a decent research budget, anyway."*
 
-### ⏳ Phase 5 — Player custom dialogue
-Text input, so the player writes their own line and the NPC answers it. The timing is
-already solved: pre-generation covers the case where the player contributes nothing and
-can fast-forward, while typed input is the case where they have just spent 5–15 seconds
-at a keyboard — you cannot mash past your own typing. What remains unsolved is the input
-channel itself (Reloaded console, a server-hosted page, or an in-game field with IME work).
+### 🔶 Phase 5 — Player custom dialogue *(channel built, mod wiring left)*
+
+Text input, so the player writes their own line and the NPC answers it.
+
+**The channel is a page the server already serves.** Of the three options, this is the one
+that costs almost nothing, because every piece of it exists: the server is already running,
+already on loopback, already a hard dependency, and already the thing that builds prompts.
+A browser already solves text entry, IME composition, clipboard and font rendering — all of
+which an in-game field would have to implement before a single line could be typed. The
+Reloaded console is nearly free and nearly useless: a separate window to alt-tab to, and
+not guaranteed to be attached at all.
+
+```
+browser  --POST /say-->  server holds one line  --GET /player-line-->  mod
+```
+
+Open `http://127.0.0.1:8765/` next to the game and type. The store holds **one** line — if
+you type twice before it is collected, the second is the one you meant — and it **expires
+after two minutes**, so a line typed and abandoned does not surface in a scene half an hour
+later. The typed line reaches the model in the prompt's user half, beside the addressee:
+
+```
+[Scene context: ...]
+[You are speaking to Joker.]
+[Joker just said to you: "So... how have you been, really?"]
+[Aim for about 51 characters, roughly 10 words. ...]
+Ryuji Sakamoto:
+```
+
+**The server never decides which record answers it.** `/generate` runs several records
+ahead of the player, so a request that silently grabbed the pending line would have the
+confidant reply several bubbles too late — worse than not having the feature. So `/say`
+holds, `GET /player-line` peeks, `?consume=true` collects, and the caller chooses.
+
+**What's left is the mod side, and it is the hard half.** A player who stops to type for
+ten seconds is a player whose entire eight-record lookahead has just finished generating,
+including the record they are about to read. The reply has to land on the record *after the
+cursor* — one the queue has already filled with something else. That record must be
+reopened: returned to `Pending`, regenerated with the typed line, rewritten before the
+player advances.
+
+Which is safe, for a reason that predates the feature. Ch. 72's invariant —
+
+> a record is writable until the interpreter reads it, and frozen afterwards
+
+— already says the record after the cursor is fair game. `RecordPlan.IsWritable` enforces
+it, the render freeze protects everything behind it, and `FlushReadyRecords` already refuses
+to write behind the player. The machinery that makes typed input safe was built while fixing
+a bug that had nothing to do with typed input.
 
 ### ✅ Speaker attribution
 A rank-up scene is not one person talking. Takemi's involves a patient and her father, and
@@ -288,10 +331,144 @@ Ch. 75–80. The rule that finally worked: **every stored address in a BMD is re
 position of the field that stores it.** Nothing in the documentation says so; one hex dump
 did.
 
-**Next up:** who a line is spoken *to*. Attribution says who is talking, but the prompt still
-assumes the listener is always Joker — so Takemi tells a child's father about "your parents",
-and answers "can I go to school tomorrow?" with a line aimed at the protagonist. The scene
-has an addressee as well as a speaker, and only one of them is modelled.
+### ✅ Addressee modelling
+
+Attribution said who was talking. The prompt still assumed the listener was always Joker, in
+the plainest possible way — all three world-grounding strings contained the words *"Joker —
+the person you are talking to"*. So Takemi told a sick child's father about "your parents",
+and answered "can I go to school tomorrow?" with a line pitched at the high-school boy
+standing silently in the corner.
+
+The BMD cannot help here. `MessageDialog` is a name, a page count, a speaker id and a page
+table — there is no addressee field, and there could not be one: the renderer draws the
+speaker's name above the bubble and never draws the listener, so it was never stored. A
+format holds what its consumer reads. After eighty chapters of *stop inferring what the game
+can hand you*, this is the case where the game genuinely never knew.
+
+What the archive does give us is every speaker in script order for the whole scene. That is
+enough for a turn model, and one rule covers it:
+
+> **The addressee of a line is the most recent earlier speaker who is not the line's own
+> speaker — and the protagonist when there is none.**
+
+The three cases it was written from all fall out of that single rule:
+
+| Scene shape | Walk back finds | Addressee |
+|---|---|---|
+| The father asks, Takemi answers | a different speaker | **Girl's Father** |
+| Takemi runs three bubbles long | only herself, then the father | **Girl's Father** (carried) |
+| Ryuji, 21 records, alone at the gym | nobody else, ever | **Joker** |
+| The player picks a reply, then Takemi speaks | a `SEL` record | **Joker** |
+
+That last row is the one the format pays for twice. A selection is the only place the
+protagonist speaks — he is silent by design — so the addressee set is the speaker table
+*plus* him, and `SEL` counts as his turn.
+
+**Where the fact goes matters as much as what it is.** The obvious home for an addressee is
+the system prompt, next to the character notes, and that would be a measurable mistake:
+llama-server reuses the KV cache for the longest identical prefix between requests, the
+system prompt *is* that prefix, and baking a per-line value into it took generation from
+~1.5 s to ~3.5 s when `max_chars` tried it (Ch. 72). So the two facts that had been welded
+into one string got prised apart — what Joker permanently is in this world stays in the
+cached half, and who happens to be listening moves to the user half beside the length rule:
+
+```
+[Scene context: ...]
+[You are speaking to Girl's Father, not to Joker. Joker is present and listening,
+ but this line is aimed at Girl's Father.]
+[Aim for about 51 characters, roughly 10 words. ...]
+Tae Takemi:
+```
+
+Naming Joker as *present* is not padding. Without it the model reads the scene as one he
+has left and starts describing him in the third person to his face.
+
+The same defect turned out to be one layer down as well. `tier_note` returned "Close
+friends. Comfortable banter" for rank 6 — true of the confidant's bond with Joker, and read
+by the model as advice about whoever was being addressed, which had Takemi bantering with a
+stranger on their first meeting. Every tier note now names its subject.
+
+**Two unknowns that are deliberately not guessed:**
+
+- An empty addressee is not "Joker". When the turn demonstrably changed hands to somebody
+  the scene did not name, the prompt omits the claim rather than asserting the protagonist
+  — which is exactly the assumption the feature exists to remove.
+- A `SEL` record is now refused by `RecordPlan.IsWritable` itself, not by the speaker
+  filter. Ch. 80's rule is "never, regardless", and the filter is none of those things: it
+  can be switched off, it goes idle when an archive does not resolve, and it declines to
+  act when nothing attributes to the confidant. A selection survived all three paths
+  protected only incidentally, by having no speaker to match.
+
+Failure is bounded by construction. Rule one is wrong when a character answers someone
+other than the last speaker; rule three is wrong when a scene opens mid-conversation
+between two NPCs. Both cost a line aimed at the wrong person in a room where both are
+present — which is the behaviour for *every* multi-party line today, so the floor cannot
+move. `addressee_enabled` in `GenDialogue.json` turns it off for an A/B on the same scene,
+because a turn model is an inference rather than a parse and that comparison is the only
+way to judge it.
+
+### ✅ One writer, and a smaller one
+
+Two cleanups that belong together, because the first is what made the second findable.
+
+`Mod.cs` was 4,219 lines — 61% of the C# in the project, 160 members, and the file was the
+only thing they had in common. It got that way honestly: when you do not know whether a
+buffer is ASCII or UTF-16, in the heap or the mapped file, the cheapest place for the next
+probe is next to the last one. Each of those calls was right; the sum was a god object.
+
+Splitting it into `partial class Mod` files changes no behaviour at all — the compiler
+concatenates the parts, the fields stay shared, the IL is the same. That is the point: a
+change the build and the test suite can fully verify, made to code that runs inside
+somebody else's process. What it bought was the ability to ask one answerable question.
+With the offset-discovery code gathered in `Mod.Discovery.cs`, "is any of this still
+load-bearing?" became a matter of reading one file.
+
+| | Before | After |
+|---|---|---|
+| `Mod.cs` | 4,219 lines | **369** |
+| Largest file | 4,219 lines | 863 (`Mod.Pool.cs`) |
+| C# total | 6,793 lines | **5,188** |
+
+**What came out.** The BF-bytecode discovery chain — and with it a hook on a function its
+own comment called "one of the hottest functions in the process", installed in every
+session, collecting large-copy destinations and logging UTF-16 strings to answer questions
+Ch. 60 and Ch. 65 had already settled.
+
+It nearly took a safety net with it. `heap_scan_enabled` is the deliberately-kept fallback
+for a scene that ends up with no pool armed, and its trigger was `_currentMsgId != 0` — a
+value *only* the diagnostic chain ever set. Deleting the chain would have left the switch,
+the function and the config comment all in place and the fallback permanently unable to
+fire. Nothing would have failed. So the trigger moved first, in its own commit, to the
+thing it always wanted: an active hang-out. That also fixes a defect the config already
+confessed to — the scan used to wait for a dispatched message, so the opening lines of
+every scene played before it could begin.
+
+**And then the thing worth finding.** `DialogueBridge` is the Phase 2 design, preserved
+intact and still wired in: its own LLM request on every CMM event, written into the pool by
+`DialogueWriter.WriteAtLineIndex`, which counts null terminators from a base address. That
+is the "pool is a pile of strings" model from Ch. 58, which Ch. 66 replaced with the MSG1
+format. Every rule learned after Phase 2 lives in the record writer and none of them lived
+here:
+
+| Rule | Enforced in | Obeyed by the legacy writer? |
+|---|---|---|
+| Freeze a record once the interpreter reads it | `RecordState.Rendered` | No |
+| Leave another speaker's lines alone | `RecordState.Foreign` | No |
+| Never rewrite a selection | `RecordPlan.IsWritable` | No |
+| Verify the twin byte-for-byte first | `MirrorToTwin` | No |
+
+It was also making its own request against a server that runs one generation at a time and
+429s the rest — two independent schedulers for a single slot, only one of them measured.
+
+Nothing about it looked dead. Every symbol was referenced, from live code, with no config
+gate, and the README listed it as a working component. The reference count that found the
+rest could never have found this one; it took asking a different question — not "what is
+unreachable" but "what else writes to the thing I just finished protecting?"
+
+**Next up:** Phase 5's input channel, and an in-game run of the selection-record
+hypothesis. Ch. 80 proposed that `SEL` headers move their count from `0x18` to `0x1A`, the
+parser ships behind the hole mechanism so a wrong guess costs coverage rather than
+correctness, and no live scene has confirmed it yet.
 
 ---
 
@@ -306,6 +483,41 @@ Llama-3.1-8B-Instruct (Meta)
   → FastAPI /generate :8765      (Pydantic validation, async queue)
   → C# HTTP client               (30s timeout, 3× retry on 503 cold-start)
 ```
+
+**Picking an engine.** `INFERENCE_BACKEND=llama` (the default) uses the subprocess above.
+`INFERENCE_BACKEND=triton` is the planned second path and refuses with a list of what it
+still needs, rather than half-working:
+
+> the Triton backend is not built yet. The 4-bit dequantize-matmul kernel exists and is
+> checked against `kernels/reference.py`, but a kernel is not an engine. Still needed: a
+> weight loader producing the packed int4 layout · a Llama-3.1 tokenizer · RMSNorm, RoPE,
+> attention, SwiGLU · a KV cache · sampling · a chat-completions shim.
+
+That last item is the one already paid for. `ChatCompletionBackend` in `pipeline.py` is a
+structural `Protocol` — anything answering `create_chat_completion` satisfies it, which is
+what let inference move out of process without touching the pipeline. A Triton engine would
+slot in the same way.
+
+**The kernel itself did not compile.** It had been in the repo since Phase 1 with an
+autotuner, five configs and forty lines of block-pointer commentary, and reading it closely
+turned up two defects:
+
+| Defect | What it was |
+|---|---|
+| The even/odd K split sliced the wrong axis | `a_tile[::2, :]` slices the activation tile's **first** axis, which is M, not K. The resulting `[BLOCK_M//2, BLOCK_N]` product cannot be accumulated into a `[BLOCK_M, BLOCK_N]` tile — a shape error, not a rounding one. Fixed by selecting the nibble on the parity of k (`tl.where`), which removes the slicing and the second `tl.dot` with it. |
+| One scale for a tile spanning two groups | `group_id = k_start // group_size` reads a single quantization group per `BLOCK_K` chunk. The autotuner offers `BLOCK_K=64` against a `group_size` that is routinely 32. Fixed by indexing scales per k. |
+
+Three layers of test infrastructure caught neither. The test asserted only `out.shape ==
+(M, N)`, which a kernel returning zeros would pass; it skipped on
+`torch.cuda.is_available()` inside a `try: import torch`, and **torch is in neither
+requirements file** — so the skip fired because torch was *absent*, reading as "no GPU
+here"; and CI excluded the file by name. Each layer is individually defensible.
+
+The fix is a reference implementation in plain Python — no numpy, no torch, no GPU — that
+pins the packing order, the group indexing and the dequantize formula, and runs in CI. The
+GPU tests are now numerical comparisons against it instead of shape checks, including one
+that specifically exercises a `BLOCK_K` wider than a group. A docstring cannot disagree
+with the code; a reference can.
 
 **Why a subprocess rather than Python bindings.** `llama-cpp-python` is a C extension
 pinned to a CPython ABI: official CUDA wheels stop at cp312, and PyPI ships source
@@ -388,12 +600,24 @@ Then download a Llama-3.1-8B-Instruct GGUF (Q4_K_M) to
 ```
 Keep the window open while playing; closing it stops both processes.
 
+To type your own lines, open **http://127.0.0.1:8765/** in a browser beside the game.
+`INFERENCE_BACKEND=triton` selects the unfinished second backend and tells you what it
+still needs.
+
 **Run tests**
 ```powershell
 cd server
 python -m pytest tests/ -q
-# 234 passed, 2 skipped
+# 343 passed, 6 skipped
+
+cd ..
+dotnet test mod/P5RGenSocialLinks.Tests/P5RGenSocialLinks.Tests.csproj
+# 81 passed
 ```
+The .NET suite covers the byte-layout parsers — BMD headers, the archive, speaker
+matching, the turn model. Its project links those source files in rather than referencing
+the mod assembly, so it runs anywhere: the parsers take a `byte[]` and return a struct,
+while the mod itself needs Reloaded and Win32.
 No GPU, model, or vendored binary needed — the inference backend is exercised through
 `httpx.MockTransport` and stub processes.
 
@@ -404,30 +628,35 @@ No GPU, model, or vendored binary needed — the inference backend is exercised 
 ```
 p5r-gen-social-links/
 ├── mod/P5RGenSocialLinks/       # C# Reloaded-II mod
-│   ├── Memory/                  # Pointer chain, struct reading, write-back
+│   ├── Memory/                  # Pointer chain, BMD parsing, speaker + addressee, write-back
 │   ├── Server/                  # HTTP client, health checker
-│   ├── Mod.cs                   # Entry point, poll loop, hook wiring
-│   ├── DialogueBridge.cs        # LLM dispatch, throttle, session history
+│   ├── Mod.cs                   # Entry point, poll loop, Reloaded lifecycle (369 lines)
+│   ├── Mod.Hooks.cs             # The injected-code surface
+│   ├── Mod.Pool*.cs             # Arming, cursor tracking, the record writer, heap fallback
+│   ├── Mod.Scene.cs             # The plan: records, capacities, speakers, addressees
+│   ├── Mod.Generation.cs        # Prompt context and the pre-generation queue
 │   └── GenDialogue.json         # Runtime config (no recompile needed)
+├── mod/P5RGenSocialLinks.Tests/ # 81 tests (xunit) over the byte-layout parsers
 ├── server/                      # Python inference server
-│   ├── inference/               # Pipeline, llama-server client + supervisor, queue, postprocessor
+│   ├── inference/               # Pipeline, backend seam, llama-server client, queue, postprocessor
+│   │   └── kernels/             # Triton int4 dequant-matmul + its CPU reference
 │   ├── vendor/                  # llama-server.exe + CUDA runtime (gitignored, fetched)
-│   ├── social_link/             # Arcana roster, prompt builder, tier mapping
-│   ├── tests/                   # 234 tests (pytest)
+│   ├── social_link/             # Arcana roster, prompt builder, tier mapping, player input + page
+│   ├── tests/                   # 343 tests (pytest)
 │   └── main.py                  # FastAPI app
 ├── scripts/fetch-llama-server.ps1  # Downloads prebuilt llama.cpp CUDA binaries
 ├── scripts/redate.sh            # Restamps branch commits to the PR day
 ├── docs/                        # Screenshots and a sample session log
 ├── scripts/verify-signature.py  # Proves a SigScan pattern is unique in p5r.exe
-├── learning.md                  # 74-chapter technical journal (the real docs)
-└── .github/workflows/ci.yml     # Python tests + .NET build on push
+├── learning.md                  # 81-chapter technical journal (the real docs)
+└── .github/workflows/ci.yml     # Python tests, .NET build, .NET tests on push
 ```
 
 ---
 
 ## learning.md
 
-`learning.md` is a 74-chapter technical journal written alongside the code — covering ASLR and pointer arithmetic, Triton block-pointer math, 4-bit quantization, BF script format, CI design, process lifetime and Windows Job Objects, hardware watchpoints and the `DR0`-`DR7` registers, writing an inline assembly stub that must not disturb the flags register, and why searching for something the system can hand you is the expensive kind of mistake. It exists because this project was built as a learning exercise as much as a mod.
+`learning.md` is an 81-chapter technical journal (numbered to Ch. 87; six numbers were skipped) written alongside the code — covering ASLR and pointer arithmetic, Triton block-pointer math, 4-bit quantization, BF script format, CI design, process lifetime and Windows Job Objects, hardware watchpoints and the `DR0`-`DR7` registers, writing an inline assembly stub that must not disturb the flags register, and why searching for something the system can hand you is the expensive kind of mistake. It exists because this project was built as a learning exercise as much as a mod.
 
 ---
 

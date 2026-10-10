@@ -24,8 +24,14 @@ internal sealed class GenConfig
     [JsonPropertyName("poll_interval_ms")]
     public int PollIntervalMs { get; init; } = 500;
 
-    // When true, logs every BF instruction byte-dump ([BFInstr]) and StructDiff slot changes.
-    // Defaults off — the [MSG] and [LLM] events are sufficient for normal operation.
+    /// <summary>
+    /// Log what changed in the CMM session struct between poll ticks.
+    ///
+    /// The only survivor of the offset-discovery diagnostics (Ch. 83). It reads the struct
+    /// the poll loop already holds and prints the bytes that moved, which is how the
+    /// layout documented in the README was worked out. Off by default: it prints on every
+    /// tick a field changes, and the [PLAN], [SPEAKER] and [SCENE] lines cover normal play.
+    /// </summary>
     [JsonPropertyName("struct_diff_enabled")]
     public bool StructDiffEnabled { get; init; } = false;
 
@@ -116,6 +122,23 @@ internal sealed class GenConfig
     /// </summary>
     [JsonPropertyName("speaker_filter_enabled")]
     public bool SpeakerFilterEnabled { get; init; } = true;
+
+    /// <summary>
+    /// Tell the server who each line is spoken to, derived from the scene's turn order.
+    ///
+    /// Attribution decides whose voice a line is written in; this decides who it is aimed
+    /// at. Without it the prompt assumes the listener is always the protagonist, so Takemi
+    /// told a patient's father about "your parents" and answered a child's question as
+    /// though Joker had asked it (Ch. 81).
+    ///
+    /// On by default, and cheaper to trust than the filter: an addressee only changes
+    /// prompt text, so a wrong one costs one line's aim and never a byte of game memory.
+    /// The switch exists because the turn model is an inference rather than a parse, and
+    /// comparing a scene with it against the same scene without it is the only way to
+    /// judge whether the inference is earning its place.
+    /// </summary>
+    [JsonPropertyName("addressee_enabled")]
+    public bool AddresseeEnabled { get; init; } = true;
 
     /// <summary>
     /// Dump the scene archive's header, the bytes ahead of its first line, and its tail.
