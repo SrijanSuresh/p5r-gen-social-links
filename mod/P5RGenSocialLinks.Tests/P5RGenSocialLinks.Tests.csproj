@@ -27,6 +27,13 @@
              Link="Memory/Addressee.cs" />
     <Compile Include="../P5RGenSocialLinks/Memory/RecordPlan.cs"
              Link="Memory/RecordPlan.cs" />
+    <Compile Include="../P5RGenSocialLinks/Memory/Generatable.cs"
+             Link="Memory/Generatable.cs" />
+    <!-- The HTTP client is linked in for its request/response shapes only. It needs
+         nothing beyond System.Net.Http and System.Text.Json, both in the shared
+         framework, so it compiles on the Linux runner like the parsers do. -->
+    <Compile Include="../P5RGenSocialLinks/Server/LLMClient.cs"
+             Link="Server/LLMClient.cs" />
   </ItemGroup>
 
   <ItemGroup>

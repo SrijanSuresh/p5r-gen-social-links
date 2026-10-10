@@ -112,6 +112,20 @@ internal sealed class RecordPlan
     /// </summary>
     internal bool IsSelection { get; set; }
 
+    /// <summary>
+    /// True when this record was reopened to answer a line the player typed.
+    ///
+    /// Carried so the write path can tell two outcomes apart that take the same code
+    /// path. A pre-generated line discarded because the player advanced past it is
+    /// routine and worth one line of log; a *reply to something the player typed*
+    /// discarded for the same reason is the feature not working, and deserves to say so
+    /// (Ch. 88).
+    ///
+    /// Cleared when the record is handed back to the ordinary queue, so a later
+    /// generation for the same record is not mislabelled.
+    /// </summary>
+    internal bool AnsweringPlayer { get; set; }
+
     internal RecordState State { get; set; } = RecordState.Pending;
 
     /// The generated replacement, once it exists.

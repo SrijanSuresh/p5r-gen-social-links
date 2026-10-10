@@ -6839,3 +6839,118 @@ What does not land here is the mod reopening the record. That needs a poll, a st
 transition back to `Pending`, and a decision about what happens when the player advances
 mid-generation. It is named in the README as the remaining work rather than implied by a
 feature that half-exists — which is the mistake Ch. 85 and Ch. 86 are both about.
+
+## Chapter 88: Reopening a Record the Queue Already Filled
+
+The channel works: a page posts a line, the server holds it, `GET /player-line` hands it
+over. What was left is the half Ch. 87 called hard — making the confidant answer it on the
+right bubble.
+
+### The problem, stated precisely
+
+Pre-generation keeps eight records ahead of the player. A player who stops to type for ten
+seconds is a player whose entire lookahead has just finished generating and writing,
+including the record they are about to read. So at the moment the line arrives, the record
+that should answer it already contains something else.
+
+The fix is to take it back. `RecordPlan.IsWritable` already says that is allowed:
+
+> a record is writable until the interpreter reads it, and frozen afterwards
+
+`_poolNextRecord[0]` is the index of the next record the interpreter will read — the
+cursor's own definition, since `AdvancePoolCursor` sets it to `i + 1` after reading record
+`i`. Everything at or after it is unread, and therefore fair game. Everything before it is
+frozen by the same mechanism that stopped the text switching under the player in Ch. 71.
+
+So the target is: **the first record at or after the cursor that is still writable and
+worth generating for.** Not the first `Pending` one — the normal queue picks those, and the
+whole point is that the target probably is not Pending any more. It is `Written`, with a
+line the queue produced before the player typed.
+
+### Peek, pick, then consume
+
+The obvious order is to collect the line and then find a record for it. That loses lines:
+if no target exists — a scene with nothing writable left ahead — the line has already been
+taken out of the store and there is nowhere to put it.
+
+So the mod peeks on a cadence (`GET /player-line`, no consume), and only the request that
+is actually going to use a line consumes it. Three states fall out of that, and each needs
+a different response:
+
+| At request time | Response |
+|---|---|
+| A line is there | Generate with it, write to the reopened record |
+| It expired while we were picking a target | Put the record back to `Pending` and let the queue have it |
+| Something else took it | Same — this is a two-process system and the store is shared |
+
+The second and third cases are why the consume happens inside the request task rather than
+in the poll tick. Reopening a record and then discovering there is nothing to answer would
+leave it `InFlight` forever.
+
+### The queue has to yield, and mostly it already does
+
+One generation runs at a time; the server answers 429 to anything overlapping. If a normal
+pre-generation request is in flight when the line lands, the typed request waits for it —
+up to about two seconds.
+
+That is worth accepting rather than engineering around. Cancelling the in-flight request
+means plumbing a `CancellationTokenSource` out of `RequestForRecord` and holding it on the
+plan, which adds a lifetime to get wrong for a two-second saving the player will not
+notice: they have just spent five to fifteen seconds at a keyboard.
+
+What does need care is ordering *within* the pump. The typed line is served before the
+lookahead loop, so a tick that could do either does the typed one. Otherwise the queue
+would spend the tick on record `cursor + 7` while the thing the player is about to read
+waits.
+
+### The race that remains
+
+Generation takes one to two seconds. If the player advances past the target in that window,
+the answer arrives for a record the interpreter has already read.
+
+`FlushReadyRecords` catches it — it refuses to write behind the cursor and marks the record
+`Rendered` — so the failure is safe. It was also silent, which is the part worth fixing:
+a discarded pre-generated line is routine, and a discarded *reply to something the player
+typed* is the feature not working. Those deserve different log lines even though they take
+the same code path.
+
+No attempt is made to re-target the answer onto a later record. The text was generated
+against one record's capacity, and a reply to "is she going to be okay?" arriving three
+bubbles later is the problem pre-generation exists to avoid — the same reasoning that kept
+the server from injecting the line into whichever request happened to arrive next.
+
+### Two thresholds that were duplicated
+
+The pump skipped records on two rules written inline: a scripted line under 8 characters is
+UI rather than dialogue, and a capacity under 24 cannot hold a complete sentence. The typed
+path needs the identical test, and a second copy of a threshold is a threshold that drifts.
+Both now live in `Generatable`, which is also the only part of this that is a pure function
+over the plan — so it is the part that can be tested without a game attached.
+
+### Two things only writing it revealed
+
+**The context was arguing with the prompt.** Every pre-generation request carries "The line
+you are replacing is: X" followed by "Say something with the same purpose, in your own
+words." That is right for pre-generation and wrong for a reply: the player has just changed
+what the conversation is about, so preserving the scripted line's purpose sets the context
+directly against the rule in the system prompt that says a typed line outranks it. A model
+handed two conflicting instructions follows the nearer one, and the context is nearer. The
+reply path now says the line above is only there to show where the conversation had got to.
+
+**A config typo was an unobserved task exception.** `HttpClient` rejects
+`127.0.0.1:8765` — a `server_url` missing its scheme — with `InvalidOperationException`
+before it ever tries to connect, not with the `HttpRequestException` that "the server is
+down" produces. The poll and the clear are both fire-and-forget, so that throw escapes onto
+a task nobody awaits: no log line, no crash, just a feature that never works.
+
+Found by building a thirty-line console harness that links `LLMClient.cs` and drives it
+against a real server in mock mode. That is worth more than it sounds. The mod cannot be
+run without P5R and Reloaded, so its HTTP layer had never been *executed* outside the game
+— only unit-tested against literals. Linking one file into a console app made the whole
+client runnable in a second, and the first thing it did was find a bug that unit tests
+asserting on JSON strings could not have.
+
+The harness also pins the behaviours that matter when the server is absent, which is the
+common case for this mod: an unreachable server, a malformed URL and an empty store all
+have to come back as "nothing typed" rather than as an exception, because the mod's answer
+to every failure is to leave the scripted dialogue alone.

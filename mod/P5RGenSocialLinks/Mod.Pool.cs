@@ -486,8 +486,17 @@ public partial class Mod
             if (record.Index < CurrentRecord())
             {
                 record.State = RecordState.Rendered;   // out of the way for good
-                _modLog!.Info($"[PREGEN] #{record.Index} discarded — player is at " +
-                              $"{CurrentRecord()}");
+
+                // Two outcomes, same code path, very different meanings. A pre-generated
+                // line the player outran is routine. A reply to something they *typed*,
+                // discarded for the same reason, is the feature not working — and it was
+                // indistinguishable in the log until this said so (Ch. 88).
+                if (record.AnsweringPlayer)
+                    _modLog!.Warn($"[PLAYER] #{record.Index} reply arrived too late — " +
+                                  $"player is at {CurrentRecord()}; the typed line is lost");
+                else
+                    _modLog!.Info($"[PREGEN] #{record.Index} discarded — player is at " +
+                                  $"{CurrentRecord()}");
                 continue;
             }
 
@@ -495,7 +504,8 @@ public partial class Mod
             {
                 record.State      = RecordState.Written;
                 record.WasWritten = true;
-                _modLog!.Info($"[PREGEN] #{record.Index} written, " +
+                string tag = record.AnsweringPlayer ? "PLAYER" : "PREGEN";
+                _modLog!.Info($"[{tag}] #{record.Index} written, " +
                               $"{record.Index - CurrentRecord()} ahead of the player");
             }
         }

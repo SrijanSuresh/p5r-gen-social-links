@@ -38,12 +38,17 @@ public partial class Mod
     {
         if (_plan.Count == 0) return;
 
-        int written = 0, pending = 0, tooSmall = 0, foreign = 0, menus = 0;
+        int written = 0, pending = 0, tooSmall = 0, foreign = 0, menus = 0, answered = 0;
         var gaps = new System.Text.StringBuilder();
         foreach (RecordPlan record in _plan)
         {
             bool replaced = record.WasWritten;
-            if (replaced) { written++; continue; }
+            if (replaced)
+            {
+                written++;
+                if (record.AnsweringPlayer) answered++;
+                continue;
+            }
             if (record.Original.Length < 8) continue;   // never a candidate
 
             // A menu is not a line we failed to replace. "Yes, I'm sure!" is fourteen
@@ -69,6 +74,7 @@ public partial class Mod
         int percent    = candidates == 0 ? 0 : written * 100 / candidates;
         _modLog!.Info($"[SCENE] replaced {written}/{candidates} records ({percent}%)" +
                       (foreign  > 0 ? $", {foreign} left to other speakers" : "") +
+                      (answered > 0 ? $", {answered} answering the player" : "") +
                       (menus    > 0 ? $", {menus} selections left alone" : "") +
                       (tooSmall > 0 ? $", {tooSmall} too short to try" : "") +
                       (gaps.Length > 0 ? $" — missed {gaps}" : ""));

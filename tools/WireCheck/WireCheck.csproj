@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <AssemblyName>wirecheck</AssemblyName>
+    <RootNamespace>WireCheck</RootNamespace>
+  </PropertyGroup>
+
+  <!-- The mod's HTTP client, compiled into this console app rather than referenced.
+
+       Same trick as the test project: LLMClient needs nothing beyond System.Net.Http and
+       System.Text.Json, so it runs anywhere, while the mod assembly it normally lives in
+       drags in Reloaded and Win32.
+
+       The point is that this is the mod's *real* client, not a reimplementation of it. The
+       mod cannot be launched without P5R and Reloaded, so without this its HTTP layer is
+       never executed outside the game — only unit-tested against JSON literals. The first
+       run of this harness found an InvalidOperationException escaping onto a
+       fire-and-forget task, which no test asserting on strings could have caught
+       (learning.md Ch. 88). -->
+  <ItemGroup>
+    <Compile Include="../../mod/P5RGenSocialLinks/Server/LLMClient.cs" Link="LLMClient.cs" />
+  </ItemGroup>
+
+</Project>

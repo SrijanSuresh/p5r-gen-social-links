@@ -133,7 +133,17 @@ public partial class Mod
         var ctx = new System.Text.StringBuilder(ContextBuilder.Build(snap));
 
         ctx.Append(" The line you are replacing is: \"").Append(record.Original).Append('"');
-        ctx.Append(" Say something with the same purpose, in your own words.");
+
+        // "Same purpose" is right for pre-generation and wrong for a reply. The scripted
+        // line was written for a conversation the player has just changed by typing into
+        // it, so telling the model to preserve its purpose sets that instruction against
+        // the typed line the prompt rules say outranks it — and a model given two
+        // conflicting instructions obeys the nearer one (Ch. 88).
+        ctx.Append(record.AnsweringPlayer
+            ? " Joker has just said something to you directly. Answer him. The line above " +
+              "is only there to show where the conversation had got to — you do not have " +
+              "to keep its purpose."
+            : " Say something with the same purpose, in your own words.");
 
         // What the player has actually heard, most recent last. Four lines rather than
         // two: with two, consecutive generations came back as "Yeah, it was a sweet gym"
@@ -397,11 +407,6 @@ public partial class Mod
     /// </summary>
     private void PumpPregen(SocialLinkSnapshot snap)
     {
-        // Below this, a complete sentence in character does not fit and the server
-        // correctly returns nothing. Measured: records of 15-21 chars produced
-        // "You can grab a" and "Guess we good to" before fragments were rejected.
-        const int MinGeneratableChars = 24;
-
         int lookahead = _cfg.PregenLookahead;
         if (lookahead <= 0 || _plan.Count == 0) return;
 
@@ -418,6 +423,16 @@ public partial class Mod
         foreach (RecordPlan inFlight in _plan)
             if (inFlight.State == RecordState.InFlight) return;
 
+        // A line the player typed outranks the lookahead. Served before the loop below so
+        // a tick that could do either does this one — otherwise the queue spends it on
+        // record cursor+7 while the reply the player is waiting for sits in the store
+        // (Ch. 88).
+        //
+        // It waits for any in-flight request like everything else. That costs up to about
+        // two seconds, which is worth not plumbing a cancellation token out of
+        // RequestForRecord for: the player has just spent five to fifteen seconds typing.
+        if (TryAnswerPlayerLine(snap)) return;
+
         int from = _poolNextRecord.Count > 0 ? Math.Max(0, _poolNextRecord[0]) : 0;
         int to   = Math.Min(_plan.Count, from + lookahead);
 
@@ -426,21 +441,14 @@ public partial class Mod
             RecordPlan record = _plan[i];
             if (record.State != RecordState.Pending) continue;
 
-            // A selection is the list of replies the player picks from, so there is
-            // nothing here to say in character and the write is forbidden outright
-            // (Ch. 80). Taking it out of the queue as well as out of the write path saves
-            // an inference that could never have been used.
-            if (record.IsSelection)
-            {
-                record.State = RecordState.Rendered;   // permanently out of the way
-                continue;
-            }
-
-            // Records whose scripted line is too short to be a spoken line are skipped
-            // rather than generated for. A three-character record is a fragment of UI,
-            // and replacing it wastes a slow inference on something nobody reads as
-            // dialogue.
-            if (record.Original.Length < 8 || record.Capacity < MinGeneratableChars)
+            // Selections and records too short to hold a sentence are taken out of the
+            // queue for good. A selection must never be rewritten at all (Ch. 80), and a
+            // three-character record is a fragment of UI — replacing it spends a slow
+            // inference on text nobody reads as dialogue.
+            //
+            // The thresholds live in Generatable because the typed-input path applies the
+            // identical test, and a second copy of a threshold is one that drifts.
+            if (!Generatable.IsWorthGenerating(record))
             {
                 record.State = RecordState.Rendered;   // permanently out of the way
                 continue;

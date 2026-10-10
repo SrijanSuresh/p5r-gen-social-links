@@ -43,6 +43,24 @@ internal sealed class GenerateRequest
     /// was before this field existed.
     /// </summary>
     public string Addressee     { get; init; } = string.Empty;
+
+    /// <summary>
+    /// What the player typed, when this request is answering it.
+    ///
+    /// Only ever set on the one request that collected a line from the store. The server
+    /// deliberately does not inject a pending line into whatever request arrives next:
+    /// pre-generation runs eight records ahead, so an auto-grabbed line would be answered
+    /// several bubbles after the player typed it (Ch. 87).
+    /// </summary>
+    public string PlayerLine    { get; init; } = string.Empty;
+}
+
+/// <summary>The pending typed line, as <c>GET /player-line</c> reports it.</summary>
+internal sealed class PlayerLineResponse
+{
+    public bool   Pending    { get; init; }
+    public string Text       { get; init; } = string.Empty;
+    public double AgeSeconds { get; init; }
 }
 
 internal sealed class GenerateResponse
@@ -122,6 +140,97 @@ internal sealed class LLMClient : IDisposable
             string body = await response.Content.ReadAsStringAsync(ct);
             var result  = JsonSerializer.Deserialize<GenerateResponse>(body, _jsonOpts);
             return result?.Text ?? string.Empty;
+        }
+    }
+
+    /// <summary>
+    /// Ask whether the player has typed something, without taking it.
+    ///
+    /// Peeking rather than consuming is what makes the feature safe to poll. The mod has
+    /// to know a line exists before it commits a record to answering it, and if it
+    /// collected first and then found no writable record ahead, the line would be gone
+    /// with nowhere to put it (Ch. 88).
+    ///
+    /// Returns false on any transport failure. A server that is not answering is the
+    /// normal case for this mod — it means scripted dialogue, not an error path — and
+    /// this runs on a poll tick, so a throw here would be noise on every tick.
+    /// </summary>
+    internal async Task<bool> HasPlayerLineAsync(CancellationToken ct = default)
+    {
+        PlayerLineResponse? line = await TryGetPlayerLineAsync(consume: false, ct);
+        return line?.Pending == true;
+    }
+
+    /// <summary>
+    /// Collect the pending typed line, removing it from the store.
+    ///
+    /// Returns null when there is nothing to collect — it expired between the poll and
+    /// this call, or something else took it. Both are ordinary in a two-process system
+    /// where the store is shared, and the caller has to put its record back rather than
+    /// leave it waiting for a line that is not coming.
+    /// </summary>
+    internal async Task<string?> TakePlayerLineAsync(CancellationToken ct = default)
+    {
+        PlayerLineResponse? line = await TryGetPlayerLineAsync(consume: true, ct);
+        return line?.Pending == true && line.Text.Length > 0 ? line.Text : null;
+    }
+
+    /// <summary>Forget any pending line. Called when a hang-out ends.</summary>
+    internal async Task ClearPlayerLineAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            using var empty = new StringContent(string.Empty);
+            using var response = await _http.PostAsync($"{_baseUrl}/player-line/clear", empty, ct);
+        }
+        catch (HttpRequestException)
+        {
+            // Nothing to clear if nobody is listening.
+        }
+        catch (InvalidOperationException)
+        {
+            // A server_url with no scheme — "127.0.0.1:8765" instead of
+            // "http://127.0.0.1:8765" — makes HttpClient reject the URI rather than fail
+            // to connect. These run on fire-and-forget tasks, so an escaping throw is an
+            // unobserved task exception rather than anything the log would show.
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    private async Task<PlayerLineResponse?> TryGetPlayerLineAsync(
+        bool consume, CancellationToken ct)
+    {
+        try
+        {
+            string url = $"{_baseUrl}/player-line" + (consume ? "?consume=true" : "");
+            using var response = await _http.GetAsync(url, ct);
+
+            // A build of the server without the channel answers 404. That is a version
+            // mismatch rather than a fault, and it must not log once per poll tick.
+            if (!response.IsSuccessStatusCode) return null;
+
+            string body = await response.Content.ReadAsStringAsync(ct);
+            return JsonSerializer.Deserialize<PlayerLineResponse>(body, _jsonOpts);
+        }
+        catch (HttpRequestException)
+        {
+            return null;
+        }
+        catch (InvalidOperationException)
+        {
+            // A malformed server_url. Reported as "nothing typed", which is the same
+            // outcome as an unreachable server and leaves the scripted dialogue alone.
+            return null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+        catch (OperationCanceledException)
+        {
+            return null;
         }
     }
 
