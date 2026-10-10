@@ -698,6 +698,7 @@ p5r-gen-social-links/
 │   ├── social_link/             # Arcana roster, prompt builder, tier mapping, player input + page
 │   ├── tests/                   # 343 tests (pytest)
 │   └── main.py                  # FastAPI app
+├── tools/WireCheck/             # Drives the mod's real HTTP client against a live server
 ├── scripts/fetch-llama-server.ps1  # Downloads prebuilt llama.cpp CUDA binaries
 ├── scripts/redate.sh            # Restamps branch commits to the PR day
 ├── docs/                        # Screenshots and a sample session log
